@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qdlblocks"
+version = "0.1.0"
+description = "Density-Matrix and Complex Hilbert-Space Deep Learning Blocks in Native PyTorch"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "QuantumDLBlocks Contributors" }
+]
+keywords = [
+    "quantum-machine-learning",
+    "deep-learning",
+    "pytorch",
+    "density-matrix",
+    "hilbert-space",
+    "kraus-channels",
+    "povm",
+    "quantum-attention"
+]
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+examples = [
+    "scikit-learn>=1.3.0",
+]
+dev = [
+    "pytest>=7.4.0",
+    "scikit-learn>=1.3.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qdlblocks"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

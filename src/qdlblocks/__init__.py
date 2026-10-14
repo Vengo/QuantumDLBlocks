@@ -1,0 +1,116 @@
+"""qdlblocks: Density-Matrix, Complex Hilbert-Space, and Stiefel/Born Quantum Deep Learning in PyTorch."""
+
+from . import functional, kernels, layers, metrics, models, optim, telemetry
+from .functional import (
+    apply_unitary_rope,
+    convex_density_mixture,
+    ensure_complex,
+    kraus_transform,
+    l2_normalize,
+    normalize_trace,
+    povm_measure,
+    power_purify,
+    riemannian_center,
+    state_to_density,
+    zeropower_via_newtonschulz5,
+)
+from .kernels import HAS_TRITON, flash_born_attention
+from .layers import (
+    ComplexLinear,
+    ComplexSuperpositionAttention,
+    ConvexHeadMixture,
+    DepolarizingNoise,
+    IsometricHilbertLift,
+    KrausChannel,
+    MultiHeadComplexProjection,
+    POVMMeasurement,
+    PowerPurification,
+    ProjectivePOVMHead,
+    PureQuantumAttention,
+    QuantumBornBlock,
+    ReLUSquared,
+    SPAMNoise,
+    SphericalResidual,
+    SubspaceProjectorBornAttention,
+    UnitSphereEmbedding,
+    UnitaryRoPE,
+)
+from .metrics import (
+    attention_entropy_and_sparsity,
+    effective_rank,
+    hs_inner_product,
+    is_valid_density_matrix,
+    logit_margin_stats,
+    model_isometry_error,
+    purity,
+    stiefel_isometry_error,
+    von_neumann_entropy,
+)
+from .models import DeepPureQuantumNetwork, HybridQuantumClassifier, QuantumBornGPT
+from .optim import StiefelMuon, polar_snap_weights, split_muon_adamw_params
+from .telemetry import inspect_quantum_model
+
+__version__ = "0.1.0"
+
+__all__ = [
+    "__version__",
+    "functional",
+    "kernels",
+    "layers",
+    "metrics",
+    "models",
+    "optim",
+    "telemetry",
+    "HAS_TRITON",
+    "flash_born_attention",
+    # Functional
+    "l2_normalize",
+    "riemannian_center",
+    "apply_unitary_rope",
+    "zeropower_via_newtonschulz5",
+    "ensure_complex",
+    "normalize_trace",
+    "state_to_density",
+    "power_purify",
+    "convex_density_mixture",
+    "kraus_transform",
+    "povm_measure",
+    # Layers
+    "ComplexLinear",
+    "MultiHeadComplexProjection",
+    "PureQuantumAttention",
+    "ComplexSuperpositionAttention",
+    "SubspaceProjectorBornAttention",
+    "PowerPurification",
+    "ReLUSquared",
+    "ConvexHeadMixture",
+    "KrausChannel",
+    "POVMMeasurement",
+    "ProjectivePOVMHead",
+    "UnitSphereEmbedding",
+    "IsometricHilbertLift",
+    "UnitaryRoPE",
+    "SphericalResidual",
+    "QuantumBornBlock",
+    "SPAMNoise",
+    "DepolarizingNoise",
+    # Metrics & Telemetry
+    "von_neumann_entropy",
+    "purity",
+    "hs_inner_product",
+    "is_valid_density_matrix",
+    "stiefel_isometry_error",
+    "model_isometry_error",
+    "effective_rank",
+    "attention_entropy_and_sparsity",
+    "logit_margin_stats",
+    "inspect_quantum_model",
+    # Optimizers
+    "StiefelMuon",
+    "polar_snap_weights",
+    "split_muon_adamw_params",
+    # Models
+    "DeepPureQuantumNetwork",
+    "HybridQuantumClassifier",
+    "QuantumBornGPT",
+]

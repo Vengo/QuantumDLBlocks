@@ -1,0 +1,85 @@
+"""End-to-end model forward/backward and generation tests."""
+
+from __future__ import annotations
+
+import torch
+
+from qdlblocks import (
+    DeepPureQuantumNetwork,
+    HybridQuantumClassifier,
+    QuantumBornGPT,
+    is_valid_density_matrix,
+)
+
+
+def test_deep_pure_quantum_network() -> None:
+    torch.manual_seed(30)
+    model = DeepPureQuantumNetwork(
+        in_features=16,
+        hilbert_dim=8,
+        num_classes=4,
+        num_heads=2,
+        num_kraus=3,
+        num_kraus_layers=2,
+        purification_placement="post_fusion",
+        purify_after_kraus=True,
+        kraus_residual=True,
+    )
+    x = torch.randn(5, 16)
+    logits, rho, trajectory = model(x, return_trajectory=True)
+    assert logits.shape == (5, 4)
+    assert rho.shape == (5, 8, 8)
+    assert len(trajectory) == 5  # 1 attention + 2 * (Kraus + Purify)
+    for state in trajectory:
+        assert is_valid_density_matrix(state)[0]
+
+    loss = logits.sum()
+    loss.backward()
+
+
+def test_hybrid_quantum_classifier() -> None:
+    torch.manual_seed(31)
+    model = HybridQuantumClassifier(
+        in_channels=1,
+        token_dim=16,
+        hilbert_dim=8,
+        num_heads=2,
+        num_classes=6,
+        grid_size=(2, 2),
+        pooling_mode="incoherent",
+        purification_placement="post_fusion",
+        num_kraus=2,
+    )
+    img = torch.randn(4, 1, 8, 8)
+    logits, rho = model(img)
+    assert logits.shape == (4, 6)
+    assert rho.shape == (4, 8, 8)
+    assert is_valid_density_matrix(rho)[0]
+    logits.sum().backward()
+
+
+def test_quantum_born_gpt_modes_and_generation() -> None:
+    torch.manual_seed(32)
+    for readout_mode in ("asymmetric", "symmetric_dual"):
+        model = QuantumBornGPT(
+            vocab_size=50,
+            embed_dim=32,
+            seed_dim=16,
+            num_heads=4,
+            num_layers=2,
+            hidden_dim=64,
+            block_size=16,
+            readout_mode=readout_mode,  # type: ignore[arg-type]
+            learnable_temperature=True,
+            value_residual_mixing=True,
+            input_highway_mixing=True,
+        )
+        idx = torch.randint(0, 50, (3, 10))
+        targets = torch.randint(0, 50, (3, 10))
+        logits, loss = model(idx, targets)
+        assert logits.shape == (3, 10, 50)
+        assert loss is not None
+        loss.backward()
+
+        generated = model.generate(idx[:, :4], max_new_tokens=5, top_k=10)
+        assert generated.shape == (3, 9)
