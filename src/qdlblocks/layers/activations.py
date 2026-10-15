@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..functional import power_purify
+from ..functional import l2_normalize, power_purify
 
 
 class PowerPurification(nn.Module):
@@ -48,3 +50,46 @@ class ReLUSquared(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return F.relu(x).square()
+
+
+class TwoBeamQuantumInterference(nn.Module):
+    """Two-Beam Bilinear Quantum Wave Interference Channel on S^{d-1}.
+
+    Replaces classical elementwise activations (GELU/SiLU) with multiplicative two-beam
+    Stiefel wave interference on the unit hypersphere:
+        |phi_mlp> = N( W_down ( (W_a |psi>) * N(W_b |psi>) * sqrt(D_ff) ) )
+    where W_a, W_b in St(D_ff, d) and W_down in St(D_ff, d) are orthogonal Stiefel
+    projections. Constructive and destructive interference between the two orthogonal
+    Stiefel paths gates information purely via quantum wave mechanics.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        hidden_dim: int,
+        normalize_output: bool = True,
+        eps: float = 1e-12,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+        self.normalize_output = normalize_output
+        self.eps = eps
+
+        self.w_a = nn.Linear(embed_dim, hidden_dim, bias=False)
+        self.w_b = nn.Linear(embed_dim, hidden_dim, bias=False)
+        self.w_down = nn.Linear(hidden_dim, embed_dim, bias=False)
+        nn.init.orthogonal_(self.w_a.weight)
+        nn.init.orthogonal_(self.w_b.weight)
+        nn.init.orthogonal_(self.w_down.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        psi = l2_normalize(x, dim=-1, eps=self.eps)
+        a = self.w_a(psi)
+        b = l2_normalize(self.w_b(psi), dim=-1, eps=self.eps)
+        interfered = a * b * math.sqrt(self.hidden_dim)
+        out = self.w_down(interfered)
+        if self.normalize_output:
+            return l2_normalize(out, dim=-1, eps=self.eps)
+        return out
+

@@ -34,6 +34,7 @@ from .layers import (
     SparseKrausMoE,
     SphericalResidual,
     SubspaceProjectorBornAttention,
+    TwoBeamQuantumInterference,
     UnitSphereEmbedding,
     UnitaryRoPE,
 )
@@ -96,6 +97,7 @@ __all__ = [
     "SubspaceProjectorBornAttention",
     "PowerPurification",
     "ReLUSquared",
+    "TwoBeamQuantumInterference",
     "ConvexHeadMixture",
     "KrausChannel",
     "POVMMeasurement",

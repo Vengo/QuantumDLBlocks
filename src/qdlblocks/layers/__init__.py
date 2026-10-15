@@ -1,6 +1,6 @@
 """Modular complex Hilbert-space, density-matrix, and Stiefel/Born quantum-geometric layers."""
 
-from .activations import PowerPurification, ReLUSquared
+from .activations import PowerPurification, ReLUSquared, TwoBeamQuantumInterference
 from .attention import (
     ComplexSuperpositionAttention,
     PoolingMode,
@@ -26,6 +26,7 @@ __all__ = [
     "PurificationPlacement",
     "PowerPurification",
     "ReLUSquared",
+    "TwoBeamQuantumInterference",
     "ConvexHeadMixture",
     "KrausChannel",
     "POVMMeasurement",

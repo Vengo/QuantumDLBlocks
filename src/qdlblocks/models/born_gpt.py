@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Literal
+import math
 
 import torch
 import torch.nn as nn
@@ -14,7 +15,7 @@ from ..layers.isometric import IsometricHilbertLift, UnitaryRoPE
 from ..layers.measurement import ProjectivePOVMHead
 
 
-ReadoutMode = Literal["asymmetric", "symmetric_dual"]
+ReadoutMode = Literal["asymmetric", "symmetric_dual", "tied_stiefel"]
 
 
 class QuantumBornGPT(nn.Module):
@@ -30,10 +31,18 @@ class QuantumBornGPT(nn.Module):
     - **Self-Adjoint Dual POVM Readout (`readout_mode="symmetric_dual"`)**:
       Projects final contextual state back through `W_lift` into seed space and measures
       against the normalized seed embedding frame.
-    - **Research Extensions**:
+    - **Associative Stiefel-Tied POVM Readout (`readout_mode="tied_stiefel"`)**:
+      Rotates the final Hilbert ket via an orthogonal readout operator `readout_rot`, projects
+      into seed space via `W_lift`, and measures against `N(wte + povm_head_seed_delta)`.
+    - **Next-Gen FineWeb Slowrun Extensions**:
       - `learnable_temperature`: Learnable per-head sharpness and POVM inverse temperature.
       - `value_residual_mixing`: Coherent reference-beam mixing of initial lifted state `|psi_0>` into `V`.
       - `input_highway_mixing`: Coherent input-state skip connections into intermediate blocks.
+      - `use_bigram_smear`: Coherent superposition of adjacent token kets `|psi_0(t)> + eta |psi_0(t-1)>`.
+      - `use_qk_wave_filter`: 2-tap causal wave-packet QK phase interference before Unitary RoPE.
+      - `use_unet_interferometry`: Mach-Zehnder U-Net skip interferometry across encoder/decoder layers.
+      - `use_two_beam_mlp`: Two-beam bilinear Stiefel wave interference MLP (`TwoBeamQuantumInterference`).
+      - `depolarizing_jitter`: Spherical depolarizing noise during multi-epoch training.
       - `complex_phase_attention`: Splitting `R^{d_h} -> C^{d_h/2}` for phase-invariant Born overlaps.
       - `riemannian_centering`: Zero-mean centering prior to spherical projection.
     """
@@ -57,6 +66,11 @@ class QuantumBornGPT(nn.Module):
         learnable_temperature: bool = False,
         value_residual_mixing: bool = False,
         input_highway_mixing: bool = False,
+        use_bigram_smear: bool = False,
+        use_qk_wave_filter: bool = False,
+        use_unet_interferometry: bool = False,
+        use_two_beam_mlp: bool = False,
+        depolarizing_jitter: float = 0.0,
         complex_phase_attention: bool = False,
         use_flash_born: bool = False,
         eps: float = 1e-12,
@@ -71,6 +85,9 @@ class QuantumBornGPT(nn.Module):
         self.top_k_experts = top_k_experts
         self.block_size = block_size
         self.readout_mode = readout_mode
+        self.use_bigram_smear = use_bigram_smear
+        self.use_unet_interferometry = use_unet_interferometry
+        self.depolarizing_jitter = depolarizing_jitter
         self.eps = eps
         self.head_dim = embed_dim // num_heads
 
@@ -85,6 +102,11 @@ class QuantumBornGPT(nn.Module):
         # Expose wte and W_lift aliases at top level for compatibility with notebook scripts
         self.wte = self.hilbert_lift.wte
         self.W_lift = self.hilbert_lift.W_lift
+
+        if use_bigram_smear:
+            self.smear_embed_gate = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        else:
+            self.register_parameter("smear_embed_gate", None)
 
         # 2. Unitary RoPE tables
         self.rope = UnitaryRoPE(head_dim=self.head_dim, max_seq_len=block_size)
@@ -106,6 +128,8 @@ class QuantumBornGPT(nn.Module):
                     learnable_temperature=learnable_temperature,
                     value_residual_mixing=value_residual_mixing,
                     input_highway_mixing=(input_highway_mixing and layer_idx > 0),
+                    use_qk_wave_filter=use_qk_wave_filter,
+                    use_two_beam_mlp=use_two_beam_mlp,
                     complex_phase_attention=complex_phase_attention,
                     use_flash_born=use_flash_born,
                     eps=eps,
@@ -113,6 +137,15 @@ class QuantumBornGPT(nn.Module):
                 for layer_idx in range(num_layers)
             ]
         )
+
+        if use_unet_interferometry and num_layers >= 2:
+            self.unet_gates = nn.ParameterList(
+                [nn.Parameter(torch.eye(embed_dim)) for _ in range(num_layers // 2)]
+            )
+            self.unet_scales = nn.Parameter(torch.full((num_layers // 2,), 0.18))
+        else:
+            self.unet_gates = None
+            self.register_parameter("unet_scales", None)
 
         # 4. Output POVM Measurement Readout
         if readout_mode == "asymmetric":
@@ -124,10 +157,24 @@ class QuantumBornGPT(nn.Module):
                 eps=eps,
             )
             self.povm_head = self.povm_readout.povm_head
+            self.readout_rot = None
+            self.register_parameter("povm_head_seed_delta", None)
+            self.register_parameter("tied_inv_temp", None)
             self._dual_inv_temp = 1.0 / povm_temperature
         elif readout_mode == "symmetric_dual":
             self.povm_readout = None
             self.register_parameter("povm_head", None)
+            self.readout_rot = None
+            self.register_parameter("povm_head_seed_delta", None)
+            self.register_parameter("tied_inv_temp", None)
+            self._dual_inv_temp = 1.0 / povm_temperature
+        elif readout_mode == "tied_stiefel":
+            self.povm_readout = None
+            self.register_parameter("povm_head", None)
+            self.readout_rot = nn.Linear(embed_dim, embed_dim, bias=False)
+            nn.init.eye_(self.readout_rot.weight)
+            self.povm_head_seed_delta = nn.Parameter(torch.zeros(vocab_size, seed_dim))
+            self.tied_inv_temp = nn.Parameter(torch.tensor(1.0 / max(povm_temperature, 1e-4)))
             self._dual_inv_temp = 1.0 / povm_temperature
         else:
             raise ValueError(f"Unknown readout_mode: {readout_mode!r}")
@@ -143,18 +190,59 @@ class QuantumBornGPT(nn.Module):
 
         # 1. State preparation in seed space & isometric lift into full Hilbert space
         psi_0 = self.hilbert_lift(idx)  # (B, T, embed_dim)
+        if self.training and self.depolarizing_jitter > 0.0:
+            noise = torch.randn_like(psi_0) * (self.depolarizing_jitter / math.sqrt(self.embed_dim))
+            psi_0 = l2_normalize(psi_0 + noise, dim=-1, eps=self.eps)
+
+        if self.use_bigram_smear and T > 1 and self.smear_embed_gate is not None:
+            psi_prev = F.pad(psi_0[:, :-1, :], (0, 0, 1, 0))
+            eta = (0.06 * torch.tanh(self.smear_embed_gate)).to(psi_0.dtype)
+            psi_0 = l2_normalize(psi_0 + eta * psi_prev, dim=-1, eps=self.eps)
+
         psi = psi_0
         layer_states: list[torch.Tensor] = []
+        encoder_states: list[torch.Tensor] = []
+        n_half = self.num_layers // 2
 
         cos, sin = self.rope.get_cos_sin(T)
-        for block in self.blocks:
+        for layer_idx, block in enumerate(self.blocks):
             psi = block(psi, cos=cos, sin=sin, psi_0=psi_0)
+            if (
+                self.use_unet_interferometry
+                and self.unet_gates is not None
+                and self.unet_scales is not None
+            ):
+                if layer_idx < n_half:
+                    encoder_states.append(psi)
+                elif layer_idx >= self.num_layers - n_half:
+                    enc_idx = self.num_layers - 1 - layer_idx
+                    skip_psi = encoder_states[enc_idx]
+                    u_scale = (0.35 * torch.tanh(self.unet_scales[enc_idx])).to(psi.dtype)
+                    skip_rot = F.linear(skip_psi, self.unet_gates[enc_idx].to(psi.dtype))
+                    psi = l2_normalize(
+                        psi + u_scale * l2_normalize(skip_rot, dim=-1, eps=self.eps),
+                        dim=-1,
+                        eps=self.eps,
+                    )
             if return_layer_states:
                 layer_states.append(psi)
 
         # 2. POVM Measurement Collapse
         if self.readout_mode == "asymmetric" and self.povm_readout is not None:
             logits = self.povm_readout(psi)
+        elif (
+            self.readout_mode == "tied_stiefel"
+            and self.readout_rot is not None
+            and self.povm_head_seed_delta is not None
+            and self.tied_inv_temp is not None
+        ):
+            psi_final = l2_normalize(self.readout_rot(psi), dim=-1, eps=self.eps)
+            phi_seed = self.hilbert_lift.collapse_to_seed(psi_final)
+            M_seed = l2_normalize(self.wte.weight + self.povm_head_seed_delta, dim=1, eps=self.eps).to(
+                phi_seed.dtype
+            )
+            inv_t = torch.clamp(self.tied_inv_temp, min=1.0, max=60.0).to(phi_seed.dtype)
+            logits = F.linear(phi_seed, M_seed) * inv_t
         else:
             psi_final = l2_normalize(psi, dim=-1, eps=self.eps)
             phi_seed = self.hilbert_lift.collapse_to_seed(psi_final)

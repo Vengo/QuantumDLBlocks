@@ -81,6 +81,64 @@ uv pip install -e ".[dev,jax]"
 | `calibration_ood` | **Quantum POVM + von Neumann Entropy** | 18,434 | `ood_auroc`: **0.98** | `id_ece=0.165`, `corrupted_ece=0.248`, `brier=0.363` |
 | `calibration_ood` | **Classical Unbounded Softmax** | 5,744 | `ood_auroc`: **0.57** | `id_ece=0.058`, `corrupted_ece=0.058`, `brier=0.890` |
 
+## 10-Qubit ($d=1024$, ~124M–189M Params) FineWeb 10B Benchmark & Quantum Slowrun (`examples/05_fineweb_10qubit_born_gpt.py`)
+
+### Initial 100-Step Single-Pass Baseline Comparison
+Executed on real FineWeb GPT-2 shards (`29,999,488` train tokens, `4,999,488` validation tokens, `vocab_size=50,304`, `block_size=512`, `batch_size=16`, `100` steps in `bfloat16` on an **NVIDIA RTX PRO 6000 Blackwell Server Edition**):
+
+| Model | Params | Val Loss | Val PPL | Top-1 Acc | Med Target Rank | Stiefel IsoErr | Peak VRAM | Throughput |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **10-Qubit QuantumBornGPT (Dense, Flash-Born + StiefelMuon)** | 124,141,694 | **6.9150** | **1,007.3** | **11.30%** | 83 | **0.8662** | **17,588 MB** | 77,062 tok/s |
+| **10-Qubit QuantumBornMoE-GPT (4 Exp, Top-2, Parseval Router)** | 160,870,533 | **6.9229** | **1,015.3** | 10.96% | **77** | **0.8737** | 20,509 MB | 57,400 tok/s |
+| **ClassicalGPTBaseline (Matched 10-Qubit Scale, Softmax+LN)** | 124,172,288 | **7.2788** | **1,449.2** | 8.69% | 120 | 13.2821 | 18,122 MB | 156,224 tok/s |
+
+### 6-Loop Cumulative Quantum-Geometric Architectural Improvement Study (`150` steps = `1,228,800` tokens/loop)
+Translating data-efficient Slowrun principles into strictly quantum-geometric primitives on $S^{d-1} \times \mathrm{St}(n, p)$ (zero Softmax, zero LayerNorm, zero GELU/SiLU):
+
+| Architecture Loop | Params | Val CE | Val PPL | Top-1 Acc | Med Rank | Stiefel IsoErr | Throughput |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **ClassicalGPTBaseline (Matched 10-Qubit Scale, Softmax+LN)** | 116.83M | 7.1169 | 1,232.6 | 10.72% | 89 | 16.8400 | 195,939 tok/s |
+| **Loop 0: Baseline 10-Qubit QuantumBornGPT (Untied POVM)** | 116.80M | 6.6579 | 778.9 | 13.98% | 56 | 1.0348 | 88,043 tok/s |
+| **Loop 1: + Stiefel-Tied POVM Readout & Warmup-Cosine Muon** | 85.79M | 6.4485 | 631.8 | 15.09% | 45 | **0.0834** | 86,952 tok/s |
+| **Loop 2: + Zero-Init Bigram Smear & Causal QK Wave Filter** | 85.79M | 6.4013 | 602.7 | 15.28% | 42 | **0.0916** | 85,476 tok/s |
+| **Loop 3: + Mach-Zehnder U-Net Skip Interferometry** | 88.93M | 6.3710 | 584.6 | 15.54% | 40 | **0.0842** | 80,918 tok/s |
+| **Loop 4: + Two-Beam Bilinear Quantum Interference MLP** | 103.61M | 6.3547 | 575.2 | 15.54% | 38 | **0.0873** | 70,016 tok/s |
+| **Loop 5: + Dual-Frame Full-Hilbert 10-Qubit POVM Readout** | 155.13M | 6.3440 | 569.1 | 15.80% | **37** | **0.0878** | 60,100 tok/s |
+| **Loop 6: + Coherent Shared + Parseval QuantumBornMoE (4 Exp)** | 188.70M | **6.3394** | **566.5** | **15.87%** | 38 | **0.1164** | 48,541 tok/s |
+
+### Multi-Epoch FineWeb Quantum Slowrun (`5` Full Epochs over Fixed FineWeb Shard, `103.61M` Params)
+Looping 5 full passes (`1,500` steps, `24.58M` total tokens processed) over a fixed FineWeb shard using `QuantumBornGPT(..., slowrun=True)` with Associative Stiefel-Tied POVM Readout, `TwoBeamQuantumInterference`, Mach-Zehnder U-Net Skip Interferometry, Cautious Stiefel Weight Decay, and Spherical Depolarizing Jitter:
+
+| Epoch (Step / Tokens) | Train CE | Val CE | Val PPL | Top-1 Acc | Top-5 Acc | Med Rank | Stiefel IsoErr | Throughput |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Epoch 0.0** (1 / 0.02M) | 13.7927 | **13.7304** | **918,453.7** | 0.02% | 0.03% | 25142 | 0.0008 | 78,329 tok/s |
+| **Epoch 0.5** (150 / 2.46M) | 6.1332 | **6.1961** | **490.8** | 15.96% | 31.41% | 34 | 0.6329 | 78,284 tok/s |
+| **Epoch 1.0** (300 / 4.92M) | 6.0308 | **5.8852** | **359.7** | 17.08% | 33.73% | 24 | 0.5957 | 78,333 tok/s |
+| **Epoch 1.5** (450 / 7.37M) | 5.2388 | **5.6014** | **270.8** | 19.36% | 36.54% | 18 | 0.5098 | 78,343 tok/s |
+| **Epoch 2.0** (600 / 9.83M) | 5.3548 | **5.5140** | **248.2** | 19.82% | 37.50% | 16 | 0.4218 | 78,347 tok/s |
+| **Epoch 2.5** (750 / 12.29M) | 4.9767 | **5.4198** | **225.8** | 20.58% | 38.60% | 14 | 0.3178 | 78,346 tok/s |
+| **Epoch 3.0** (900 / 14.75M) | 4.9712 | **5.3105** | **202.5** | 21.73% | 39.78% | 12 | 0.2153 | 78,344 tok/s |
+| **Epoch 3.5** (1,050 / 17.20M) | 5.3558 | **5.2286** | **186.5** | 22.23% | 40.87% | 12 | 0.1444 | 78,343 tok/s |
+| **Epoch 4.0** (1,200 / 19.66M) | 5.0159 | **5.1277** | **168.6** | 23.17% | 41.94% | 10 | 0.0863 | 78,341 tok/s |
+| **Epoch 4.5** (1,350 / 22.12M) | 5.3828 | **5.1117** | **166.0** | 23.52% | 42.40% | 10 | 0.0497 | 78,340 tok/s |
+| **Epoch 5.0** (1,500 / 24.58M) | 4.8484 | **5.0773** | **160.3** | **23.79%** | **42.88%** | **9** | **0.0379** | 78,339 tok/s |
+
+### 10-Epoch Multi-Pass Generalization Study (`QuantumBornGPT` vs. `ClassicalGPTBaseline` on Fixed `1.97M`-Token Micro-Shard)
+Stress-testing multi-epoch sample efficiency at a extreme **52:1 parameter-to-token ratio** (`103.61M` parameters looped for `10` full epochs over a fixed `1.97M`-token FineWeb slice): `QuantumBornGPT` surpasses the classical model's best 10-epoch validation loss by **Epoch 2** (`6.0022` vs `6.1115`) and reaches **`Val CE: 5.5941` (`Val PPL: 268.8`, `Top-1: 19.91%`, `MedRank: 16`)** while driving Stiefel isometry error down to `0.0286` (whereas classical weight matrices suffer a $7\times$ singular-value explosion from `IsoErr 6.86` to `47.28`):
+
+| Epoch | Quantum Train CE | Quantum Val CE (PPL) | Quantum Top-1 / Rank | Quantum IsoErr | Classical Train CE | Classical Val CE (PPL) | Classical Top-1 / Rank | Classical IsoErr |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Epoch 1** | 7.5025 | **6.3353** (**564.1**) | **15.52%** / `40` | **0.5623** | 7.4366 | 6.8407 (935.2) | 12.04% / `68` | 6.8578 |
+| **Epoch 2** | 5.9199 | **6.0022** (**404.3**) | **17.07%** / `28` | **0.5853** | 6.5862 | 6.5353 (689.0) | 13.78% / `48` | 12.3377 |
+| **Epoch 3** | 5.4321 | **5.8545** (**348.8**) | **17.75%** / `23` | **0.4693** | 6.2524 | 6.3682 (583.0) | 15.03% / `40` | 18.4470 |
+| **Epoch 4** | 5.0829 | **5.7293** (**307.8**) | **18.49%** / `20` | **0.3954** | 5.9394 | 6.2669 (526.9) | 15.80% / `36` | 24.2110 |
+| **Epoch 5** | 4.7608 | **5.6465** (**283.3**) | **19.26%** / `18` | **0.3100** | 5.6131 | 6.2213 (503.4) | 16.27% / `32` | 30.3792 |
+| **Epoch 6** | 4.4533 | **5.5941** (**268.8**) | **19.83%** / `16` | **0.2216** | 5.2610 | 6.1480 (467.8) | 17.07% / `29` | 36.4335 |
+| **Epoch 7** | 4.0980 | **5.6004** (**270.5**) | **19.91%** / `16` | **0.1350** | 4.8957 | 6.1233 (456.3) | 17.59% / `28` | 41.1819 |
+| **Epoch 8** | 3.6801 | **5.6720** (**290.6**) | **19.83%** / `17` | **0.0777** | 4.5806 | 6.1125 (451.5) | 17.73% / `26` | 44.2692 |
+| **Epoch 9** | 3.2604 | **5.7849** (**325.3**) | **19.41%** / `19` | **0.0430** | 4.3301 | 6.1115 (451.0) | 17.83% / `26` | 46.1024 |
+| **Epoch 10** | 2.9820 | **5.8561** (**349.4**) | **18.89%** / `20` | **0.0286** | 4.1914 | 6.1138 (452.1) | 17.91% / `26` | 47.2783 |
+
 ## Q-NAS Head-to-Head Comparison (`examples/08_qnas_comparison_study.py`)
 
 | Q-NAS Method | Discovered Topology | Params | Search Time | Test Acc (%) | Extra Telemetry |

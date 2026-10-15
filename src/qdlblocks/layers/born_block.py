@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from ..functional import l2_normalize, riemannian_center
-from .activations import ReLUSquared
+from .activations import ReLUSquared, TwoBeamQuantumInterference
 from .attention import SubspaceProjectorBornAttention
 from .moe import QuantumBornMoE
 
@@ -16,8 +16,10 @@ class QuantumBornBlock(nn.Module):
 
     Combines:
     1. `SubspaceProjectorBornAttention` (positive-cone squared overlaps, zero Softmax).
-    2. Either a dense orthogonal Stiefel `ReLUSquared` channel (`num_experts=1`) or a
-       sparsely activated `QuantumBornMoE` projective instrument router (`num_experts > 1`).
+    2. Either:
+       - Sparsely activated `QuantumBornMoE` projective instrument router (`num_experts > 1`),
+       - Two-beam bilinear Stiefel wave interferometer `TwoBeamQuantumInterference` (`use_two_beam_mlp=True`), or
+       - Dense orthogonal Stiefel `ReLUSquared` channel (`num_experts=1, use_two_beam_mlp=False`).
     3. Strict hyperspherical residual blending `x <- l2_normalize(x + sublayer(x))`
        (with optional zero-mean Riemannian centering and coherent input-state highway mixing).
     """
@@ -37,6 +39,8 @@ class QuantumBornBlock(nn.Module):
         learnable_temperature: bool = False,
         value_residual_mixing: bool = False,
         input_highway_mixing: bool = False,
+        use_qk_wave_filter: bool = False,
+        use_two_beam_mlp: bool = False,
         complex_phase_attention: bool = False,
         use_flash_born: bool = False,
         eps: float = 1e-12,
@@ -50,6 +54,7 @@ class QuantumBornBlock(nn.Module):
         self.strict_spherical_residual = strict_spherical_residual
         self.riemannian_centering = riemannian_centering
         self.input_highway_mixing = input_highway_mixing
+        self.use_two_beam_mlp = use_two_beam_mlp
         self.eps = eps
 
         self.attn = SubspaceProjectorBornAttention(
@@ -59,6 +64,7 @@ class QuantumBornBlock(nn.Module):
             is_causal=is_causal,
             learnable_temperature=learnable_temperature,
             value_residual_mixing=value_residual_mixing,
+            use_qk_wave_filter=use_qk_wave_filter,
             complex_phase=complex_phase_attention,
             use_flash_born=use_flash_born,
             eps=eps,
@@ -72,11 +78,24 @@ class QuantumBornBlock(nn.Module):
                 top_k=self.top_k_experts,
                 learnable_temperature=learnable_temperature,
             )
+            self.two_beam_mlp: TwoBeamQuantumInterference | None = None
+            self.ff1 = None
+            self.act = None
+            self.ff2 = None
+        elif use_two_beam_mlp:
+            self.moe = None
+            self.two_beam_mlp = TwoBeamQuantumInterference(
+                embed_dim=embed_dim,
+                hidden_dim=self.hidden_dim,
+                normalize_output=True,
+                eps=eps,
+            )
             self.ff1 = None
             self.act = None
             self.ff2 = None
         else:
             self.moe = None
+            self.two_beam_mlp = None
             self.ff1 = nn.Linear(embed_dim, self.hidden_dim, bias=False)
             self.act = ReLUSquared()
             self.ff2 = nn.Linear(self.hidden_dim, embed_dim, bias=False)
@@ -97,6 +116,8 @@ class QuantumBornBlock(nn.Module):
     def _channel_forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.moe is not None:
             return self.moe(x)
+        if self.two_beam_mlp is not None:
+            return self.two_beam_mlp(x)
         assert self.ff1 is not None and self.act is not None and self.ff2 is not None
         return self.ff2(self.act(self.ff1(x)))
 

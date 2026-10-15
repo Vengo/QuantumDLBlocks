@@ -62,8 +62,32 @@ def build_10qubit_born_gpt(
     block_size: int = 1024,
     complex_phase: bool = False,
     use_flash_born: bool = True,
+    slowrun: bool = False,
 ) -> QuantumBornGPT:
-    """Instantiate the 124.14M-parameter 10-Qubit (d=1024) QuantumBornGPT model."""
+    """Instantiate the 10-Qubit (d=1024) QuantumBornGPT model (Standard or Next-Gen Slowrun)."""
+    if slowrun:
+        return QuantumBornGPT(
+            vocab_size=50304,
+            embed_dim=1024,
+            seed_dim=256,
+            num_heads=16,
+            num_layers=7,
+            hidden_dim=2048,
+            block_size=block_size,
+            povm_temperature=1.0 / 18.0,
+            readout_mode="tied_stiefel",
+            strict_spherical_residual=True,
+            learnable_temperature=True,
+            value_residual_mixing=True,
+            input_highway_mixing=True,
+            use_bigram_smear=True,
+            use_qk_wave_filter=True,
+            use_unet_interferometry=True,
+            use_two_beam_mlp=True,
+            depolarizing_jitter=0.015,
+            complex_phase_attention=complex_phase,
+            use_flash_born=use_flash_born,
+        )
     return QuantumBornGPT(
         vocab_size=50304,
         embed_dim=1024,
@@ -86,6 +110,7 @@ def build_10qubit_born_gpt(
 def main() -> None:
     parser = argparse.ArgumentParser(description="10-Qubit QuantumBornGPT Training & Dry-Run")
     parser.add_argument("--dry-run", action="store_true", help="Run parameter summary & 2 synthetic steps")
+    parser.add_argument("--slowrun", action="store_true", help="Enable all Next-Gen FineWeb Slowrun quantum-geometric innovations")
     parser.add_argument("--data-dir", type=str, default="./data/fineweb10B")
     parser.add_argument("--max-steps", type=int, default=5000)
     parser.add_argument("--eval-interval", type=int, default=250)
@@ -102,6 +127,7 @@ def main() -> None:
         block_size=args.block_size,
         complex_phase=args.complex_phase,
         use_flash_born=not args.no_flash_born,
+        slowrun=args.slowrun,
     ).to(device)
 
     muon_params, adamw_params = split_muon_adamw_params(raw_model)

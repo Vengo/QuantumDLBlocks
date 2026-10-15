@@ -263,9 +263,10 @@ class _FlashBornAttentionFn(torch.autograd.Function):
         eps: float,
     ) -> torch.Tensor:
         B, H, T, D = q.shape
-        q_c = q.contiguous()
-        k_c = k.contiguous()
-        v_c = v.contiguous()
+        target_dtype = v.dtype
+        q_c = q.to(target_dtype).contiguous()
+        k_c = k.to(target_dtype).contiguous()
+        v_c = v.to(target_dtype).contiguous()
 
         per_head_scale = scale.numel() > 1
         scale_flat = scale.contiguous().view(-1).to(dtype=torch.float32, device=q.device)
@@ -317,6 +318,9 @@ class _FlashBornAttentionFn(torch.autograd.Function):
         ctx.per_head_scale = per_head_scale
         ctx.scale_shape = scale.shape
         ctx.scale_dtype = scale.dtype
+        ctx.orig_q_dtype = q.dtype
+        ctx.orig_k_dtype = k.dtype
+        ctx.orig_v_dtype = v.dtype
         return out
 
     @staticmethod
@@ -324,7 +328,7 @@ class _FlashBornAttentionFn(torch.autograd.Function):
         q_c, k_c, v_c, out, z_denom, scale_flat = ctx.saved_tensors
         B, H, T, D = q_c.shape
 
-        do_c = do.contiguous()
+        do_c = do.to(v_c.dtype).contiguous()
         # dQ uses atomic_add in float32 for precision
         dq_f32 = torch.zeros((B, H, T, D), dtype=torch.float32, device=q_c.device)
         dk = torch.empty_like(k_c)
@@ -362,9 +366,11 @@ class _FlashBornAttentionFn(torch.autograd.Function):
             BLOCK_N=block_n,
         )
 
-        dq = dq_f32.to(q_c.dtype)
+        dq = dq_f32.to(ctx.orig_q_dtype)
+        dk_out = dk.to(ctx.orig_k_dtype)
+        dv_out = dv.to(ctx.orig_v_dtype)
         dscale = dscale_f32.view(ctx.scale_shape).to(ctx.scale_dtype)
-        return dq, dk, dv, dscale, None, None
+        return dq, dk_out, dv_out, dscale, None, None
 
 
 def flash_born_attention(
@@ -406,7 +412,7 @@ def flash_born_attention(
         return _FlashBornAttentionFn.apply(q, k, v, scale_t, is_causal, eps)
 
     # Fallback PyTorch implementation when on CPU or non-power-of-2 head_dim
-    scaled_overlap = torch.matmul(q, k.transpose(-1, -2)) * scale_t
+    scaled_overlap = torch.matmul(q.to(v.dtype), k.to(v.dtype).transpose(-1, -2)) * scale_t.to(v.dtype)
     projected_amp = torch.relu(scaled_overlap)
     prob = projected_amp.square()
     if is_causal:
@@ -414,4 +420,4 @@ def flash_born_attention(
         mask = torch.tril(torch.ones(T, T, device=q.device, dtype=prob.dtype)).view(1, 1, T, T)
         prob = prob * mask
     born_weights = prob / (torch.sum(prob, dim=-1, keepdim=True) + eps)
-    return torch.matmul(born_weights, v)
+    return torch.matmul(born_weights.to(v.dtype), v)

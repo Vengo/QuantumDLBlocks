@@ -227,6 +227,7 @@ class SubspaceProjectorBornAttention(nn.Module):
         is_causal: bool = True,
         learnable_temperature: bool = False,
         value_residual_mixing: bool = False,
+        use_qk_wave_filter: bool = False,
         complex_phase: bool = False,
         use_flash_born: bool = False,
         eps: float = 1e-12,
@@ -246,6 +247,7 @@ class SubspaceProjectorBornAttention(nn.Module):
         self.is_causal = is_causal
         self.learnable_temperature = learnable_temperature
         self.value_residual_mixing = value_residual_mixing
+        self.use_qk_wave_filter = use_qk_wave_filter
         self.complex_phase = complex_phase
         self.use_flash_born = use_flash_born
         self.eps = eps
@@ -271,6 +273,13 @@ class SubspaceProjectorBornAttention(nn.Module):
             self.v_mix_logit = nn.Parameter(torch.tensor(-1.1))
         else:
             self.register_parameter("v_mix_logit", None)
+
+        if use_qk_wave_filter:
+            self.q_prev_mix = nn.Parameter(torch.zeros(1, num_heads, 1, 1))
+            self.k_prev_mix = nn.Parameter(torch.zeros(1, num_heads, 1, 1))
+        else:
+            self.register_parameter("q_prev_mix", None)
+            self.register_parameter("k_prev_mix", None)
 
         self.register_buffer(
             "causal_mask",
@@ -313,6 +322,19 @@ class SubspaceProjectorBornAttention(nn.Module):
             V_0 = V_0.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
             alpha = torch.sigmoid(self.v_mix_logit).to(V.dtype)
             V = (1.0 - alpha) * V + alpha * V_0
+
+        if (
+            self.use_qk_wave_filter
+            and T > 1
+            and self.q_prev_mix is not None
+            and self.k_prev_mix is not None
+        ):
+            q_prev = F.pad(Q[:, :, :-1, :], (0, 0, 1, 0))
+            k_prev = F.pad(K[:, :, :-1, :], (0, 0, 1, 0))
+            qm = (0.06 * torch.tanh(self.q_prev_mix)).to(Q.dtype)
+            km = (0.06 * torch.tanh(self.k_prev_mix)).to(K.dtype)
+            Q = Q + qm * q_prev
+            K = K + km * k_prev
 
         if cos is not None and sin is not None:
             Q = apply_unitary_rope(Q, cos, sin)
