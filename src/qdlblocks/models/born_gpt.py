@@ -47,6 +47,8 @@ class QuantumBornGPT(nn.Module):
         num_layers: int = 7,
         hidden_dim: int | None = 2560,
         mlp_expansion: float = 2.5,
+        num_experts: int = 1,
+        top_k_experts: int = 2,
         block_size: int = 1024,
         povm_temperature: float = 0.035,
         readout_mode: ReadoutMode = "asymmetric",
@@ -65,6 +67,8 @@ class QuantumBornGPT(nn.Module):
         self.seed_dim = seed_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
+        self.num_experts = num_experts
+        self.top_k_experts = top_k_experts
         self.block_size = block_size
         self.readout_mode = readout_mode
         self.eps = eps
@@ -94,6 +98,8 @@ class QuantumBornGPT(nn.Module):
                     block_size=block_size,
                     hidden_dim=hidden_dim,
                     mlp_expansion=mlp_expansion,
+                    num_experts=num_experts,
+                    top_k_experts=top_k_experts,
                     is_causal=True,
                     strict_spherical_residual=strict_spherical_residual,
                     riemannian_centering=riemannian_centering,
@@ -130,17 +136,21 @@ class QuantumBornGPT(nn.Module):
         self,
         idx: torch.Tensor,
         targets: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return_layer_states: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
         """Forward pass from token indices `(B, T)` to `(logits, loss)`."""
         B, T = idx.shape
 
         # 1. State preparation in seed space & isometric lift into full Hilbert space
         psi_0 = self.hilbert_lift(idx)  # (B, T, embed_dim)
         psi = psi_0
+        layer_states: list[torch.Tensor] = []
 
         cos, sin = self.rope.get_cos_sin(T)
         for block in self.blocks:
             psi = block(psi, cos=cos, sin=sin, psi_0=psi_0)
+            if return_layer_states:
+                layer_states.append(psi)
 
         # 2. POVM Measurement Collapse
         if self.readout_mode == "asymmetric" and self.povm_readout is not None:
@@ -155,6 +165,8 @@ class QuantumBornGPT(nn.Module):
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.reshape(-1, self.vocab_size), targets.reshape(-1))
+        if return_layer_states:
+            return logits, loss, layer_states
         return logits, loss
 
     @torch.no_grad()

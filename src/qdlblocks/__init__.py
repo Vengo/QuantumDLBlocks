@@ -1,6 +1,6 @@
 """qdlblocks: Density-Matrix, Complex Hilbert-Space, and Stiefel/Born Quantum Deep Learning in PyTorch."""
 
-from . import functional, kernels, layers, metrics, models, optim, telemetry
+from . import benchmarks, functional, kernels, layers, metrics, models, optim, qnas, telemetry
 from .functional import (
     apply_unitary_rope,
     convex_density_mixture,
@@ -28,8 +28,10 @@ from .layers import (
     ProjectivePOVMHead,
     PureQuantumAttention,
     QuantumBornBlock,
+    QuantumBornMoE,
     ReLUSquared,
     SPAMNoise,
+    SparseKrausMoE,
     SphericalResidual,
     SubspaceProjectorBornAttention,
     UnitSphereEmbedding,
@@ -46,7 +48,16 @@ from .metrics import (
     stiefel_isometry_error,
     von_neumann_entropy,
 )
-from .models import DeepPureQuantumNetwork, HybridQuantumClassifier, QuantumBornGPT
+from .models import (
+    ClassicalSpeechCTCBaseline,
+    ComplexPhaseAcousticStem,
+    ComplexQuantumSpeechCTC,
+    ComplexSuperpositionAudioClassifier,
+    DeepPureQuantumNetwork,
+    HybridQuantumClassifier,
+    QuantumBornGPT,
+    QuantumBornViT,
+)
 from .optim import StiefelMuon, polar_snap_weights, split_muon_adamw_params
 from .telemetry import inspect_quantum_model
 
@@ -54,12 +65,14 @@ __version__ = "0.1.0"
 
 __all__ = [
     "__version__",
+    "benchmarks",
     "functional",
     "kernels",
     "layers",
     "metrics",
     "models",
     "optim",
+    "qnas",
     "telemetry",
     "HAS_TRITON",
     "flash_born_attention",
@@ -92,6 +105,8 @@ __all__ = [
     "UnitaryRoPE",
     "SphericalResidual",
     "QuantumBornBlock",
+    "QuantumBornMoE",
+    "SparseKrausMoE",
     "SPAMNoise",
     "DepolarizingNoise",
     # Metrics & Telemetry
@@ -113,4 +128,9 @@ __all__ = [
     "DeepPureQuantumNetwork",
     "HybridQuantumClassifier",
     "QuantumBornGPT",
+    "QuantumBornViT",
+    "ComplexSuperpositionAudioClassifier",
+    "ComplexPhaseAcousticStem",
+    "ComplexQuantumSpeechCTC",
+    "ClassicalSpeechCTCBaseline",
 ]

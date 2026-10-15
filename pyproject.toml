@@ -30,14 +30,28 @@ dependencies = [
 [project.optional-dependencies]
 examples = [
     "scikit-learn>=1.3.0",
+    "pyarrow>=14.0.0",
+    "soundfile>=0.12.0",
+]
+jax = [
+    "jax>=0.4.30",
+    "jaxlib>=0.4.30",
+    "equinox>=0.11.5",
+    "optax>=0.2.2",
+    "haliax>=1.2.0",
+]
+levanter = [
+    "levanter>=1.2.0",
 ]
 dev = [
     "pytest>=7.4.0",
     "scikit-learn>=1.3.0",
+    "pyarrow>=14.0.0",
+    "soundfile>=0.12.0",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/qdlblocks"]
+packages = ["src/qdlblocks", "src/qdlblocks_jax"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

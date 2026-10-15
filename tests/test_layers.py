@@ -14,10 +14,14 @@ from qdlblocks import (
     ProjectivePOVMHead,
     PureQuantumAttention,
     QuantumBornBlock,
+    QuantumBornMoE,
     SPAMNoise,
+    SparseKrausMoE,
     SubspaceProjectorBornAttention,
     UnitaryRoPE,
     is_valid_density_matrix,
+    l2_normalize,
+    state_to_density,
 )
 
 
@@ -133,3 +137,32 @@ def test_causal_masking_in_born_attention() -> None:
     # Strictly upper triangular entries (j > i) must be exact 0.0
     upper = torch.triu(attn.last_born_weights, diagonal=1)
     assert torch.all(upper == 0.0)
+
+
+def test_quantum_born_moe_and_sparse_kraus_moe() -> None:
+    torch.manual_seed(14)
+    # 1. Pure-state QuantumBornMoE & MoE-enabled QuantumBornBlock
+    x = l2_normalize(torch.randn(3, 12, 64, requires_grad=True), dim=-1)
+    moe = QuantumBornMoE(embed_dim=64, expert_hidden_dim=128, num_experts=6, top_k=2)
+    y = moe(x)
+    assert y.shape == (3, 12, 64)
+    norms = torch.norm(y, p=2, dim=-1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
+    assert moe.last_routing_stats["positive_cone_zero_fraction"] > 0.0
+    y.sum().backward()
+    assert moe.router_proj.weight.grad is not None
+
+    block_moe = QuantumBornBlock(
+        embed_dim=64, num_heads=4, block_size=16, hidden_dim=96, num_experts=4, top_k_experts=2
+    )
+    out_block = block_moe(x.detach())
+    assert out_block.shape == (3, 12, 64)
+
+    # 2. Density-matrix SparseKrausMoE
+    psi = torch.complex(torch.randn(4, 10), torch.randn(4, 10))
+    rho = state_to_density(psi)
+    sparse_kraus = SparseKrausMoE(in_dim=10, out_dim=8, num_experts=6, top_k=2)
+    rho_out = sparse_kraus(rho)
+    assert rho_out.shape == (4, 8, 8)
+    assert is_valid_density_matrix(rho_out)[0]
+

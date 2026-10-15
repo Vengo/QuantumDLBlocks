@@ -8,6 +8,7 @@ import torch.nn as nn
 from ..functional import l2_normalize, riemannian_center
 from .activations import ReLUSquared
 from .attention import SubspaceProjectorBornAttention
+from .moe import QuantumBornMoE
 
 
 class QuantumBornBlock(nn.Module):
@@ -15,8 +16,8 @@ class QuantumBornBlock(nn.Module):
 
     Combines:
     1. `SubspaceProjectorBornAttention` (positive-cone squared overlaps, zero Softmax).
-    2. Bias-free orthogonal Stiefel feed-forward projections (`ff1`, `ff2`) with
-       Projective `ReLUSquared` multi-particle activation `f(x) = max(0, x)^2`.
+    2. Either a dense orthogonal Stiefel `ReLUSquared` channel (`num_experts=1`) or a
+       sparsely activated `QuantumBornMoE` projective instrument router (`num_experts > 1`).
     3. Strict hyperspherical residual blending `x <- l2_normalize(x + sublayer(x))`
        (with optional zero-mean Riemannian centering and coherent input-state highway mixing).
     """
@@ -28,6 +29,8 @@ class QuantumBornBlock(nn.Module):
         block_size: int = 1024,
         hidden_dim: int | None = None,
         mlp_expansion: float = 2.5,
+        num_experts: int = 1,
+        top_k_experts: int = 2,
         is_causal: bool = True,
         strict_spherical_residual: bool = True,
         riemannian_centering: bool = False,
@@ -42,6 +45,8 @@ class QuantumBornBlock(nn.Module):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.hidden_dim = hidden_dim if hidden_dim is not None else int(embed_dim * mlp_expansion)
+        self.num_experts = num_experts
+        self.top_k_experts = min(top_k_experts, num_experts)
         self.strict_spherical_residual = strict_spherical_residual
         self.riemannian_centering = riemannian_centering
         self.input_highway_mixing = input_highway_mixing
@@ -59,12 +64,24 @@ class QuantumBornBlock(nn.Module):
             eps=eps,
         )
 
-        self.ff1 = nn.Linear(embed_dim, self.hidden_dim, bias=False)
-        self.act = ReLUSquared()
-        self.ff2 = nn.Linear(self.hidden_dim, embed_dim, bias=False)
-
-        nn.init.orthogonal_(self.ff1.weight)
-        nn.init.orthogonal_(self.ff2.weight)
+        if num_experts > 1:
+            self.moe: QuantumBornMoE | None = QuantumBornMoE(
+                embed_dim=embed_dim,
+                expert_hidden_dim=self.hidden_dim,
+                num_experts=num_experts,
+                top_k=self.top_k_experts,
+                learnable_temperature=learnable_temperature,
+            )
+            self.ff1 = None
+            self.act = None
+            self.ff2 = None
+        else:
+            self.moe = None
+            self.ff1 = nn.Linear(embed_dim, self.hidden_dim, bias=False)
+            self.act = ReLUSquared()
+            self.ff2 = nn.Linear(self.hidden_dim, embed_dim, bias=False)
+            nn.init.orthogonal_(self.ff1.weight)
+            nn.init.orthogonal_(self.ff2.weight)
 
         if input_highway_mixing:
             # Sigmoid gate initialized near ~0.12 reference-beam highway blend
@@ -76,6 +93,12 @@ class QuantumBornBlock(nn.Module):
         if self.riemannian_centering:
             return riemannian_center(x, dim=-1, eps=self.eps)
         return l2_normalize(x, dim=-1, eps=self.eps)
+
+    def _channel_forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.moe is not None:
+            return self.moe(x)
+        assert self.ff1 is not None and self.act is not None and self.ff2 is not None
+        return self.ff2(self.act(self.ff1(x)))
 
     def forward(
         self,
@@ -100,11 +123,11 @@ class QuantumBornBlock(nn.Module):
         if self.strict_spherical_residual:
             a = self.attn(x, cos=cos, sin=sin, psi_0=psi_0)
             x = self._spherical_norm(x + a)
-            h = self.ff2(self.act(self.ff1(x)))
+            h = self._channel_forward(x)
             x = self._spherical_norm(x + h)
         else:
             x = x + self.attn(self._spherical_norm(x), cos=cos, sin=sin, psi_0=psi_0)
-            h = self.ff2(self.act(self.ff1(self._spherical_norm(x))))
+            h = self._channel_forward(self._spherical_norm(x))
             x = x + h
 
         return x
