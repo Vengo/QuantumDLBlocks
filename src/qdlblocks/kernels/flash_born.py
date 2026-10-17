@@ -134,7 +134,6 @@ if HAS_TRITON:
         dO_ptr,
         Z_ptr,
         Scale_ptr,
-        dQ_ptr,
         dK_ptr,
         dV_ptr,
         dScale_ptr,
@@ -165,7 +164,6 @@ if HAS_TRITON:
         v_base = V_ptr + pid_b * stride_qb + pid_h * stride_qh
         o_base = Out_ptr + pid_b * stride_qb + pid_h * stride_qh
         do_base = dO_ptr + pid_b * stride_qb + pid_h * stride_qh
-        dq_base = dQ_ptr + pid_b * stride_qb + pid_h * stride_qh
         dk_base = dK_ptr + pid_b * stride_qb + pid_h * stride_qh
         dv_base = dV_ptr + pid_b * stride_qb + pid_h * stride_qh
         z_base = Z_ptr + pid_b * stride_zb + pid_h * stride_zh
@@ -202,7 +200,6 @@ if HAS_TRITON:
             do_f32 = do.to(tl.float32)
             z_denom = tl.load(z_ptrs, mask=mask_m, other=1.0).to(tl.float32)
 
-            # Recompute overlap in SRAM: raw_dot = <Q_i, K_j>
             raw_dot = tl.dot(q, tl.trans(k), allow_tf32=False)
             s = raw_dot * scale
             a = tl.maximum(s, 0.0)
@@ -214,31 +211,21 @@ if HAS_TRITON:
             a = tl.where(valid_mask, a, 0.0)
 
             p = a * a
-            w = p / z_denom[:, None]  # Normalized Born weights in SRAM
+            w = p / z_denom[:, None]
 
-            # dV += w^T @ dO
             dv_acc += tl.dot(tl.trans(w.to(do.dtype)), do, allow_tf32=False)
 
-            # dp_ij = (<dO_i, V_j> - <dO_i, O_i>) / z_denom_i
             delta_i = tl.sum(do_f32 * o, axis=1)
             dov = tl.dot(do, tl.trans(v), allow_tf32=False)
             dp = (dov - delta_i[:, None]) / z_denom[:, None]
 
-            # ds_ij = 2 * a_ij * dp_ij
             ds = 2.0 * a * dp
             ds = tl.where(valid_mask, ds, 0.0)
 
-            # Accumulate gradient wrt scale: dL/d(scale) = sum_{i,j} ds_{ij} * <Q_i, K_j>
             dscale_acc += tl.sum(ds * raw_dot)
 
             ds_typed = ds.to(q.dtype)
-            # dK += scale * ds^T @ Q
             dk_acc += tl.dot(tl.trans(ds_typed), q, allow_tf32=False) * scale
-
-            # Atomic add to dQ: dQ += scale * ds @ K
-            dq_tile = tl.dot(ds_typed, k, allow_tf32=False) * scale
-            dq_ptrs = dq_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-            tl.atomic_add(dq_ptrs, dq_tile, mask=mask_m[:, None])
 
         dk_ptrs = dk_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
         dv_ptrs = dv_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
@@ -249,6 +236,96 @@ if HAS_TRITON:
             tl.atomic_add(dScale_ptr + pid_h, dscale_acc)
         else:
             tl.atomic_add(dScale_ptr, dscale_acc)
+
+    @triton.jit
+    def _flash_born_bwd_dq_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        Out_ptr,
+        dO_ptr,
+        Z_ptr,
+        Scale_ptr,
+        dQ_ptr,
+        stride_qb,
+        stride_qh,
+        stride_qm,
+        stride_qd,
+        stride_zb,
+        stride_zh,
+        stride_zm,
+        T: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+        IS_CAUSAL: tl.constexpr,
+        PER_HEAD_SCALE: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid_m = tl.program_id(0)
+        pid_b = tl.program_id(1)
+        pid_h = tl.program_id(2)
+
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, HEAD_DIM)
+        mask_m = offs_m < T
+
+        q_base = Q_ptr + pid_b * stride_qb + pid_h * stride_qh
+        k_base = K_ptr + pid_b * stride_qb + pid_h * stride_qh
+        v_base = V_ptr + pid_b * stride_qb + pid_h * stride_qh
+        o_base = Out_ptr + pid_b * stride_qb + pid_h * stride_qh
+        do_base = dO_ptr + pid_b * stride_qb + pid_h * stride_qh
+        dq_base = dQ_ptr + pid_b * stride_qb + pid_h * stride_qh
+        z_base = Z_ptr + pid_b * stride_zb + pid_h * stride_zh
+
+        if PER_HEAD_SCALE:
+            scale = tl.load(Scale_ptr + pid_h).to(tl.float32)
+        else:
+            scale = tl.load(Scale_ptr).to(tl.float32)
+
+        q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        o_ptrs = o_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        do_ptrs = do_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        z_ptrs = z_base + offs_m * stride_zm
+
+        q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+        o = tl.load(o_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
+        do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
+        do_f32 = do.to(tl.float32)
+        z_denom = tl.load(z_ptrs, mask=mask_m, other=1.0).to(tl.float32)
+        delta_i = tl.sum(do_f32 * o, axis=1)
+
+        dq_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+        max_n = (pid_m + 1) * BLOCK_M if IS_CAUSAL else T
+        max_n = tl.minimum(max_n, T)
+
+        for start_n in range(0, max_n, BLOCK_N):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            mask_n = offs_n < T
+
+            k_ptrs = k_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
+            v_ptrs = v_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
+
+            k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
+            v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+
+            s = tl.dot(q, tl.trans(k), allow_tf32=False) * scale
+            a = tl.maximum(s, 0.0)
+
+            if IS_CAUSAL:
+                valid_mask = (offs_m[:, None] >= offs_n[None, :]) & mask_m[:, None] & mask_n[None, :]
+            else:
+                valid_mask = mask_m[:, None] & mask_n[None, :]
+            a = tl.where(valid_mask, a, 0.0)
+
+            dov = tl.dot(do, tl.trans(v), allow_tf32=False)
+            dp = (dov - delta_i[:, None]) / z_denom[:, None]
+            ds = 2.0 * a * dp
+            ds = tl.where(valid_mask, ds, 0.0)
+
+            dq_acc += tl.dot(ds.to(k.dtype), k, allow_tf32=False) * scale
+
+        dq_ptrs = dq_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
+        tl.store(dq_ptrs, dq_acc.to(dQ_ptr.dtype.element_ty), mask=mask_m[:, None])
 
 
 class _FlashBornAttentionFn(torch.autograd.Function):
@@ -263,7 +340,7 @@ class _FlashBornAttentionFn(torch.autograd.Function):
         eps: float,
     ) -> torch.Tensor:
         B, H, T, D = q.shape
-        target_dtype = v.dtype
+        target_dtype = torch.get_autocast_gpu_dtype() if (q.is_cuda and torch.is_autocast_enabled()) else v.dtype
         q_c = q.to(target_dtype).contiguous()
         k_c = k.to(target_dtype).contiguous()
         v_c = v.to(target_dtype).contiguous()
@@ -274,8 +351,8 @@ class _FlashBornAttentionFn(torch.autograd.Function):
         out = torch.empty_like(q_c)
         z_denom = torch.empty((B, H, T), dtype=torch.float32, device=q.device)
 
-        block_m = 32 if T >= 32 else 16
-        block_n = 32 if T >= 32 else 16
+        block_m = 64 if T >= 64 else (32 if T >= 32 else 16)
+        block_n = 64 if T >= 64 else (32 if T >= 32 else 16)
         grid = (triton.cdiv(T, block_m), B, H)
 
         _flash_born_fwd_kernel[grid](
@@ -329,17 +406,17 @@ class _FlashBornAttentionFn(torch.autograd.Function):
         B, H, T, D = q_c.shape
 
         do_c = do.to(v_c.dtype).contiguous()
-        # dQ uses atomic_add in float32 for precision
-        dq_f32 = torch.zeros((B, H, T, D), dtype=torch.float32, device=q_c.device)
+        dq = torch.empty_like(q_c)
         dk = torch.empty_like(k_c)
         dv = torch.empty_like(v_c)
         dscale_f32 = torch.zeros_like(scale_flat, dtype=torch.float32)
 
-        block_m = 32 if T >= 32 else 16
-        block_n = 32 if T >= 32 else 16
-        grid = (triton.cdiv(T, block_n), B, H)
+        block_m = 64 if T >= 64 else (32 if T >= 32 else 16)
+        block_n = 64 if T >= 64 else (32 if T >= 32 else 16)
+        grid_n = (triton.cdiv(T, block_n), B, H)
+        grid_m = (triton.cdiv(T, block_m), B, H)
 
-        _flash_born_bwd_kernel[grid](
+        _flash_born_bwd_kernel[grid_n](
             q_c,
             k_c,
             v_c,
@@ -347,7 +424,6 @@ class _FlashBornAttentionFn(torch.autograd.Function):
             do_c,
             z_denom,
             scale_flat,
-            dq_f32,
             dk,
             dv,
             dscale_f32,
@@ -366,11 +442,47 @@ class _FlashBornAttentionFn(torch.autograd.Function):
             BLOCK_N=block_n,
         )
 
-        dq = dq_f32.to(ctx.orig_q_dtype)
+        _flash_born_bwd_dq_kernel[grid_m](
+            q_c,
+            k_c,
+            v_c,
+            out,
+            do_c,
+            z_denom,
+            scale_flat,
+            dq,
+            q_c.stride(0),
+            q_c.stride(1),
+            q_c.stride(2),
+            q_c.stride(3),
+            z_denom.stride(0),
+            z_denom.stride(1),
+            z_denom.stride(2),
+            T=T,
+            HEAD_DIM=D,
+            IS_CAUSAL=ctx.is_causal,
+            PER_HEAD_SCALE=ctx.per_head_scale,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+        )
+
+        dq_out = dq.to(ctx.orig_q_dtype)
         dk_out = dk.to(ctx.orig_k_dtype)
         dv_out = dv.to(ctx.orig_v_dtype)
         dscale = dscale_f32.view(ctx.scale_shape).to(ctx.scale_dtype)
-        return dq, dk_out, dv_out, dscale, None, None
+        return dq_out, dk_out, dv_out, dscale, None, None
+
+
+@torch.compiler.disable
+def _run_triton_flash_born(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale_t: torch.Tensor,
+    is_causal: bool,
+    eps: float,
+) -> torch.Tensor:
+    return _FlashBornAttentionFn.apply(q, k, v, scale_t, is_causal, eps)
 
 
 def flash_born_attention(
@@ -409,7 +521,7 @@ def flash_born_attention(
         scale_t = scale
 
     if HAS_TRITON and q.is_cuda and is_pow2_d:
-        return _FlashBornAttentionFn.apply(q, k, v, scale_t, is_causal, eps)
+        return _run_triton_flash_born(q, k, v, scale_t, is_causal, eps)
 
     # Fallback PyTorch implementation when on CPU or non-power-of-2 head_dim
     scaled_overlap = torch.matmul(q.to(v.dtype), k.to(v.dtype).transpose(-1, -2)) * scale_t.to(v.dtype)

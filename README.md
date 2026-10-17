@@ -139,6 +139,41 @@ Stress-testing multi-epoch sample efficiency at a extreme **52:1 parameter-to-to
 | **Epoch 9** | 3.2604 | **5.7849** (**325.3**) | **19.41%** / `19` | **0.0430** | 4.3301 | 6.1115 (451.0) | 17.83% / `26` | 46.1024 |
 | **Epoch 10** | 2.9820 | **5.8561** (**349.4**) | **18.89%** / `20` | **0.0286** | 4.1914 | 6.1138 (452.1) | 17.91% / `26` | 47.2783 |
 
+### Full 100M-Token Multi-Epoch Compiled GPU & TPU Slowrun Benchmark (`examples/11_fineweb_100m_multiepoch_gpu_tpu.py`)
+Scaling to the full **100,000,000-token** FineWeb training shard (`fineweb_train_000001.bin`, `1,525` steps/epoch $\times$ `65,536` tok/step = `99.94M` tokens/epoch) with a matched 10-Qubit `QuantumBornGPT` (`d=1024, H=16, L=6, d_ff=1536x2, d_seed=128`, `70.68M` parameters) across both **Colab GPU (NVIDIA RTX PRO 6000 Blackwell)** and **Colab TPU (Google Cloud TPU v5e-1)**:
+
+#### 1. Accelerator Throughput, Memory Footprint & Model FLOPs Utilization (MFU / HFU)
+| Accelerator Backend | Compiler & Kernel Stack | Sustained Speed | Analytical TFLOP/s (MFU) | Hardware TFLOP/s (HFU) | Compute / MXU Util | Live / Peak Memory |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: |
+| **NVIDIA RTX PRO 6000 Blackwell** (`gpu_slowrun`) | `torch.compile` (TorchInductor) + Fused Triton `flash_born_attention` (`64x64` MMA + Atomic-Free SRAM Backward `dQ`/`dK`/`dV`) + Compiled `StiefelMuon` | **311,495 tok/s** (`3.98x` vs eager) | **143.8 TFLOP/s** (**28.6%** MFU) | **170.8 TFLOP/s** (**33.9%** HFU) | **99% SM Util** (`59%` Mem BW, `525.5 W`) | **24.97 GB Peak** (`25.26 / 95.59 GiB`) |
+| **Google Cloud TPU v5e-1** (`tpu_slowrun`) | Pure JAX/XLA `@jax.jit(donate_argnums=(0, 1))` + Rematerialized MXU Born Attention + Scatter-Free Factorized MXU POVM CE (`mxu_factorized_ce`) + BF16 MXU `StiefelMuon` | **122,073 tok/s** | **56.4 TFLOP/s** (**28.6%** MFU) | **66.9 TFLOP/s** (**34.0%** HFU) | **100.0% MXU Duty Cycle** (`libtpu:8431`) | **5.76 / 16.91 GB HBM2e** (**34.1%**) |
+
+#### 2. Matched 3-Epoch Full 100M-Token (`299.83M` Total Tokens) GPU vs. TPU Progression
+| Epoch (Step / Tokens) | GPU Train CE | GPU Val CE (Val PPL) | GPU Top-1 / Top-5 / Rank | GPU IsoErr | TPU Train CE | TPU Val CE (Val PPL) | TPU Top-1 / Top-5 / Rank | TPU IsoErr |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Epoch 0.0** (`0` / `0.00M`) | 20.7653 | 20.7653 (485.2M) | 0.02% / 0.03% / `23804` | 0.0002 | 20.6317 | 20.6317 (485.2M) | 0.02% / 0.03% / `25874` | 0.0000 |
+| **Epoch 0.5** (`762` / `49.94M`) | 5.9415 | **5.0007** (**148.5**) | 24.33% / 42.23% / `9` | 1.2568 | 6.3505 | **5.2209** (**185.1**) | 22.63% / 39.84% / `13` | 1.4866 |
+| **Epoch 1.0** (`1,525` / `99.94M`) | 4.8441 | **4.7547** (**116.1**) | 26.06% / 44.72% / `7` | 0.9785 | 5.0234 | **4.9054** (**135.0**) | 24.78% / 42.95% / `9` | 1.0739 |
+| **Epoch 1.5** (`2,287` / `149.88M`) | 4.6417 | **4.6126** (**100.7**) | 27.22% / 46.33% / `6` | 0.7210 | 4.7845 | **4.7845** (**119.6**) | 25.66% / 44.30% / `8` | 0.7182 |
+| **Epoch 2.0** (`3,050` / `199.88M`) | 4.5670 | **4.5284** (**92.6**) | 27.96% / 47.23% / `6` | 0.4623 | 4.6912 | **4.6893** (**108.8**) | 26.38% / 45.21% / `7` | 0.4763 |
+| **Epoch 2.5** (`3,812` / `249.82M`) | 4.4032 | **4.4006** (**81.5**) | 29.35% / 48.78% / `5` | 0.2648 | 4.5571 | **4.5555** (**95.2**) | 27.65% / 46.93% / `6` | 0.2660 |
+| **Epoch 3.0** (`4,575` / `299.83M`) | **4.3322** | **4.3488** (**77.4**) | **29.80%** / **49.38%** / **`5`** | **0.1613** | **4.4846** | **4.4849** (**88.7**) | **28.43%** / **47.76%** / **`6`** | **0.1623** |
+
+#### 3. Extended 5-Epoch Full 100M-Token (`499.71M` Total Tokens — Half a Billion Tokens) GPU Scaling Run
+| Epoch | Step | Tokens Processed | Train CE | Val CE | Val PPL | Top-1 Acc | Top-5 Acc | Med Target Rank | Stiefel IsoErr | Throughput |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Epoch 0.0** | 0 | 0.00M | 20.7653 | 20.7653 | 485,165,195.4 | 0.02% | 0.03% | 23,804 | 0.0002 | — |
+| **Epoch 0.5** | 762 | 49.94M | 5.9102 | **4.9337** | **138.9** | 25.15% | 43.06% | 9 | 1.3763 | 310,177 tok/s |
+| **Epoch 1.0** | 1,525 | 99.94M | 4.8612 | **4.8971** | **133.9** | 24.50% | 43.09% | 8 | 1.1037 | 311,481 tok/s |
+| **Epoch 1.5** | 2,287 | 149.88M | 4.7120 | **4.7164** | **111.8** | 26.17% | 44.97% | 7 | 0.9996 | 311,485 tok/s |
+| **Epoch 2.0** | 3,050 | 199.88M | 4.6615 | **4.6395** | **103.5** | 26.75% | 45.79% | 6 | 0.8279 | 311,488 tok/s |
+| **Epoch 2.5** | 3,812 | 249.82M | 4.5580 | **4.5745** | **97.0** | 27.47% | 46.70% | 6 | 0.6366 | 311,490 tok/s |
+| **Epoch 3.0** | 4,575 | 299.83M | 4.5210 | **4.5340** | **93.1** | 27.78% | 47.17% | 6 | 0.5188 | 311,491 tok/s |
+| **Epoch 3.5** | 5,337 | 349.77M | 4.4112 | **4.4549** | **86.0** | 28.50% | 47.95% | 5 | 0.3864 | 311,493 tok/s |
+| **Epoch 4.0** | 6,100 | 399.77M | 4.3810 | **4.3720** | **79.2** | 29.41% | 49.01% | 5 | 0.2627 | 311,495 tok/s |
+| **Epoch 4.5** | 6,862 | 449.71M | 4.2620 | **4.3058** | **74.1** | 30.24% | 49.96% | 5 | 0.1863 | 311,484 tok/s |
+| **Epoch 5.0** | 7,625 | **499.71M** | **4.2336** | **4.2676** | **71.3** | **30.55%** | **50.35%** | **4** | **0.1560** | **311,495 tok/s** |
+
 ## Q-NAS Head-to-Head Comparison (`examples/08_qnas_comparison_study.py`)
 
 | Q-NAS Method | Discovered Topology | Params | Search Time | Test Acc (%) | Extra Telemetry |
@@ -152,7 +187,7 @@ Stress-testing multi-epoch sample efficiency at a extreme **52:1 parameter-to-to
 
 ## Included CLI Examples & Google Colab Notebooks
 
-### CLI Scripts (`examples/`)
+### CLI Scripts (`examples/` & `scripts/`)
 | Script | Description |
 | :--- | :--- |
 | `examples/01_pure_quantum_digits.py` | Multi-layer Pure Quantum Attention + Kraus Channel + POVM network on `load_digits` (Zero Conv, Zero ReLU, Zero Softmax). |
@@ -165,6 +200,8 @@ Stress-testing multi-epoch sample efficiency at a extreme **52:1 parameter-to-to
 | `examples/08_qnas_comparison_study.py` | Head-to-head comparison of all 3 Q-NAS paradigms against Classical Softmax DARTS. |
 | `examples/09_jax_haliax_born_gpt.py` | JAX + Equinox + Haliax 6-Qubit `HaxQuantumBornGPT` with `HaxQuantumBornMoE`, `scale_by_stiefel_muon`, and 3+3 qubit bipartite entanglement entropy. |
 | `examples/10_librispeech_quantum_asr.py` | End-to-end 16 kHz LibriSpeech CTC Speech Recognition (`ComplexQuantumSpeechCTC` vs `ClassicalSpeechCTCBaseline`) + utterance-disjoint spoken word classification. |
+| `examples/11_fineweb_100m_multiepoch_gpu_tpu.py` | Full 100M-Token Multi-Epoch FineWeb Quantum Slowrun Benchmark for both compiled CUDA GPU (`--backend cuda`) and pure JAX/XLA Cloud TPU (`--backend tpu`). |
+| `scripts/monitor_colab_runs.py` | LAN-accessible (`0.0.0.0:8765`) Multi-Run Overlay Dashboard & Terminal TUI collecting live GPU (`nvidia-smi`), TPU (`libtpu:8431` MXU/HBM), MFU/HFU, and JAX/Haliax/XLA HLO compiler telemetry. |
 
 ### Interactive Google Colab Notebooks (`notebooks/`)
 | Notebook | Description |

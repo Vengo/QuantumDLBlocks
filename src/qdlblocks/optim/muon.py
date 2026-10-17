@@ -47,6 +47,7 @@ class StiefelMuon(torch.optim.Optimizer):
         stiefel_penalty: float = 0.0,
         ns_steps: int = 5,
         aspect_scale: bool = False,
+        retract_every: int = 1,
     ) -> None:
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -63,6 +64,7 @@ class StiefelMuon(torch.optim.Optimizer):
             stiefel_penalty=stiefel_penalty,
             ns_steps=ns_steps,
             aspect_scale=aspect_scale,
+            retract_every=max(1, int(retract_every)),
         )
         super().__init__(params, defaults)
 
@@ -81,6 +83,7 @@ class StiefelMuon(torch.optim.Optimizer):
             stiefel_penalty: float = group["stiefel_penalty"]
             ns_steps: int = group["ns_steps"]
             aspect_scale: bool = group["aspect_scale"]
+            retract_every: int = group.get("retract_every", 1)
 
             for p in group["params"]:
                 if p.grad is None:
@@ -94,6 +97,9 @@ class StiefelMuon(torch.optim.Optimizer):
                 state = self.state[p]
                 if "momentum_buffer" not in state:
                     state["momentum_buffer"] = torch.zeros_like(g)
+                    state["step"] = 0
+                state["step"] = state.get("step", 0) + 1
+                step_num: int = state["step"]
                 buf: torch.Tensor = state["momentum_buffer"]
                 buf.mul_(momentum).add_(g)
 
@@ -116,21 +122,22 @@ class StiefelMuon(torch.optim.Optimizer):
                 # 2. Continuous Riemannian Stiefel retraction penalty:
                 # Pulls singular values smoothly toward 1.0 along grad(1/4 ||W^T W - I||_F^2),
                 # normalized by (1 + ||W^T W - I||_F) for unconditional numerical stability.
-                if stiefel_penalty > 0.0:
-                    W_f = p.float()
+                if stiefel_penalty > 0.0 and (step_num % retract_every == 0):
+                    work_dtype = torch.bfloat16 if p.is_cuda else torch.float32
+                    W_f = p.to(work_dtype)
                     if W_f.size(0) >= W_f.size(1):
                         gram = W_f.t() @ W_f
-                        ident = torch.eye(gram.size(0), device=p.device, dtype=W_f.dtype)
+                        ident = torch.eye(gram.size(0), device=p.device, dtype=work_dtype)
                         diff = gram - ident
-                        denom = 1.0 + (torch.norm(diff, p="fro") / math.sqrt(diff.size(0)))
+                        denom = 1.0 + (torch.norm(diff.float(), p="fro") / math.sqrt(diff.size(0)))
                         stiefel_grad = (W_f @ (diff / denom)).type_as(p)
                     else:
                         gram = W_f @ W_f.t()
-                        ident = torch.eye(gram.size(0), device=p.device, dtype=W_f.dtype)
+                        ident = torch.eye(gram.size(0), device=p.device, dtype=work_dtype)
                         diff = gram - ident
-                        denom = 1.0 + (torch.norm(diff, p="fro") / math.sqrt(diff.size(0)))
+                        denom = 1.0 + (torch.norm(diff.float(), p="fro") / math.sqrt(diff.size(0)))
                         stiefel_grad = ((diff / denom) @ W_f).type_as(p)
-                    p.add_(stiefel_grad, alpha=-stiefel_penalty)
+                    p.add_(stiefel_grad, alpha=-stiefel_penalty * retract_every)
 
                 # 3. Apply Newton-Schulz polar gradient step
                 p.add_(update, alpha=-lr)

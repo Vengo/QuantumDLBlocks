@@ -18,9 +18,10 @@ def l2_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-12) -> torch.Te
         eps: Small constant for numerical stability.
 
     Returns:
-        Unit-norm tensor on S^{d-1}.
+        Unit-norm tensor on S^{d-1} preserving `x.dtype`.
     """
-    return x * torch.rsqrt(torch.sum(x * x, dim=dim, keepdim=True) + eps)
+    x_f = x.float()
+    return (x_f * torch.rsqrt(torch.sum(x_f * x_f, dim=dim, keepdim=True) + eps)).type_as(x)
 
 
 def riemannian_center(x: torch.Tensor, dim: int = -1, eps: float = 1e-12) -> torch.Tensor:
@@ -51,11 +52,13 @@ def apply_unitary_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) ->
         sin: Sine frequency table broadcastable to `(..., d // 2)`.
 
     Returns:
-        Rotated tensor of shape `(..., d)` with identical L2 norm.
+        Rotated tensor of shape `(..., d)` with identical L2 norm and dtype.
     """
     d = x.shape[-1]
     x1, x2 = x[..., : d // 2], x[..., d // 2 :]
-    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    c = cos.to(x.dtype)
+    s = sin.to(x.dtype)
+    return torch.cat([x1 * c - x2 * s, x1 * s + x2 * c], dim=-1)
 
 
 def zeropower_via_newtonschulz5(
