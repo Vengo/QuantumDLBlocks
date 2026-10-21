@@ -106,6 +106,12 @@ class ProjectivePOVMHead(nn.Module):
         )
         with torch.no_grad():
             self.povm_head.copy_(l2_normalize(self.povm_head, dim=1, eps=eps))
+        # Allow both head.effects and head.povm_head.effects to access the POVM matrix
+        self.povm_head.effects = self.povm_head  # type: ignore[attr-defined]
+
+    @property
+    def effects(self) -> nn.Parameter:
+        return self.povm_head
 
     @property
     def inv_temp(self) -> torch.Tensor | float:
@@ -119,3 +125,4 @@ class ProjectivePOVMHead(nn.Module):
         M_norm = l2_normalize(self.povm_head, dim=1, eps=self.eps)
         amplitudes = torch.matmul(psi_final, M_norm.t())
         return amplitudes * self.inv_temp
+

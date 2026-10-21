@@ -82,14 +82,23 @@ class TwoBeamQuantumInterference(nn.Module):
         nn.init.orthogonal_(self.w_a.weight)
         nn.init.orthogonal_(self.w_b.weight)
         nn.init.orthogonal_(self.w_down.weight)
+        self.last_beam2: torch.Tensor | None = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_second_beam: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         psi = l2_normalize(x, dim=-1, eps=self.eps)
         a = self.w_a(psi)
         b = l2_normalize(self.w_b(psi), dim=-1, eps=self.eps)
         interfered = a * b * math.sqrt(self.hidden_dim)
         out = self.w_down(interfered)
-        if self.normalize_output:
-            return l2_normalize(out, dim=-1, eps=self.eps)
-        return out
+        out_2 = self.w_down(b)
+        psi_beam2 = l2_normalize(out_2 - 0.25 * out, dim=-1, eps=self.eps)
+        self.last_beam2 = psi_beam2
+        main_out = l2_normalize(out, dim=-1, eps=self.eps) if self.normalize_output else out
+        if return_second_beam:
+            return main_out, psi_beam2
+        return main_out
 

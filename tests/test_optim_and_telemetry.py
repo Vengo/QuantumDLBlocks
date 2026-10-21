@@ -89,3 +89,69 @@ def test_inspect_quantum_model_and_param_splitting() -> None:
 
     # Test polar_snap_weights
     polar_snap_weights(model)
+    assert "layer_bipartite_entropies" in report
+    assert "mean_bipartite_entropy_nats" in report
+    assert "quantum_scales" in report
+    assert "gamma_head_mean" in report["quantum_scales"]
+    assert "povm_beta" in report["quantum_scales"]
+
+
+def test_wsd_schedule_and_cooldown_branching() -> None:
+    from qdlblocks import (
+        ProgressiveSequenceCurriculum,
+        branch_wsd_cooldown_multiplier,
+        cosine_lr_multiplier,
+        wsd_lr_multiplier,
+    )
+
+    # Warmup phase
+    assert abs(wsd_lr_multiplier(50, 1000, warmup_steps=100, decay_fraction=0.2) - 0.5) < 1e-6
+    # Stable plateau phase (steps 100..800)
+    for s in (100, 300, 500, 800):
+        assert abs(wsd_lr_multiplier(s, 1000, warmup_steps=100, decay_fraction=0.2) - 1.0) < 1e-6
+    # Radical 1 - sqrt(t / T_decay) cooldown phase (steps 800..1000)
+    m_mid = wsd_lr_multiplier(900, 1000, warmup_steps=100, decay_fraction=0.2, min_lr_ratio=0.1)
+    assert 0.1 < m_mid < 1.0
+    m_end = wsd_lr_multiplier(1000, 1000, warmup_steps=100, decay_fraction=0.2, min_lr_ratio=0.1)
+    assert abs(m_end - 0.1) < 1e-6
+
+    # Branching cooldown over 200 steps
+    assert abs(branch_wsd_cooldown_multiplier(0, 200, min_lr_ratio=0.1) - 1.0) < 1e-6
+    assert abs(branch_wsd_cooldown_multiplier(200, 200, min_lr_ratio=0.1) - 0.1) < 1e-6
+    assert 0.1 < cosine_lr_multiplier(500, 1000, warmup_steps=100, min_lr_ratio=0.1) <= 1.0
+
+    # Progressive sequence curriculum preserves B * T == tokens_per_step
+    curr = ProgressiveSequenceCurriculum(tokens_per_step=65536, seq_lengths=(256, 512, 1024, 2048))
+    for ep in range(4):
+        b_ep, t_ep = curr.for_epoch(ep, 4)
+        assert b_ep * t_ep == 65536
+        assert t_ep == (256, 512, 1024, 2048)[ep]
+
+
+def test_distributed_stiefel_muon_and_10qubit_entanglement() -> None:
+    from qdlblocks import (
+        DistributedStiefelMuon,
+        bipartite_entanglement_entropy,
+        l2_normalize,
+        partial_trace_qubits,
+    )
+
+    torch.manual_seed(77)
+    p1 = nn.Parameter(torch.randn(32, 16) * 0.5)
+    p2 = nn.Parameter(torch.randn(16, 32) * 0.5)
+    opt = DistributedStiefelMuon([p1, p2], lr=0.02, stiefel_penalty=0.05, ns_steps=5)
+    opt.zero_grad()
+    p1.grad = torch.randn_like(p1)
+    p2.grad = torch.randn_like(p2)
+    p1_init = p1.detach().clone()
+    opt.step()
+    assert not torch.allclose(p1, p1_init)
+
+    # Fast 10-qubit (d=1024, 5+5 split -> 32x32 reduced density matrix) pure-state partial trace
+    psi_10q = l2_normalize(torch.randn(4, 1024), dim=-1)
+    rho_a = partial_trace_qubits(psi_10q, num_qubits=10, keep_qubits=(0, 1, 2, 3, 4))
+    assert rho_a.shape == (4, 32, 32)
+    ent = bipartite_entanglement_entropy(psi_10q, num_qubits=10, keep_qubits=(0, 1, 2, 3, 4))
+    assert ent.shape == (4,)
+    assert torch.all((ent >= 0.0) & (ent <= 5.0 * 0.69315 + 1e-3))
+

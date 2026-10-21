@@ -40,6 +40,11 @@ class HaxQuantumBornLMConfig:
     top_k_experts: int = 2
     povm_temperature: float = 0.035
     use_flash_born: bool = True
+    mtp_horizons: int = 1
+    mtp_loss_weight: float = 0.25
+    mtp_stride: int = 1
+    mtp_detach_readout: bool = True
+    mtp_decoupled_temp: bool = True
 
     def build(
         self,
@@ -77,5 +82,12 @@ class HaxQuantumBornLMConfig:
             top_k_experts=self.top_k_experts,
             povm_temperature=self.povm_temperature,
             use_flash_born=self.use_flash_born,
+            mtp_horizons=self.mtp_horizons,
+            mtp_loss_weight=self.mtp_loss_weight,
+            mtp_stride=self.mtp_stride,
+            mtp_detach_readout=self.mtp_detach_readout,
+            mtp_decoupled_temp=self.mtp_decoupled_temp,
             key=key,
         )
+
+

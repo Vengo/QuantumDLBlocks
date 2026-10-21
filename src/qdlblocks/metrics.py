@@ -154,8 +154,26 @@ def model_isometry_error(
         Tuple `(mean_isometry_error, per_parameter_error_dict)`.
     """
     if param_filter is None:
+        _non_stiefel = (
+            "wte",
+            "povm_head",
+            "embed",
+            "value_embeds",
+            "unet_lambdas",
+            "vocab_higher_affinity",
+            "token_radial_scale",
+            "kraus",
+            "kboson",
+            "diffuse",
+            "gate",
+            "mudd",
+            "smear",
+            "purity",
+            "adapter",
+            "lambdas",
+        )
         def param_filter(name: str, p: nn.Parameter) -> bool:
-            return p.ndim == 2 and "wte" not in name and "povm_head" not in name
+            return p.ndim == 2 and not any(sub in name for sub in _non_stiefel)
 
     errors: dict[str, float] = {}
     for name, p in model.named_parameters():
@@ -266,3 +284,60 @@ def logit_margin_stats(
         "top5_accuracy": top5_acc,
         "eval_cross_entropy": float(loss),
     }
+
+
+@torch.no_grad()
+def model_quantum_scale_telemetry(model: nn.Module) -> dict[str, float | list[float]]:
+    """Extract per-head Born attention scales gamma_h^(l), POVM inverse temperature beta, and interferometry gates.
+
+    Args:
+        model: `QuantumBornGPT` or compatible module.
+
+    Returns:
+        Dictionary with `gamma_head_mean`, `gamma_head_min`, `gamma_head_max`,
+        `gamma_layer_means`, `povm_beta`, and `unet_gate_scales`.
+    """
+    raw = getattr(model, "_orig_mod", model)
+    blocks = getattr(raw, "blocks", None)
+    all_gammas: list[float] = []
+    layer_means: list[float] = []
+    if blocks is not None:
+        for blk in blocks:
+            attn = getattr(blk, "attn", None)
+            if attn is not None:
+                hs = getattr(attn, "head_scale", None)
+                if hs is not None:
+                    vals = torch.clamp(hs.detach().float().view(-1), min=1.0, max=100.0).cpu().tolist()
+                else:
+                    scale_val = float(getattr(attn, "scale", 1.0))
+                    n_h = int(getattr(attn, "num_heads", 1))
+                    vals = [scale_val] * n_h
+                all_gammas.extend(vals)
+                layer_means.append(round(float(np.mean(vals)), 4))
+
+    povm_beta = 1.0 / 0.035
+    if getattr(raw, "tied_inv_temp", None) is not None:
+        povm_beta = float(torch.clamp(raw.tied_inv_temp.detach().float(), min=1.0, max=60.0).item())
+    elif getattr(raw, "povm_readout", None) is not None:
+        inv_t = raw.povm_readout.inv_temp
+        povm_beta = float(inv_t.detach().float().item()) if isinstance(inv_t, torch.Tensor) else float(inv_t)
+    elif hasattr(raw, "_dual_inv_temp"):
+        povm_beta = float(getattr(raw, "_dual_inv_temp"))
+
+    unet_scales: list[float] = []
+    if getattr(raw, "unet_scales", None) is not None:
+        u_t = 0.35 * torch.tanh(raw.unet_scales.detach().float())
+        unet_scales = [round(float(v), 4) for v in u_t.cpu().tolist()]
+    elif getattr(raw, "unet_lambdas", None) is not None:
+        u_t = raw.unet_lambdas[:, 1].detach().float()
+        unet_scales = [round(float(v), 4) for v in u_t.cpu().tolist()]
+
+    return {
+        "gamma_head_mean": round(float(np.mean(all_gammas)), 4) if all_gammas else 0.0,
+        "gamma_head_min": round(float(np.min(all_gammas)), 4) if all_gammas else 0.0,
+        "gamma_head_max": round(float(np.max(all_gammas)), 4) if all_gammas else 0.0,
+        "gamma_layer_means": layer_means,
+        "povm_beta": round(povm_beta, 4),
+        "unet_gate_scales": unet_scales,
+    }
+

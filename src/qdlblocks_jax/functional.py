@@ -21,6 +21,9 @@ __all__ = [
     "von_neumann_entropy",
     "partial_trace_qubits",
     "bipartite_entanglement_entropy",
+    "empirical_state_density",
+    "effective_quantum_rank",
+    "purity_participation_ratio",
 ]
 
 
@@ -214,7 +217,13 @@ def partial_trace_qubits(
     keep_qubits: tuple[int, ...],
     eps: float = 1e-8,
 ) -> jax.Array:
-    """Compute reduced density matrix rho_A = Tr_B(rho) over a subset of qubits."""
+    """Compute reduced density matrix rho_A = Tr_B(rho) over a subset of qubits.
+
+    When `psi_or_rho` is a pure state vector `(..., 2^n)`, uses the exact Schmidt
+    reshape `M in C^(..., 2^k, 2^(n-k))` to compute `rho_A = M @ M^dagger` in
+    `O(2^(n+k))` time and `O(4^k)` memory without materializing the `2^n x 2^n`
+    full density matrix.
+    """
     if num_qubits < 1:
         raise ValueError(f"num_qubits must be >= 1, got {num_qubits}.")
     keep = tuple(keep_qubits)
@@ -226,14 +235,34 @@ def partial_trace_qubits(
         raise ValueError(f"keep_qubits indices must be in [0, {num_qubits - 1}], got {keep}.")
 
     dim = 2**num_qubits
-    if (
+    is_density = (
         psi_or_rho.ndim >= 2
         and psi_or_rho.shape[-1] == dim
         and psi_or_rho.shape[-2] == dim
-    ):
+    )
+    if not is_density and psi_or_rho.shape[-1] == dim:
+        psi_norm = l2_normalize(ensure_complex(psi_or_rho), axis=-1, eps=eps)
+        batch_shape = psi_norm.shape[:-1]
+        n_batch = len(batch_shape)
+        k = len(keep)
+        trace_out = tuple(q for q in range(num_qubits) if q not in keep)
+        psi_q = psi_norm.reshape(batch_shape + (2,) * num_qubits)
+        perm = (
+            list(range(n_batch))
+            + [n_batch + q for q in keep]
+            + [n_batch + q for q in trace_out]
+        )
+        psi_perm = jnp.transpose(psi_q, perm)
+        schmidt_mat = psi_perm.reshape(batch_shape + (2**k, 2 ** (num_qubits - k)))
+        rho_red = jnp.matmul(
+            schmidt_mat,
+            jnp.conj(jnp.swapaxes(schmidt_mat, -1, -2)),
+            precision=jax.lax.Precision.HIGHEST,
+        )
+        return normalize_trace(rho_red, eps=eps)
+
+    if is_density:
         rho = normalize_trace(ensure_complex(psi_or_rho), eps=eps)
-    elif psi_or_rho.shape[-1] == dim:
-        rho = state_to_density(psi_or_rho, eps=eps)
     else:
         raise ValueError(
             f"Expected state or density with dimension {dim} (2**{num_qubits}), got shape {psi_or_rho.shape}."
@@ -280,3 +309,56 @@ def bipartite_entanglement_entropy(
         eps=eps,
     )
     return von_neumann_entropy(rho_a, eps=eps)
+
+
+def empirical_state_density(psi: jax.Array, eps: float = 1e-8) -> jax.Array:
+    """Compute the empirical ensemble density matrix rho = (1/N) sum_{i=1}^N |psi_i><psi_i|."""
+    if psi.ndim < 1 or psi.shape[-1] < 1 or psi.size == 0:
+        raise ValueError(f"Expected non-empty state array of shape (..., D), got shape {psi.shape}.")
+    d = psi.shape[-1]
+    n = psi.size // d
+    psi_norm = l2_normalize(ensure_complex(psi.reshape(n, d)), axis=-1, eps=eps)
+    rho = jnp.matmul(jnp.swapaxes(jnp.conj(psi_norm), -2, -1), psi_norm, precision=jax.lax.Precision.HIGHEST) / float(n)
+    rho = 0.5 * (rho + jnp.conj(jnp.swapaxes(rho, -2, -1)))
+    return normalize_trace(rho, eps=eps)
+
+
+def _resolve_density_matrix_jax(
+    psi_or_rho: jax.Array,
+    eps: float = 1e-8,
+    *,
+    is_density: bool = False,
+) -> jax.Array:
+    if is_density:
+        if psi_or_rho.ndim < 2 or psi_or_rho.shape[-2] != psi_or_rho.shape[-1]:
+            raise ValueError(
+                f"When is_density=True, expected square density matrix (..., D, D), got shape {psi_or_rho.shape}."
+            )
+        rho = ensure_complex(psi_or_rho)
+        rho = 0.5 * (rho + jnp.conj(jnp.swapaxes(rho, -2, -1)))
+        return normalize_trace(rho, eps=eps)
+    return empirical_state_density(psi_or_rho, eps=eps)
+
+
+def effective_quantum_rank(
+    psi_or_rho: jax.Array,
+    eps: float = 1e-8,
+    *,
+    is_density: bool = False,
+) -> jax.Array:
+    """Compute the Effective Quantum Rank R_eff(rho) = exp(S(rho)) in [1, D]."""
+    rho = _resolve_density_matrix_jax(psi_or_rho, eps=eps, is_density=is_density)
+    return jnp.exp(von_neumann_entropy(rho, eps=eps))
+
+
+def purity_participation_ratio(
+    psi_or_rho: jax.Array,
+    eps: float = 1e-8,
+    *,
+    is_density: bool = False,
+) -> jax.Array:
+    """Compute the Purity Participation Ratio PR(rho) = 1 / Tr(rho^2) in [1, D]."""
+    rho = _resolve_density_matrix_jax(psi_or_rho, eps=eps, is_density=is_density)
+    purity = jnp.sum(jnp.abs(rho) ** 2, axis=(-2, -1))
+    return 1.0 / jnp.maximum(purity, eps)
+

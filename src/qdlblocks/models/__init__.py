@@ -3,6 +3,12 @@
 from .audio_quantum import ComplexSuperpositionAudioClassifier
 from .born_gpt import QuantumBornGPT, ReadoutMode
 from .born_vit import QuantumBornViT
+from .classical_modded_gpt import (
+    ClassicalModdedBlock,
+    ClassicalModdedGPT,
+    LeaderboardRotary,
+    apply_leaderboard_rotary,
+)
 from .hybrid_classifier import HybridQuantumClassifier
 from .pure_quantum_net import DeepPureQuantumNetwork
 from .speech_ctc import (
@@ -25,6 +31,10 @@ __all__ = [
     "HybridQuantumClassifier",
     "QuantumBornGPT",
     "QuantumBornViT",
+    "ClassicalModdedBlock",
+    "ClassicalModdedGPT",
+    "LeaderboardRotary",
+    "apply_leaderboard_rotary",
     "ComplexSuperpositionAudioClassifier",
     "ComplexPhaseAcousticStem",
     "ComplexQuantumSpeechCTC",

@@ -402,9 +402,16 @@ class HaxQuantumBornGPT(eqx.Module):
     Heads: hax.Axis = eqx.field(static=True)
     HeadDim: hax.Axis = eqx.field(static=True)
     MlpDim: hax.Axis = eqx.field(static=True)
+    mtp_horizons: int = eqx.field(static=True)
+    mtp_loss_weight: float = eqx.field(static=True)
+    mtp_stride: int = eqx.field(static=True)
+    mtp_detach_readout: bool = eqx.field(static=True)
+    mtp_decoupled_temp: bool = eqx.field(static=True)
     lift: HaxIsometricHilbertLift
     blocks: tuple[HaxQuantumBornBlock, ...]
     povm_head: HaxProjectivePOVMHead
+    mtp_rotations: tuple[hax.NamedArray, ...]
+    mtp_inv_temps: jax.Array
 
     def __init__(
         self,
@@ -421,8 +428,17 @@ class HaxQuantumBornGPT(eqx.Module):
         top_k_experts: int = 2,
         povm_temperature: float = 0.035,
         use_flash_born: bool = True,
+        mtp_horizons: int = 1,
+        mtp_loss_weight: float = 0.25,
+        mtp_stride: int = 1,
+        mtp_detach_readout: bool = True,
+        mtp_decoupled_temp: bool = True,
         key: jax.Array,
     ):
+        if mtp_horizons < 1:
+            raise ValueError(f"mtp_horizons must be >= 1, got {mtp_horizons}.")
+        if mtp_stride < 1:
+            raise ValueError(f"mtp_stride must be >= 1, got {mtp_stride}.")
         self.Vocab = Vocab
         self.Seq = Seq
         self.Seed = Seed
@@ -430,8 +446,14 @@ class HaxQuantumBornGPT(eqx.Module):
         self.Heads = Heads
         self.HeadDim = HeadDim
         self.MlpDim = MlpDim
+        self.mtp_horizons = mtp_horizons
+        self.mtp_loss_weight = mtp_loss_weight
+        self.mtp_stride = int(mtp_stride)
+        self.mtp_detach_readout = bool(mtp_detach_readout)
+        self.mtp_decoupled_temp = bool(mtp_decoupled_temp)
 
-        keys = jax.random.split(key, num_layers + 2)
+        n_extra = max(0, mtp_horizons - 1)
+        keys = jax.random.split(key, num_layers + 2 + n_extra)
         self.lift = HaxIsometricHilbertLift(Vocab, Seed, Hilbert, key=keys[0])
         self.blocks = tuple(
             HaxQuantumBornBlock(
@@ -451,8 +473,22 @@ class HaxQuantumBornGPT(eqx.Module):
             Hilbert,
             Vocab,
             temperature=povm_temperature,
-            key=keys[-1],
+            key=keys[num_layers + 1],
         )
+        if n_extra > 0:
+            HilbertOut = hax.Axis("hilbert_mtp", Hilbert.size)
+            self.mtp_rotations = tuple(
+                orthogonal_init((Hilbert, HilbertOut), keys[num_layers + 2 + h])
+                for h in range(n_extra)
+            )
+            base_t = max(povm_temperature, 1e-4)
+            self.mtp_inv_temps = jnp.array(
+                [1.0 / (base_t * math.sqrt(float(h))) for h in range(2, mtp_horizons + 1)],
+                dtype=jnp.float32,
+            )
+        else:
+            self.mtp_rotations = ()
+            self.mtp_inv_temps = jnp.zeros((0,), dtype=jnp.float32)
 
     def encode(self, token_ids: hax.NamedArray) -> hax.NamedArray:
         """Encode token IDs into normalized Hilbert-space state vectors |psi>."""
@@ -482,11 +518,70 @@ class HaxQuantumBornGPT(eqx.Module):
         if targets is None:
             return logits, None
 
-        # Cross-entropy loss over Vocab axis
+        # Cross-entropy loss over Vocab axis (with optional Multi-Token POVM Prediction horizons)
         leading_axes = tuple(ax for ax in logits.axes if ax != self.Vocab)
-        logits_ord = logits.rearrange(leading_axes + (self.Vocab,)).array
-        targets_ord = targets.rearrange(leading_axes).array
+        seq_axes = tuple(ax for ax in leading_axes if ax != self.Seq) + (self.Seq,)
+        logits_ord = logits.rearrange(seq_axes + (self.Vocab,)).array
+        targets_ord = targets.rearrange(seq_axes).array
         log_probs = jax.nn.log_softmax(logits_ord, axis=-1)
         nll = -jnp.take_along_axis(log_probs, targets_ord[..., None], axis=-1).squeeze(-1)
         loss = jnp.mean(nll)
+
+        if self.mtp_horizons > 1 and len(self.mtp_rotations) > 0:
+            HilbertOut = hax.Axis("hilbert_mtp", self.Hilbert.size)
+            m_norm_arr = (
+                hax_l2_normalize(self.povm_head.m_vocab, axis=self.Hilbert)
+                .rearrange((self.Vocab, self.Hilbert))
+                .array
+            )
+            for h_idx, u_rot in enumerate(self.mtp_rotations, start=1):
+                T_avail = self.Seq.size - h_idx
+                if T_avail <= 0:
+                    break
+                psi_rot = hax.dot(psi, u_rot, axis=self.Hilbert).rename({HilbertOut: self.Hilbert})
+                psi_h_arr = (
+                    hax_l2_normalize(psi_rot, axis=self.Hilbert)
+                    .rearrange(seq_axes + (self.Hilbert,))
+                    .array
+                )
+                if self.mtp_stride > 1 and T_avail > self.mtp_stride:
+                    offset = (h_idx - 1) % self.mtp_stride
+                    psi_sub = psi_h_arr[..., offset : T_avail : self.mtp_stride, :]
+                    tgt_h = targets_ord[..., h_idx + offset : self.Seq.size : self.mtp_stride]
+                else:
+                    psi_sub = psi_h_arr[..., :T_avail, :]
+                    tgt_h = targets_ord[..., h_idx:]
+
+                m_aux = jax.lax.stop_gradient(m_norm_arr) if self.mtp_detach_readout else m_norm_arr
+                beta_h = (
+                    jnp.clip(self.mtp_inv_temps[h_idx - 1], 1.0, 60.0)
+                    if self.mtp_decoupled_temp
+                    else jnp.clip(self.povm_head.inv_temp, 1.0, 100.0)
+                )
+                logits_h = jnp.matmul(psi_sub, m_aux.T) * beta_h
+                log_p_h = jax.nn.log_softmax(logits_h, axis=-1)
+                nll_h = -jnp.take_along_axis(log_p_h, tgt_h[..., None], axis=-1).squeeze(-1)
+                loss = loss + (self.mtp_loss_weight / float(h_idx)) * jnp.mean(nll_h)
+
         return logits, loss
+
+    def forward_mtp_logits(self, token_ids: hax.NamedArray) -> list[hax.NamedArray]:
+        """Compute NamedArray POVM measurement logits for all configured horizons `[t+1, ..., t+mtp_horizons]`."""
+        psi = self.encode(token_ids)
+        out = [self.povm_head(psi)]
+        if self.mtp_horizons > 1 and len(self.mtp_rotations) > 0:
+            HilbertOut = hax.Axis("hilbert_mtp", self.Hilbert.size)
+            m_norm = hax_l2_normalize(self.povm_head.m_vocab, axis=self.Hilbert)
+            for h_idx, u_rot in enumerate(self.mtp_rotations, start=1):
+                psi_rot = hax.dot(psi, u_rot, axis=self.Hilbert).rename({HilbertOut: self.Hilbert})
+                psi_h = hax_l2_normalize(psi_rot, axis=self.Hilbert)
+                beta_h = (
+                    jnp.clip(self.mtp_inv_temps[h_idx - 1], 1.0, 60.0)
+                    if self.mtp_decoupled_temp
+                    else jnp.clip(self.povm_head.inv_temp, 1.0, 100.0)
+                )
+                out.append(hax.dot(psi_h, m_norm, axis=self.Hilbert) * hax.NamedArray(beta_h, ()))
+        return out
+
+
+

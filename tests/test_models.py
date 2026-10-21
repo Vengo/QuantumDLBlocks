@@ -83,3 +83,40 @@ def test_quantum_born_gpt_modes_and_generation() -> None:
 
         generated = model.generate(idx[:, :4], max_new_tokens=5, top_k=10)
         assert generated.shape == (3, 9)
+
+
+def test_quantum_born_gpt_mtp_and_dynamic_rope_extension() -> None:
+    torch.manual_seed(33)
+    model = QuantumBornGPT(
+        vocab_size=48,
+        embed_dim=32,
+        seed_dim=16,
+        num_heads=4,
+        num_layers=2,
+        hidden_dim=64,
+        block_size=8,  # Start with small block_size=8
+        readout_mode="tied_stiefel",
+        learnable_temperature=True,
+        mtp_horizons=3,
+        mtp_loss_weight=0.25,
+    )
+    assert len(model.mtp_rotations) == 2
+
+    # Pass a sequence of length 16 (> initial block_size=8) to test dynamic UnitaryRoPE table extension
+    idx = torch.randint(0, 48, (2, 16))
+    targets = torch.randint(0, 48, (2, 16))
+    logits, loss = model(idx, targets)
+    assert logits.shape == (2, 16, 48)
+    assert loss is not None and torch.isfinite(loss)
+    loss.backward()
+
+    for rot in model.mtp_rotations:
+        assert rot.grad is not None
+        assert torch.any(rot.grad != 0.0)
+
+    # Verify forward_mtp_logits returns [t+1, t+2, t+3] horizon tensors
+    horizon_logits = model.forward_mtp_logits(idx)
+    assert len(horizon_logits) == 3
+    for h_log in horizon_logits:
+        assert h_log.shape == (2, 16, 48)
+

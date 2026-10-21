@@ -266,3 +266,32 @@ def build_quantum_optax_optimizer(
         },
         _map_labels,
     )
+
+
+def wsd_lr_schedule_jax(
+    warmup_steps: int,
+    total_steps: int,
+    decay_fraction: float = 0.20,
+    min_lr_ratio: float = 0.10,
+    peak_lr: float = 1.0,
+) -> optax.Schedule:
+    """Optax-compatible Warmup-Stable-Decay (WSD) schedule with radical `1 - sqrt(tau)` cooldown."""
+    decay_steps = max(1, int(round(total_steps * max(0.0, min(0.95, decay_fraction)))))
+    stable_end = max(warmup_steps, total_steps - decay_steps)
+    actual_decay = max(1, total_steps - stable_end)
+
+    def schedule_fn(count: jax.Array | int) -> jax.Array:
+        step = jnp.asarray(count, dtype=jnp.float32)
+        w_mult = jnp.where(
+            warmup_steps > 0,
+            jnp.clip(step / float(max(1, warmup_steps)), 0.0, 1.0),
+            1.0,
+        )
+        tau = jnp.clip((step - float(stable_end)) / float(actual_decay), 0.0, 1.0)
+        d_mult = min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - jnp.sqrt(tau))
+        mult = jnp.where(step <= float(warmup_steps), w_mult, jnp.where(step <= float(stable_end), 1.0, d_mult))
+        return mult * float(peak_lr)
+
+    return schedule_fn
+
+

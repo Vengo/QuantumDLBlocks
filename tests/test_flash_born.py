@@ -65,3 +65,21 @@ def test_flash_born_matches_reference_forward_and_backward(
         assert torch.allclose(p2.grad, p1.grad, atol=3e-3, rtol=2e-2), (
             f"Max grad diff for {n1}: {(p2.grad - p1.grad).abs().max().item()}"
         )
+
+
+def test_flash_born_rdna4_and_cuda_launch_metadata() -> None:
+    from qdlblocks.kernels import get_flash_born_launch_meta, get_rdna4_autotune_configs
+
+    hip_meta = get_flash_born_launch_meta(64, is_hip=True)
+    assert hip_meta["num_warps"] == 4
+    assert hip_meta["waves_per_eu"] == 2
+
+    cuda_meta = get_flash_born_launch_meta(64, is_hip=False)
+    assert cuda_meta["num_warps"] == 4
+    assert "waves_per_eu" not in cuda_meta
+
+    cfgs = get_rdna4_autotune_configs()
+    assert len(cfgs) == 4
+    assert all(c["matrix_instr_nonkdim"] == 16 and c["waves_per_eu"] in (2, 4) for c in cfgs)
+
+

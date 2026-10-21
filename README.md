@@ -200,8 +200,8 @@ Scaling to the full **100,000,000-token** FineWeb training shard (`fineweb_train
 | `examples/08_qnas_comparison_study.py` | Head-to-head comparison of all 3 Q-NAS paradigms against Classical Softmax DARTS. |
 | `examples/09_jax_haliax_born_gpt.py` | JAX + Equinox + Haliax 6-Qubit `HaxQuantumBornGPT` with `HaxQuantumBornMoE`, `scale_by_stiefel_muon`, and 3+3 qubit bipartite entanglement entropy. |
 | `examples/10_librispeech_quantum_asr.py` | End-to-end 16 kHz LibriSpeech CTC Speech Recognition (`ComplexQuantumSpeechCTC` vs `ClassicalSpeechCTCBaseline`) + utterance-disjoint spoken word classification. |
-| `examples/11_fineweb_100m_multiepoch_gpu_tpu.py` | Full 100M-Token Multi-Epoch FineWeb Quantum Slowrun Benchmark for both compiled CUDA GPU (`--backend cuda`) and pure JAX/XLA Cloud TPU (`--backend tpu`). |
-| `scripts/monitor_colab_runs.py` | LAN-accessible (`0.0.0.0:8765`) Multi-Run Overlay Dashboard & Terminal TUI collecting live GPU (`nvidia-smi`), TPU (`libtpu:8431` MXU/HBM), MFU/HFU, and JAX/Haliax/XLA HLO compiler telemetry. |
+| `examples/11_fineweb_100m_multiepoch_gpu_tpu.py` | Full 100M-Token Multi-Epoch FineWeb Quantum Slowrun Benchmark for CUDA/ROCm GPU (`--backend cuda`) and JAX/XLA Cloud TPU (`--backend tpu`) with WSD schedule (`--schedule wsd`), Progressive Sequence Curriculum (`--seq-curriculum`), Multi-Token POVM (`--mtp-horizons 3`), Pallas TPU Flash-Born (`--tpu-attn-kernel pallas`), and 10-qubit $5+5$ entanglement telemetry. |
+| `scripts/monitor_colab_runs.py` | LAN-accessible (`0.0.0.0:8765`) 6-Panel Multi-Run Overlay Dashboard & Terminal TUI collecting live GPU (`nvidia-smi`), TPU (`libtpu:8431` MXU/HBM), MFU/HFU, 10-Qubit Bipartite Entanglement $S(\rho_A)$, Born Scales $\gamma_h^{(\ell)}$, POVM $\beta$, and JAX/Haliax/Pallas/XLA HLO compiler telemetry. |
 
 ### Interactive Google Colab Notebooks (`notebooks/`)
 | Notebook | Description |

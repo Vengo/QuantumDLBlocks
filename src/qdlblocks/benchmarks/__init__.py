@@ -1,12 +1,53 @@
 """Multi-Domain Quantum-Geometric Benchmark Suite (`qdlblocks.benchmarks`)."""
 
 from .baselines import ClassicalGPTBaseline, ClassicalViTBaseline, MagnitudeMelAudioBaseline
+from .calibration_probe import (
+    RANK_BUCKETS,
+    compute_calibration_rank_decomposition,
+    compute_layerwise_dynamics_profile,
+)
+from .db import (
+    DEFAULT_DB_PATH,
+    BenchmarkSQLiteDB,
+    backfill_micro_verifications,
+    classify_run_tier,
+    compute_family_pareto_and_obsolete,
+)
+from .fineweb_stream import (
+    FINEWEB10B_BASE_URL,
+    FINEWEB_GPT2_VOCAB_SIZE,
+    FINEWEB_SHARD_HEADER_BYTES,
+    FINEWEB_TRAIN_SHARD_BYTES,
+    FINEWEB_VAL_SHARD_BYTES,
+    FINEWEB_VAL_TOKENS,
+    FineWebMultiShardStream,
+    compute_empirical_bigram_coverage,
+    compute_memorization_gap_metrics,
+    compute_modded_nanogpt_val_steps,
+    compute_tapered_mtp_weight,
+    find_bos_aligned_starts,
+    generate_contextual_zipf_shard,
+    iter_modded_nanogpt_val_batches,
+)
 from .metrics_calibration import (
     brier_score,
     expected_calibration_error,
     ood_auroc,
     ood_auroc_from_scores,
     probs_from_logits_or_probs,
+)
+from .model_card import (
+    BASELINE_RUN_KEYS,
+    DynamicWaveRegistry,
+    RunModelCard,
+    build_model_card_from_manifest_entry,
+    deterministic_run_color,
+    parse_cli_args_to_card_sections,
+    render_model_card_markdown,
+    save_model_card_atomic,
+    set_model_card_obsolete,
+    update_model_card_telemetry,
+    validate_model_card,
 )
 from .runner import (
     BenchmarkResult,
@@ -25,6 +66,23 @@ from .runner import (
 )
 
 __all__ = [
+    "RANK_BUCKETS",
+    "compute_calibration_rank_decomposition",
+    "compute_layerwise_dynamics_profile",
+    "FINEWEB10B_BASE_URL",
+    "FINEWEB_SHARD_HEADER_BYTES",
+    "FINEWEB_TRAIN_SHARD_BYTES",
+    "FINEWEB_VAL_TOKENS",
+    "FINEWEB_GPT2_VOCAB_SIZE",
+    "FINEWEB_VAL_SHARD_BYTES",
+    "generate_contextual_zipf_shard",
+    "FineWebMultiShardStream",
+    "compute_memorization_gap_metrics",
+    "compute_empirical_bigram_coverage",
+    "find_bos_aligned_starts",
+    "compute_tapered_mtp_weight",
+    "compute_modded_nanogpt_val_steps",
+    "iter_modded_nanogpt_val_batches",
     "BenchmarkResult",
     "format_benchmark_table",
     "probs_from_logits_or_probs",
@@ -46,4 +104,21 @@ __all__ = [
     "run_lra_benchmark",
     "run_calibration_ood_benchmark",
     "run_all_benchmarks",
+    "BASELINE_RUN_KEYS",
+    "RunModelCard",
+    "validate_model_card",
+    "deterministic_run_color",
+    "parse_cli_args_to_card_sections",
+    "build_model_card_from_manifest_entry",
+    "update_model_card_telemetry",
+    "set_model_card_obsolete",
+    "save_model_card_atomic",
+    "render_model_card_markdown",
+    "DynamicWaveRegistry",
+    "DEFAULT_DB_PATH",
+    "BenchmarkSQLiteDB",
+    "classify_run_tier",
+    "compute_family_pareto_and_obsolete",
+    "backfill_micro_verifications",
 ]
+
