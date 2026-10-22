@@ -81,8 +81,10 @@ def run_calibration_probe_suite(
     quick_test: bool = False,
     max_vram_gb: float = 8.0,
     device_str: str | None = None,
+    include_twobeam_kboson: bool = True,
+    diffuse_rank: int = 16,
 ) -> dict[str, Any]:
-    """Run controlled Classical vs. Quantum POVM vs. Quantum Softmax calibration rank decomposition."""
+    """Run controlled Classical vs. Quantum POVM vs. Quantum Softmax vs. Two-Beam k-Boson calibration rank decomposition."""
     if device_str is not None:
         device = torch.device(device_str)
     else:
@@ -102,6 +104,7 @@ def run_calibration_probe_suite(
         batch_size = 8
         seq_len = 32
         eff_steps = max(2, min(steps, 4))
+        eff_diffuse_rank = min(8, diffuse_rank)
     else:
         vocab_size = 2048
         valid_vocab_size = 2048
@@ -114,6 +117,7 @@ def run_calibration_probe_suite(
         batch_size = 8
         seq_len = 128
         eff_steps = max(2, int(steps))
+        eff_diffuse_rank = int(diffuse_rank)
 
     train_batches, (val_x, val_y) = _build_synthetic_zipf_stream(
         vocab_size=vocab_size,
@@ -129,6 +133,10 @@ def run_calibration_probe_suite(
         ("quantum_softmax", "QuantumBornGPT (16-Qubit + 256-Hier Calibrated Softmax)"),
         ("quantum_w13w15_unified", "QuantumBornGPT (W13+W15 Unified + Embed-Only Causal Mem)"),
     ]
+    if include_twobeam_kboson:
+        variant_specs.append(
+            ("quantum_twobeam_kboson", "QuantumBornGPT (16-Qubit + 256-Hier Two-Beam k-Boson Readout)")
+        )
 
     variants_out: dict[str, dict[str, Any]] = {}
 
@@ -203,6 +211,33 @@ def run_calibration_probe_suite(
                 bridge_causal_memory=True,
                 use_last_layer_softmax=True,
                 logit_softcap=15.0,
+            ).to(device)
+        elif v_key == "quantum_twobeam_kboson":
+            model = QuantumBornGPT(
+                vocab_size=vocab_size,
+                embed_dim=embed_dim,
+                seed_dim=embed_dim // 2,
+                num_heads=num_heads,
+                num_layers=num_layers,
+                block_size=seq_len,
+                readout_mode="asymmetric",
+                use_overcomplete_two_beam=True,
+                frame_expansion=2.0,
+                use_purified_attn=True,
+                true_layer0_v_residual=True,
+                use_gated_spherical_residual=True,
+                use_dynamic_povm_beta=True,
+                use_povm_log_prior=True,
+                use_ortho_decouple=True,
+                use_hierarchical_16qubit=True,
+                qubit_registers=qubit_registers,
+                qubit_amplitudes=qubit_amplitudes,
+                num_higher_states=num_higher_states,
+                use_block_hierarchy_bridge=True,
+                bridge_causal_memory=True,
+                use_last_layer_softmax=False,
+                use_two_beam_kboson_readout=True,
+                diffuse_rank=eff_diffuse_rank,
             ).to(device)
         else:
             model = QuantumBornGPT(
@@ -394,6 +429,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Device override ('cuda' or 'cpu').",
     )
     parser.add_argument(
+        "--include-twobeam-kboson",
+        action="store_true",
+        default=True,
+        help="Include Two-Beam k-Boson Mixed-State Readout variant (default: True).",
+    )
+    parser.add_argument(
+        "--diffuse-rank",
+        type=int,
+        default=16,
+        help="Rank of the Kraus diffuse semantic bath (default: 16).",
+    )
+    parser.add_argument(
         "--out-json",
         type=str,
         default=None,
@@ -411,6 +458,8 @@ def main(argv: list[str] | None = None) -> int:
         quick_test=args.quick_test,
         max_vram_gb=args.max_vram_gb,
         device_str=args.device,
+        include_twobeam_kboson=args.include_twobeam_kboson,
+        diffuse_rank=args.diffuse_rank,
     )
     md = format_probe_markdown(report)
     print(md)

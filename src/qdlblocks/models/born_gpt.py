@@ -109,11 +109,23 @@ class QuantumBornGPT(nn.Module):
         num_higher_states: int = 256,
         use_block_hierarchy_bridge: bool = True,
         bridge_causal_memory: bool = True,
+        use_embed_causal_memory: bool = True,
         use_last_layer_softmax: bool = False,
         use_two_beam_kboson: bool = False,
         use_two_beam_kboson_readout: bool | None = None,
         diffuse_rank: int = 16,
         diffuse_bath_rank: int | None = None,
+        diffuse_schedule: str = "free_decay",
+        lambda_diff_min: float = 0.08,
+        lambda_diff_max: float = 0.35,
+        lambda_diff_start: float = 0.22,
+        lambda_diff_end: float = 0.12,
+        contextual_purity_gain: float = 0.20,
+        use_stereographic_lift: bool = False,
+        use_cosine_phase_beam_gate: bool = False,
+        quadratic_diffuse_fidelity: float = 0.0,
+        use_bipolar_kboson: bool = False,
+        bipolar_hole_weight: float = 0.0,
         logit_softcap: float = 15.0,
         use_activation_checkpointing: bool = False,
         mtp_horizons: int = 1,
@@ -125,6 +137,7 @@ class QuantumBornGPT(nn.Module):
         *,
         use_zero_half_rope: bool | None = None,
         use_depth_scaled_residual: bool | None = None,
+        quad_diffuse_weight: float | None = None,
     ) -> None:
         super().__init__()
         if use_zero_half_rope is not None:
@@ -191,6 +204,7 @@ class QuantumBornGPT(nn.Module):
         self.num_higher_states = int(num_higher_states)
         self.use_block_hierarchy_bridge = bool(use_block_hierarchy_bridge)
         self.bridge_causal_memory = bool(bridge_causal_memory)
+        self.use_embed_causal_memory = bool(use_embed_causal_memory)
         self.use_last_layer_softmax = bool(use_last_layer_softmax)
         self.use_two_beam_kboson_readout = bool(
             use_two_beam_kboson_readout if use_two_beam_kboson_readout is not None else use_two_beam_kboson
@@ -198,6 +212,26 @@ class QuantumBornGPT(nn.Module):
         self.use_two_beam_kboson = self.use_two_beam_kboson_readout
         self.diffuse_rank = int(diffuse_bath_rank if diffuse_bath_rank is not None else diffuse_rank)
         self.diffuse_bath_rank = self.diffuse_rank
+        self.diffuse_schedule = str(diffuse_schedule)
+        self.lambda_diff_min = float(lambda_diff_min)
+        self.lambda_diff_max = float(lambda_diff_max)
+        self.lambda_diff_start = float(lambda_diff_start)
+        self.lambda_diff_end = float(lambda_diff_end)
+        self.contextual_purity_gain = float(contextual_purity_gain)
+        self.use_stereographic_lift = bool(use_stereographic_lift)
+        self.use_cosine_phase_beam_gate = bool(use_cosine_phase_beam_gate)
+        self.quadratic_diffuse_fidelity = float(
+            quad_diffuse_weight
+            if quad_diffuse_weight is not None
+            else quadratic_diffuse_fidelity
+        )
+        self.quad_diffuse_weight = self.quadratic_diffuse_fidelity
+        self.use_bipolar_kboson = bool(use_bipolar_kboson or float(bipolar_hole_weight) > 0.0)
+        self.bipolar_hole_weight = (
+            float(bipolar_hole_weight)
+            if float(bipolar_hole_weight) > 0.0
+            else (0.85 if self.use_bipolar_kboson else 0.0)
+        )
         self.logit_softcap = float(logit_softcap)
         self.use_activation_checkpointing = bool(use_activation_checkpointing)
         if self.use_hierarchical_16qubit and embed_dim == 2 * self.qubit_registers * self.qubit_amplitudes:
@@ -249,6 +283,7 @@ class QuantumBornGPT(nn.Module):
                 use_ortho_decouple=self.use_ortho_decouple,
                 use_block_hierarchy_bridge=self.use_block_hierarchy_bridge,
                 bridge_causal_memory=self.bridge_causal_memory,
+                use_embed_causal_memory=self.use_embed_causal_memory,
                 eps=eps,
             )
             self.hierarchical_povm_readout: Hierarchical16QubitPOVMReadout | None = Hierarchical16QubitPOVMReadout(
@@ -260,6 +295,16 @@ class QuantumBornGPT(nn.Module):
                 povm_temperature=povm_temperature,
                 use_ortho_decouple=self.use_ortho_decouple,
                 diffuse_rank=self.diffuse_rank,
+                diffuse_schedule=self.diffuse_schedule,
+                lambda_diff_min=self.lambda_diff_min,
+                lambda_diff_max=self.lambda_diff_max,
+                lambda_diff_start=self.lambda_diff_start,
+                lambda_diff_end=self.lambda_diff_end,
+                contextual_purity_gain=self.contextual_purity_gain,
+                use_stereographic_lift=self.use_stereographic_lift,
+                quadratic_diffuse_fidelity=self.quadratic_diffuse_fidelity,
+                use_bipolar_kboson=self.use_bipolar_kboson,
+                bipolar_hole_weight=self.bipolar_hole_weight,
                 eps=eps,
             )
         else:
@@ -365,6 +410,8 @@ class QuantumBornGPT(nn.Module):
                     use_partial_key_offset=self.use_partial_key_offset,
                     use_paired_heads=self.use_paired_heads,
                     qk_head_dim=self.qk_head_dim,
+                    use_stereographic_lift=self.use_stereographic_lift,
+                    use_cosine_phase_beam_gate=self.use_cosine_phase_beam_gate,
                     eps=eps,
                 )
                 for layer_idx in range(num_layers)
@@ -593,7 +640,7 @@ class QuantumBornGPT(nn.Module):
         cos, sin = self.rope.get_cos_sin(T)
         doc_ids = compute_document_ids(idx, eot_token_id=self.eot_token_id) if self.doc_mask_attn else None
         v_0: torch.Tensor | None = None
-        last_beam2_ckpt: torch.Tensor | None = None
+        last_beam2_final: torch.Tensor | None = None
         need_v0 = bool(self.true_layer0_v_residual or self.value_embeds is not None)
         use_block_ckpt = bool(self.use_activation_checkpointing and self.training and torch.is_grad_enabled())
         for layer_idx, block in enumerate(self.blocks):
@@ -607,6 +654,7 @@ class QuantumBornGPT(nn.Module):
                 psi = l2_normalize(psi + s_l * h_ngram_sparse.to(psi.dtype), dim=-1, eps=self.eps)
             psi_before_block = psi
             ve_l = self._get_value_embed(layer_idx, idx)
+            is_last_b2 = (layer_idx == self.num_layers - 1) and self.use_two_beam_kboson_readout
             if use_block_ckpt:
                 from torch.utils.checkpoint import checkpoint
 
@@ -617,11 +665,13 @@ class QuantumBornGPT(nn.Module):
                     ve_in: torch.Tensor | None,
                     _blk: nn.Module = block,
                     _l_idx: int = layer_idx,
+                    _ret_b2: bool = is_last_b2,
                 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
                     v0_out = v0_in
+                    beam2_b: torch.Tensor | None = None
                     if need_v0:
                         if _l_idx == 0 and getattr(_blk, "attn", None) is not None:
-                            psi_b, v0_out = _blk(
+                            blk_out = _blk(
                                 psi_in,
                                 cos=cos,
                                 sin=sin,
@@ -631,9 +681,14 @@ class QuantumBornGPT(nn.Module):
                                 ve=ve_in,
                                 window_size=self.window_size,
                                 doc_ids=doc_ids,
+                                return_beam2=_ret_b2,
                             )
+                            if _ret_b2:
+                                psi_b, v0_out, beam2_b = blk_out
+                            else:
+                                psi_b, v0_out = blk_out
                         else:
-                            psi_b = _blk(
+                            blk_out = _blk(
                                 psi_in,
                                 cos=cos,
                                 sin=sin,
@@ -643,9 +698,14 @@ class QuantumBornGPT(nn.Module):
                                 ve=ve_in,
                                 window_size=self.window_size,
                                 doc_ids=doc_ids,
+                                return_beam2=_ret_b2,
                             )
+                            if _ret_b2:
+                                psi_b, beam2_b = blk_out
+                            else:
+                                psi_b = blk_out
                     else:
-                        psi_b = _blk(
+                        blk_out = _blk(
                             psi_in,
                             cos=cos,
                             sin=sin,
@@ -653,8 +713,14 @@ class QuantumBornGPT(nn.Module):
                             ve=ve_in,
                             window_size=self.window_size,
                             doc_ids=doc_ids,
+                            return_beam2=_ret_b2,
                         )
-                    beam2_b = getattr(_blk, "last_beam2", None) if _l_idx == self.num_layers - 1 else None
+                        if _ret_b2:
+                            psi_b, beam2_b = blk_out
+                        else:
+                            psi_b = blk_out
+                    if beam2_b is None and _l_idx == self.num_layers - 1:
+                        beam2_b = getattr(_blk, "last_beam2", None)
                     if self.hierarchical_qubit_embed is not None and self.use_block_hierarchy_bridge:
                         psi_b = self.hierarchical_qubit_embed.forward_block_bridge(psi_b, layer_idx=_l_idx)
                     if self.mudd_skips is not None:
@@ -671,13 +737,13 @@ class QuantumBornGPT(nn.Module):
                     use_reentrant=False,
                 )
                 if layer_idx == self.num_layers - 1:
-                    last_beam2_ckpt = b2_out
+                    last_beam2_final = b2_out
                 if layer_idx == 0 and v_0 is not None and not torch.compiler.is_compiling():
                     self._last_v_0 = v_0.detach()
             else:
                 if need_v0:
                     if layer_idx == 0 and block.attn is not None:
-                        psi, v_0 = block(
+                        blk_out = block(
                             psi,
                             cos=cos,
                             sin=sin,
@@ -687,11 +753,16 @@ class QuantumBornGPT(nn.Module):
                             ve=ve_l,
                             window_size=self.window_size,
                             doc_ids=doc_ids,
+                            return_beam2=is_last_b2,
                         )
+                        if is_last_b2:
+                            psi, v_0, last_beam2_final = blk_out
+                        else:
+                            psi, v_0 = blk_out
                         if not torch.compiler.is_compiling():
                             self._last_v_0 = v_0.detach()
                     else:
-                        psi = block(
+                        blk_out = block(
                             psi,
                             cos=cos,
                             sin=sin,
@@ -701,9 +772,14 @@ class QuantumBornGPT(nn.Module):
                             ve=ve_l,
                             window_size=self.window_size,
                             doc_ids=doc_ids,
+                            return_beam2=is_last_b2,
                         )
+                        if is_last_b2:
+                            psi, last_beam2_final = blk_out
+                        else:
+                            psi = blk_out
                 else:
-                    psi = block(
+                    blk_out = block(
                         psi,
                         cos=cos,
                         sin=sin,
@@ -711,7 +787,12 @@ class QuantumBornGPT(nn.Module):
                         ve=ve_l,
                         window_size=self.window_size,
                         doc_ids=doc_ids,
+                        return_beam2=is_last_b2,
                     )
+                    if is_last_b2:
+                        psi, last_beam2_final = blk_out
+                    else:
+                        psi = blk_out
                 if self.hierarchical_qubit_embed is not None and self.use_block_hierarchy_bridge:
                     psi = self.hierarchical_qubit_embed.forward_block_bridge(psi, layer_idx=layer_idx)
                 if self.mudd_skips is not None:
@@ -744,11 +825,19 @@ class QuantumBornGPT(nn.Module):
             if return_layer_states:
                 layer_states.append(psi)
 
-        self._last_psi_beam2 = (
-            last_beam2_ckpt
-            if (use_block_ckpt and last_beam2_ckpt is not None)
+        raw_beam2 = (
+            last_beam2_final
+            if last_beam2_final is not None
             else (getattr(self.blocks[-1], "last_beam2", None) if len(self.blocks) > 0 else None)
         )
+        if self.use_cosine_phase_beam_gate and raw_beam2 is not None:
+            proj_final = (raw_beam2.float() * psi.float()).sum(dim=-1, keepdim=True)
+            raw_beam2 = l2_normalize(
+                raw_beam2.float() - proj_final * psi.float(),
+                dim=-1,
+                eps=self.eps,
+            ).to(psi.dtype)
+        self._last_psi_beam2 = raw_beam2
 
         if self.sparse_density_layer is not None:
             last_blk_density = getattr(self.blocks[-1], "sparse_density_layer", None) if len(self.blocks) > 0 else None
@@ -777,15 +866,6 @@ class QuantumBornGPT(nn.Module):
             and self.hierarchical_povm_readout is not None
             and self.hierarchical_qubit_embed is not None
         ):
-            base_head = self.povm_readout.povm_head if self.povm_readout is not None else None
-            psi_s, psi_d, m_s, m_d, k_eff, lam_diff = (
-                self.hierarchical_povm_readout.get_two_beam_kboson_factors(
-                    self.hierarchical_qubit_embed,
-                    psi,
-                    psi_beam2=self._last_psi_beam2,
-                    base_povm_head=base_head,
-                )
-            )
             inv_t_raw = (
                 self.povm_readout.inv_temp
                 if self.povm_readout is not None
@@ -798,19 +878,26 @@ class QuantumBornGPT(nn.Module):
             )
             if self.purity_gate is not None:
                 beta_t = self.purity_gate(psi, inv_t_primary)
-                if not torch.compiler.is_compiling():
-                    self._last_mean_beta = float(beta_t.detach().mean().item())
             else:
                 beta_t = (
                     inv_t_primary
                     if isinstance(inv_t_primary, torch.Tensor)
                     else torch.tensor(float(inv_t_primary), device=psi.device, dtype=torch.float32)
                 )
-                if not torch.compiler.is_compiling():
-                    self._last_mean_beta = float(beta_t.detach().mean().item())
+            base_head = self.povm_readout.povm_head if self.povm_readout is not None else None
+            psi_s, psi_d, m_s, m_d, k_eff, lam_diff = (
+                self.hierarchical_povm_readout.get_two_beam_kboson_factors(
+                    self.hierarchical_qubit_embed,
+                    psi,
+                    psi_beam2=self._last_psi_beam2,
+                    base_povm_head=base_head,
+                    beta_t=beta_t,
+                )
+            )
             if not torch.compiler.is_compiling():
+                self._last_mean_beta = float(beta_t.detach().mean().item())
                 self._last_kboson_copies = float(k_eff.detach().item())
-                self._last_lambda_diff = float(lam_diff.detach().item())
+                self._last_lambda_diff = float(lam_diff.detach().float().mean().item())
             return compute_two_beam_kboson_logits(
                 psi_s,
                 psi_d,
@@ -820,6 +907,8 @@ class QuantumBornGPT(nn.Module):
                 k_eff,
                 lam_diff,
                 log_prior=self.povm_log_prior,
+                quad_diffuse_weight=self.quadratic_diffuse_fidelity,
+                bipolar_hole_weight=self.bipolar_hole_weight if self.use_bipolar_kboson else 0.0,
             )
 
         if self.use_last_layer_softmax:
@@ -926,17 +1015,6 @@ class QuantumBornGPT(nn.Module):
             and self.hierarchical_povm_readout is not None
             and self.hierarchical_qubit_embed is not None
         ):
-            base_head = self.povm_readout.povm_head if self.povm_readout is not None else None
-            psi_s, psi_d, m_s, m_d, k_eff, lam_diff = (
-                self.hierarchical_povm_readout.get_two_beam_kboson_factors(
-                    self.hierarchical_qubit_embed,
-                    psi,
-                    psi_beam2=self._last_psi_beam2,
-                    base_povm_head=base_head,
-                )
-            )
-            phi_seed = psi_s
-            M_seed = m_s
             inv_t_raw = (
                 self.povm_readout.inv_temp
                 if self.povm_readout is not None
@@ -955,10 +1033,22 @@ class QuantumBornGPT(nn.Module):
                     if isinstance(inv_t_primary, torch.Tensor)
                     else torch.tensor(float(inv_t_primary), device=psi.device, dtype=torch.float32)
                 )
+            base_head = self.povm_readout.povm_head if self.povm_readout is not None else None
+            psi_s, psi_d, m_s, m_d, k_eff, lam_diff = (
+                self.hierarchical_povm_readout.get_two_beam_kboson_factors(
+                    self.hierarchical_qubit_embed,
+                    psi,
+                    psi_beam2=self._last_psi_beam2,
+                    base_povm_head=base_head,
+                    beta_t=beta_t,
+                )
+            )
+            phi_seed = psi_s
+            M_seed = m_s
             if not torch.compiler.is_compiling():
                 self._last_mean_beta = float(beta_t.detach().mean().item())
                 self._last_kboson_copies = float(k_eff.detach().item())
-                self._last_lambda_diff = float(lam_diff.detach().item())
+                self._last_lambda_diff = float(lam_diff.detach().float().mean().item())
             if targets is not None and direct_chunked_ce:
                 logits = torch.empty((B, 0, self.vocab_size), device=idx.device, dtype=psi.dtype)
                 kboson_chunked_loss = direct_chunked_two_beam_kboson_ce(
@@ -972,6 +1062,8 @@ class QuantumBornGPT(nn.Module):
                     targets,
                     log_prior=self.povm_log_prior,
                     chunk_tokens=max(1, min(1024, B * T)),
+                    quad_diffuse_weight=self.quadratic_diffuse_fidelity,
+                    bipolar_hole_weight=self.bipolar_hole_weight if self.use_bipolar_kboson else 0.0,
                 )
             else:
                 logits = compute_two_beam_kboson_logits(
@@ -983,6 +1075,8 @@ class QuantumBornGPT(nn.Module):
                     k_eff,
                     lam_diff,
                     log_prior=self.povm_log_prior,
+                    quad_diffuse_weight=self.quadratic_diffuse_fidelity,
+                    bipolar_hole_weight=self.bipolar_hole_weight if self.use_bipolar_kboson else 0.0,
                 )
             self._last_density_branches = None
             self._last_density_weights = None

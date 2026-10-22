@@ -70,7 +70,9 @@ WAVE_DEFAULT_LABELS: dict[str, str] = {
     "W13": "Wave 13 (Plan 021: 9-Shard PPMI-SVD Co-Occurrence Init, Hashed N-Gram Embeddings & ANVIL Cat A/B/C)",
     "W14": "Wave 14 (Plan 022: 64-Qubit Sparse Fock Excitation Space, Sparse 1/2/3-Gram Qubit Encodings & 4M Density Matrix Layers)",
     "W15": "Wave 15 (Plan 023: 16-Qubit Multi-Register Amplitudes & 256-State Interacting Quantum Hierarchy)",
-    "VERIFY": "Pre-Launch Micro-Verifications & Controlled Hypothesis Tests (Plans 013–023)",
+    "W16": "Wave 16 (Plan 026–027: 100% Quantum Two-Beam k-Boson Mixed-State Readout & Scheduled Rank-r Kraus Semantic Bath)",
+    "W17": "Wave 17 (Plan 028: Stereographic Radial Lift, Cosine Phase-Interference Two-Beam Readout & Quadratic Kraus Fidelity)",
+    "VERIFY": "Pre-Launch Micro-Verifications & Controlled Hypothesis Tests (Plans 013–028)",
 }
 
 WAVE_DEFAULT_PLANS: dict[str, str] = {
@@ -91,7 +93,9 @@ WAVE_DEFAULT_PLANS: dict[str, str] = {
     "W13": "EXPERIMENT_PLAN_021",
     "W14": "EXPERIMENT_PLAN_022",
     "W15": "EXPERIMENT_PLAN_023",
-    "VERIFY": "EXPERIMENT_PLAN_013_023",
+    "W16": "EXPERIMENT_PLAN_027",
+    "W17": "EXPERIMENT_PLAN_028",
+    "VERIFY": "EXPERIMENT_PLAN_013_028",
 }
 
 BASELINE_RUN_KEYS: frozenset[str] = frozenset(
@@ -316,6 +320,25 @@ def _build_cli_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--last-layer-softmax", action="store_true")
     parser.add_argument("--two-beam-kboson-readout", "--two-beam-kboson", dest="two_beam_kboson_readout", action="store_true")
     parser.add_argument("--diffuse-rank", type=int, default=16)
+    parser.add_argument("--diffuse-schedule", type=str, default="free_decay")
+    parser.add_argument("--lambda-diff-min", type=float, default=0.08)
+    parser.add_argument("--lambda-diff-max", type=float, default=0.35)
+    parser.add_argument("--lambda-diff-start", type=float, default=0.22)
+    parser.add_argument("--lambda-diff-end", type=float, default=0.12)
+    parser.add_argument("--contextual-purity-gain", type=float, default=0.20)
+    parser.add_argument("--stereographic-lift", action="store_true")
+    parser.add_argument("--cosine-phase-beam-gate", action="store_true")
+    parser.add_argument(
+        "--quadratic-diffuse-fidelity",
+        "--quad-diffuse-weight",
+        dest="quadratic_diffuse_fidelity",
+        nargs="?",
+        const=0.50,
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument("--bipolar-kboson", action="store_true")
+    parser.add_argument("--bipolar-hole-weight", type=float, default=0.85)
     parser.add_argument("--logit-softcap", type=float, default=15.0)
     parser.add_argument("--val-tokens", type=int, default=10485760)
     return parser
@@ -458,7 +481,23 @@ def parse_cli_args_to_card_sections(cli_args: str) -> tuple[dict[str, Any], dict
         "bridge_causal_memory": not bool(ns.no_bridge_causal_memory),
         "use_last_layer_softmax": bool(ns.last_layer_softmax),
         "use_two_beam_kboson_readout": bool(ns.two_beam_kboson_readout),
+        "two_beam_kboson_readout": bool(ns.two_beam_kboson_readout),
         "diffuse_rank": int(ns.diffuse_rank),
+        "diffuse_schedule": str(ns.diffuse_schedule),
+        "lambda_diff_min": float(ns.lambda_diff_min),
+        "lambda_diff_max": float(ns.lambda_diff_max),
+        "lambda_diff_start": float(ns.lambda_diff_start),
+        "lambda_diff_end": float(ns.lambda_diff_end),
+        "contextual_purity_gain": float(ns.contextual_purity_gain),
+        "use_stereographic_lift": bool(ns.stereographic_lift),
+        "stereographic_lift": bool(ns.stereographic_lift),
+        "use_cosine_phase_beam_gate": bool(ns.cosine_phase_beam_gate),
+        "cosine_phase_beam_gate": bool(ns.cosine_phase_beam_gate),
+        "quadratic_diffuse_fidelity": float(ns.quadratic_diffuse_fidelity),
+        "quad_diffuse_weight": float(ns.quadratic_diffuse_fidelity),
+        "use_bipolar_kboson": bool(ns.bipolar_kboson),
+        "bipolar_kboson": bool(ns.bipolar_kboson),
+        "bipolar_hole_weight": float(ns.bipolar_hole_weight),
         "logit_softcap": float(ns.logit_softcap),
     }
 

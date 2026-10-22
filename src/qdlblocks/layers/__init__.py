@@ -123,6 +123,17 @@ from .hierarchical_qubit import (
     Hierarchical16QubitPOVMReadout,
     initialize_hierarchical_16qubit_with_ppmi_svd,
 )
+from .stereographic_lift import (
+    ClassicalSoftmaxMLP,
+    NaiveBornClassifier,
+    StereographicHilbertLift,
+    StereographicSingleBeamKBoson,
+    StereographicTwoBeamKBoson,
+    apply_dimension_preserving_stereographic_rotation,
+    build_concentric_shells_dataset,
+    load_fisher_iris_dataset,
+    run_iris_and_shells_benchmark,
+)
 
 __all__ = [
     "ComplexLinear",
@@ -159,6 +170,15 @@ __all__ = [
     "Hierarchical16QubitEmbedder",
     "Hierarchical16QubitPOVMReadout",
     "initialize_hierarchical_16qubit_with_ppmi_svd",
+    "StereographicHilbertLift",
+    "apply_dimension_preserving_stereographic_rotation",
+    "load_fisher_iris_dataset",
+    "build_concentric_shells_dataset",
+    "NaiveBornClassifier",
+    "StereographicSingleBeamKBoson",
+    "StereographicTwoBeamKBoson",
+    "ClassicalSoftmaxMLP",
+    "run_iris_and_shells_benchmark",
     "InputChannelGate",
     "apply_gated_xsa",
     "MUDDDynamicSkip",
@@ -220,5 +240,6 @@ __all__ = [
     "SPAMNoise",
     "DepolarizingNoise",
 ]
+
 
 

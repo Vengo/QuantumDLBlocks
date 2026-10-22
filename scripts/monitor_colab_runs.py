@@ -94,6 +94,12 @@ DEFAULT_OBSOLETE_KEYS: dict[str, str] = {
     "w15_900m_qborn_16x32_qubit_256hier_deep_L12_H8_d128": "Stopped at 175M tok (4.5966 Val CE) and superseded by Plan 024 Calibrated Last-Layer Softmax + VE Init hotfix (w15_900m_qborn_16x32_qubit_256hier_deep_L12_softmax)",
     "w15_900m_qborn_16x32_qubit_512hier_L8": "Stopped at 175M tok (4.6020 Val CE) and superseded by Plan 024 Calibrated Last-Layer Softmax hotfix (w15_900m_qborn_16x32_qubit_512hier_softmax_L8)",
     "w15_900m_qborn_16x32_qubit_256hier_rank4_density_L8": "Stopped at 100M tok (4.8648 Val CE) due to 5.4x slower Rank-4 density channel throughput and superseded by Plan 024 N-Gram + Calibrated Softmax hotfix (w15_900m_qborn_16x32_qubit_256hier_ngram_softmax_L8)",
+    "w15_900m_qborn_16x32_qubit_256hier_flagship_softmax_L8": "Colab VM lease expired at 775M tok (3.6531 Val CE, 40.42% Top-1) and superseded by Wave 16 100% Quantum Two-Beam k-Boson Flagship (w16_900m_qborn_16x32_256hier_twobeam_kboson_flagship_L8)",
+    "w15_900m_qborn_16x32_qubit_256hier_deep_L12_softmax": "Colab VM lease expired at 750M tok (3.6353 Val CE, 40.55% Top-1) and superseded by Wave 16 Deep L=12 Unified Two-Beam k-Boson (w16_900m_qborn_16x32_256hier_unified_deep_L12_twobeam_kboson)",
+    "w15_900m_qborn_16x32_qubit_512hier_softmax_L8": "Colab VM lease expired at 750M tok (3.6562 Val CE, 40.37% Top-1) and superseded by Wave 16 Unified W13+W15 Two-Beam k-Boson (w16_900m_qborn_16x32_256hier_unified_w13w15_twobeam_kboson_L8)",
+    "w15_900m_qborn_16x32_qubit_256hier_ngram_softmax_L8": "Colab VM lease expired at 450M tok (3.7330 Val CE, 39.21% Top-1) and superseded by Wave 16 N-Gram Two-Beam k-Boson (w16_900m_qborn_16x32_256hier_ngram_twobeam_kboson_L8)",
+    "w18_8gb_L2_d256_bipolar_kboson_whitened_300steps": "Falsified Plan 031 ablation (6.3250 vs Plan 030 6.1960): convex bipolar hole -0.85*k*ln(1+|x|) inflated 49,000 negative-hemisphere background tokens in Z and hard Cholesky diffuse whitening (R_diff=16.00) destroyed Zipfian syntactic SNR",
+    "w18_8gb_L4_d256_bipolar_kboson_whitened_900steps": "Aborted & falsified Plan 031 ablation at Step 300 (6.4489 vs Plan 030 6.1391): superseded by Plan 032 clean J_anti + gentle 2x zero-WD qubit LR (w18_8gb_L4_d256_clean_janti_gentle_lr_900steps)",
 }
 
 _COLAB_EXEC_LOCK = threading.Lock()

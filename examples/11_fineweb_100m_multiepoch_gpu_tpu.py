@@ -565,6 +565,14 @@ def parse_args() -> argparse.Namespace:
         help="Disable the per-block 256-state hierarchical quantum bridge inside QuantumBornGPT blocks (Plan 023).",
     )
     parser.add_argument(
+        "--no-bridge-causal-memory",
+        "--embed-only-causal-memory",
+        dest="no_bridge_causal_memory",
+        action="store_true",
+        default=False,
+        help="Disable causal hierarchy memory shift inside per-block bridges while keeping embedder causal shift (Plan 025).",
+    )
+    parser.add_argument(
         "--last-layer-softmax",
         action="store_true",
         default=False,
@@ -583,6 +591,83 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=16,
         help="Subspace rank r of the Non-Isometric Kraus Semantic Bath K_diff (Plan 026, default: 16).",
+    )
+    parser.add_argument(
+        "--diffuse-schedule",
+        type=str,
+        default="warmup_hold_anneal",
+        choices=[
+            "free_decay",
+            "bounded_floor",
+            "cosine_broad_to_sharp",
+            "warmup_hold_anneal",
+            "contextual_purity_complement",
+        ],
+        help="Diffuse Kraus Bath weight schedule mode (Plan 027, default: warmup_hold_anneal).",
+    )
+    parser.add_argument(
+        "--lambda-diff-min",
+        type=float,
+        default=0.08,
+        help="Minimum diffuse Kraus bath mixing weight lambda_diff (Plan 027, default: 0.08).",
+    )
+    parser.add_argument(
+        "--lambda-diff-max",
+        type=float,
+        default=0.35,
+        help="Maximum diffuse Kraus bath mixing weight lambda_diff (Plan 027, default: 0.35).",
+    )
+    parser.add_argument(
+        "--lambda-diff-start",
+        type=float,
+        default=0.22,
+        help="Starting diffuse Kraus bath mixing weight lambda_diff (Plan 027, default: 0.22).",
+    )
+    parser.add_argument(
+        "--lambda-diff-end",
+        type=float,
+        default=0.12,
+        help="Ending diffuse Kraus bath mixing weight lambda_diff (Plan 027, default: 0.12).",
+    )
+    parser.add_argument(
+        "--contextual-purity-gain",
+        type=float,
+        default=0.20,
+        help="Contextual purity complement gain for per-token lambda_diff (Plan 027, default: 0.20).",
+    )
+    parser.add_argument(
+        "--stereographic-lift",
+        action="store_true",
+        default=False,
+        help="Enable Stereographic Radial-Norm-Preserving Polar-Latitude Lift in two-beam MLP and readout (Plan 028).",
+    )
+    parser.add_argument(
+        "--cosine-phase-beam-gate",
+        action="store_true",
+        default=False,
+        help="Enable Cosine/Sine Quadrature Phase-Interference Two-Beam Gate + Exact Gram-Schmidt Beam-2 Orthogonality (Plan 028).",
+    )
+    parser.add_argument(
+        "--quadratic-diffuse-fidelity",
+        "--quad-diffuse-weight",
+        dest="quadratic_diffuse_fidelity",
+        nargs="?",
+        const=0.50,
+        type=float,
+        default=0.0,
+        help="Positive-part quadratic Kraus diffuse fidelity weight w_quad (Plan 028, default: 0.0; --quadratic-diffuse-fidelity defaults to 0.50).",
+    )
+    parser.add_argument(
+        "--bipolar-kboson",
+        action="store_true",
+        default=False,
+        help="Enable Bipolar Particle-Hole k-Boson Log-Fidelity and Diffuse Mode Whitening (Plan 031).",
+    )
+    parser.add_argument(
+        "--bipolar-hole-weight",
+        type=float,
+        default=0.85,
+        help="Destructive hole penalty weight w_hole for Bipolar Particle-Hole k-Boson Readout (Plan 031, default: 0.85).",
     )
     parser.add_argument(
         "--logit-softcap",
@@ -743,9 +828,21 @@ def run_cuda_benchmark(
     qubit_amplitudes: int = 32,
     num_higher_states: int = 256,
     no_block_hierarchy_bridge: bool = False,
+    no_bridge_causal_memory: bool = False,
     last_layer_softmax: bool = False,
     two_beam_kboson_readout: bool = False,
     diffuse_rank: int = 16,
+    diffuse_schedule: str = "warmup_hold_anneal",
+    lambda_diff_min: float = 0.08,
+    lambda_diff_max: float = 0.35,
+    lambda_diff_start: float = 0.22,
+    lambda_diff_end: float = 0.12,
+    contextual_purity_gain: float = 0.20,
+    stereographic_lift: bool = False,
+    cosine_phase_beam_gate: bool = False,
+    quadratic_diffuse_fidelity: float = 0.0,
+    bipolar_kboson: bool = False,
+    bipolar_hole_weight: float = 0.85,
     logit_softcap: float = 15.0,
     optimizer_mode: Literal["muon_adamw", "pure_adamw", "sgd_nesterov"] = "muon_adamw",
     batch_size: int = 128,
@@ -852,7 +949,7 @@ def run_cuda_benchmark(
         idx: torch.Tensor,
         return_layer_states: bool = False,
         cached_m_seed: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor], torch.Tensor | None]:
         B_cur, T_cur = idx.shape
         if getattr(m, "use_hierarchical_16qubit", False) and getattr(m, "hierarchical_qubit_embed", None) is not None:
             psi_0 = m.hierarchical_qubit_embed(idx)
@@ -904,6 +1001,7 @@ def run_cuda_benchmark(
             and (torch.cuda.get_device_properties(psi.device).total_memory < 24 * (1024**3))
         )
         v_0: torch.Tensor | None = None
+        last_psi_beam2: torch.Tensor | None = None
         need_v0 = bool(
             getattr(m, "true_layer0_v_residual", False)
             or getattr(m, "value_embeds", None) is not None
@@ -922,14 +1020,28 @@ def run_cuda_benchmark(
                 )
             psi_before_block = psi
             ve_l = m._get_value_embed(layer_idx, idx) if hasattr(m, "_get_value_embed") else None
+            is_last_b2 = (layer_idx == m.num_layers - 1) and bool(
+                getattr(m, "use_two_beam_kboson_readout", False)
+            )
             if need_v0:
                 if layer_idx == 0 and block.attn is not None:
                     if use_block_ckpt:
-                        psi, v_0 = checkpoint(
-                            block, psi, cos, sin, psi_0, None, True, ve_l, win_sz, doc_ids, use_reentrant=False
+                        blk_out = checkpoint(
+                            block,
+                            psi,
+                            cos,
+                            sin,
+                            psi_0,
+                            None,
+                            True,
+                            ve_l,
+                            win_sz,
+                            doc_ids,
+                            is_last_b2,
+                            use_reentrant=False,
                         )
                     else:
-                        psi, v_0 = block(
+                        blk_out = block(
                             psi,
                             cos=cos,
                             sin=sin,
@@ -939,14 +1051,30 @@ def run_cuda_benchmark(
                             ve=ve_l,
                             window_size=win_sz,
                             doc_ids=doc_ids,
+                            return_beam2=is_last_b2,
                         )
+                    if is_last_b2:
+                        psi, v_0, last_psi_beam2 = blk_out
+                    else:
+                        psi, v_0 = blk_out
                 else:
                     if use_block_ckpt:
-                        psi = checkpoint(
-                            block, psi, cos, sin, psi_0, v_0, False, ve_l, win_sz, doc_ids, use_reentrant=False
+                        blk_out = checkpoint(
+                            block,
+                            psi,
+                            cos,
+                            sin,
+                            psi_0,
+                            v_0,
+                            False,
+                            ve_l,
+                            win_sz,
+                            doc_ids,
+                            is_last_b2,
+                            use_reentrant=False,
                         )
                     else:
-                        psi = block(
+                        blk_out = block(
                             psi,
                             cos=cos,
                             sin=sin,
@@ -956,14 +1084,30 @@ def run_cuda_benchmark(
                             ve=ve_l,
                             window_size=win_sz,
                             doc_ids=doc_ids,
+                            return_beam2=is_last_b2,
                         )
+                    if is_last_b2:
+                        psi, last_psi_beam2 = blk_out
+                    else:
+                        psi = blk_out
             else:
                 if use_block_ckpt:
-                    psi = checkpoint(
-                        block, psi, cos, sin, psi_0, None, False, ve_l, win_sz, doc_ids, use_reentrant=False
+                    blk_out = checkpoint(
+                        block,
+                        psi,
+                        cos,
+                        sin,
+                        psi_0,
+                        None,
+                        False,
+                        ve_l,
+                        win_sz,
+                        doc_ids,
+                        is_last_b2,
+                        use_reentrant=False,
                     )
                 else:
-                    psi = block(
+                    blk_out = block(
                         psi,
                         cos=cos,
                         sin=sin,
@@ -973,7 +1117,12 @@ def run_cuda_benchmark(
                         ve=ve_l,
                         window_size=win_sz,
                         doc_ids=doc_ids,
+                        return_beam2=is_last_b2,
                     )
+                if is_last_b2:
+                    psi, last_psi_beam2 = blk_out
+                else:
+                    psi = blk_out
             if (
                 getattr(m, "hierarchical_qubit_embed", None) is not None
                 and getattr(m, "use_block_hierarchy_bridge", False)
@@ -1003,6 +1152,14 @@ def run_cuda_benchmark(
                         )
             if return_layer_states:
                 layer_states.append(psi.detach())
+
+        if getattr(m, "use_cosine_phase_beam_gate", False) and last_psi_beam2 is not None:
+            proj_f = (last_psi_beam2.float() * psi.float()).sum(dim=-1, keepdim=True)
+            last_psi_beam2 = l2_normalize(
+                last_psi_beam2.float() - proj_f * psi.float(),
+                dim=-1,
+                eps=m.eps,
+            ).to(psi.dtype)
 
         if getattr(m, "use_last_layer_softmax", False):
             if (
@@ -1036,7 +1193,7 @@ def run_cuda_benchmark(
                     ).to(phi_seed.dtype)
                 )
             inv_t = torch.tensor(float(getattr(m, "logit_softcap", 15.0)), device=phi_seed.device, dtype=torch.float32)
-            return phi_seed, M_seed, inv_t, layer_states
+            return phi_seed, M_seed, inv_t, layer_states, last_psi_beam2
 
         if (
             getattr(m, "use_sparse_64qubit", False)
@@ -1055,6 +1212,8 @@ def run_cuda_benchmark(
             phi_seed = l2_normalize(psi, dim=-1, eps=m.eps)
             if cached_m_seed is not None:
                 M_seed = cached_m_seed.to(phi_seed.dtype)
+            elif getattr(m, "use_two_beam_kboson_readout", False) and m.mtp_horizons <= 1:
+                M_seed = m.povm_readout.povm_head.to(phi_seed.dtype)
             elif (
                 getattr(m, "use_hierarchical_16qubit", False)
                 and getattr(m, "hierarchical_povm_readout", None) is not None
@@ -1077,7 +1236,8 @@ def run_cuda_benchmark(
                 M_seed = l2_normalize(m_coupled, dim=1, eps=m.eps).to(phi_seed.dtype)
             else:
                 M_seed = l2_normalize(m.povm_readout.povm_head, dim=1, eps=m.eps).to(phi_seed.dtype)
-            inv_t = torch.clamp(m.povm_readout.inv_temp, min=1.0, max=60.0)
+            max_beta = 45.0 if getattr(m, "use_two_beam_kboson_readout", False) else 60.0
+            inv_t = torch.clamp(m.povm_readout.inv_temp, min=1.0, max=max_beta)
         elif (
             m.readout_mode in ("tied_stiefel", "tied_vocab")
             and m.readout_rot is not None
@@ -1128,7 +1288,13 @@ def run_cuda_benchmark(
 
         if getattr(m, "purity_gate", None) is not None:
             inv_t = m.purity_gate(psi, inv_t)  # type: ignore[misc]
-        return phi_seed, M_seed, inv_t, layer_states
+        return phi_seed, M_seed, inv_t, layer_states, last_psi_beam2
+
+    def _backbone_step(
+        m: QuantumBornGPT, idx: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        phi_s, m_s, inv_t_out, _, b2_out = forward_backbone(m, idx, False)
+        return phi_s, m_s, inv_t_out, b2_out
 
     is_low_vram_gpu = bool(
         torch.cuda.is_available()
@@ -1136,11 +1302,11 @@ def run_cuda_benchmark(
         and (batch_size * seq_len >= 65536)
     )
     if is_low_vram_gpu:
-        compiled_backbone = lambda m, idx: forward_backbone(m, idx, False)[:3]
+        compiled_backbone = _backbone_step
         compiled_classical_features = lambda m, idx: m.forward_features(idx, return_layer_states=False)[0]
     else:
         compiled_backbone = torch.compile(
-            lambda m, idx: forward_backbone(m, idx, False)[:3],
+            _backbone_step,
             mode="default",
         )
         compiled_classical_features = torch.compile(
@@ -1277,7 +1443,7 @@ def run_cuda_benchmark(
                 )
             return total_loss / float(n_chunks)
 
-        phi_3d, M_seed, inv_t = compiled_backbone(m, idx)
+        phi_3d, M_seed, inv_t, psi_beam2 = compiled_backbone(m, idx)
         out_dim = int(phi_3d.size(-1))
         log_prior = getattr(m, "povm_log_prior", None)
         if (
@@ -1285,7 +1451,6 @@ def run_cuda_benchmark(
             and getattr(m, "hierarchical_povm_readout", None) is not None
             and getattr(m, "hierarchical_qubit_embed", None) is not None
         ):
-            psi_beam2 = getattr(m.blocks[-1], "last_beam2", None) if len(m.blocks) > 0 else None
             base_head = m.povm_readout.povm_head if m.povm_readout is not None else None
             psi_s, psi_d, m_s, m_d, k_eff, lam_diff = (
                 m.hierarchical_povm_readout.get_two_beam_kboson_factors(
@@ -1293,6 +1458,7 @@ def run_cuda_benchmark(
                     phi_3d,
                     psi_beam2=psi_beam2,
                     base_povm_head=base_head,
+                    beta_t=inv_t,
                 )
             )
             loss_t1 = direct_chunked_two_beam_kboson_ce(
@@ -1307,6 +1473,10 @@ def run_cuda_benchmark(
                 log_prior=log_prior,
                 chunk_size=16384,
                 valid_vocab_size=FINEWEB_GPT2_VOCAB_SIZE,
+                quad_diffuse_weight=float(getattr(m, "quadratic_diffuse_fidelity", 0.0)),
+                bipolar_hole_weight=float(getattr(m, "bipolar_hole_weight", 0.0))
+                if getattr(m, "use_bipolar_kboson", False)
+                else 0.0,
             )
         else:
             loss_t1 = _chunked_povm_ce(
@@ -1414,6 +1584,8 @@ def run_cuda_benchmark(
                     "kraus",
                     "kboson",
                     "diffuse",
+                    "stereo",
+                    "phase",
                     "causal_mem",
                     "block_even_odd_mix",
                     "block_out_parity_mix",
@@ -1506,6 +1678,8 @@ def run_cuda_benchmark(
 
         total_loss_gpu = torch.zeros((), device=device, dtype=torch.float64)
         cached_m_seed: torch.Tensor | None = None
+        cached_m_sharp: torch.Tensor | None = None
+        cached_m_diff: torch.Tensor | None = None
         v_active = min(FINEWEB_GPT2_VOCAB_SIZE, int(getattr(model, "vocab_size", FINEWEB_GPT2_VOCAB_SIZE)))
 
         for b_idx in range(eff_batches):
@@ -1568,7 +1742,7 @@ def run_cuda_benchmark(
                     continue
 
                 if b_idx == 0:
-                    phi_3d, M_seed, inv_t, l_states = forward_backbone(model, x, return_layer_states=True)
+                    phi_3d, M_seed, inv_t, l_states, psi_beam2_eval = forward_backbone(model, x, return_layer_states=True)
                     cached_m_seed = M_seed.detach()
                     mean_beta_eval = float(inv_t.detach().float().mean().item())
                     keep_5 = (0, 1, 2, 3, 4)
@@ -1585,7 +1759,7 @@ def run_cuda_benchmark(
                         ent_v = bipartite_entanglement_entropy(sub_psi, num_qubits=10, keep_qubits=keep_5)
                         ent_layers.append(round(float(ent_v.mean().item()), 4))
                 else:
-                    phi_3d, M_seed, inv_t, _ = forward_backbone(
+                    phi_3d, M_seed, inv_t, _, psi_beam2_eval = forward_backbone(
                         model, x, return_layer_states=False, cached_m_seed=cached_m_seed
                     )
 
@@ -1608,7 +1782,6 @@ def run_cuda_benchmark(
                     and getattr(model, "hierarchical_povm_readout", None) is not None
                     and getattr(model, "hierarchical_qubit_embed", None) is not None
                 ):
-                    psi_beam2_eval = getattr(model.blocks[-1], "last_beam2", None) if len(model.blocks) > 0 else None
                     base_head_eval = model.povm_readout.povm_head if model.povm_readout is not None else None
                     psi_s_e, psi_d_e, m_s_e, m_d_e, k_eff_e, lam_diff_e = (
                         model.hierarchical_povm_readout.get_two_beam_kboson_factors(
@@ -1616,8 +1789,14 @@ def run_cuda_benchmark(
                             phi_3d,
                             psi_beam2=psi_beam2_eval,
                             base_povm_head=base_head_eval,
+                            beta_t=inv_t,
+                            cached_m_sharp=cached_m_sharp,
+                            cached_m_diff=cached_m_diff,
                         )
                     )
+                    if b_idx == 0:
+                        cached_m_sharp = m_s_e.detach()
+                        cached_m_diff = m_d_e.detach()
                     loss_b = direct_chunked_two_beam_kboson_ce(
                         psi_s_e.reshape(-1, out_dim),
                         psi_d_e.reshape(-1, psi_d_e.size(-1)),
@@ -1630,6 +1809,10 @@ def run_cuda_benchmark(
                         log_prior=log_prior_eval,
                         chunk_size=16384,
                         valid_vocab_size=v_active,
+                        quad_diffuse_weight=float(getattr(model, "quadratic_diffuse_fidelity", 0.0)),
+                        bipolar_hole_weight=float(getattr(model, "bipolar_hole_weight", 0.0))
+                        if getattr(model, "use_bipolar_kboson", False)
+                        else 0.0,
                     )
                     total_loss_gpu = total_loss_gpu + loss_b.to(torch.float64)
                 elif getattr(model, "use_last_layer_softmax", False):
@@ -1681,6 +1864,11 @@ def run_cuda_benchmark(
                     ):
                         psi_s_diag = psi_s_e.reshape(-1, out_dim)[:8192]
                         psi_d_diag = psi_d_e.reshape(-1, psi_d_e.size(-1))[:8192]
+                        lam_diff_diag = (
+                            lam_diff_e.reshape(-1, 1)[:8192]
+                            if lam_diff_e.numel() > 1
+                            else lam_diff_e
+                        )
                         logits_diag = compute_two_beam_kboson_logits(
                             psi_s_diag,
                             psi_d_diag,
@@ -1688,8 +1876,12 @@ def run_cuda_benchmark(
                             m_d_e[:v_active],
                             inv_t_diag,
                             k_eff_e,
-                            lam_diff_e,
+                            lam_diff_diag,
                             log_prior=log_prior_eval[:v_active] if log_prior_eval is not None else None,
+                            quad_diffuse_weight=float(getattr(model, "quadratic_diffuse_fidelity", 0.0)),
+                            bipolar_hole_weight=float(getattr(model, "bipolar_hole_weight", 0.0))
+                            if getattr(model, "use_bipolar_kboson", False)
+                            else 0.0,
                         )
                     elif getattr(model, "use_last_layer_softmax", False):
                         eff_cap = float(getattr(model, "logit_softcap", 15.0))
@@ -1924,9 +2116,21 @@ def run_cuda_benchmark(
             qubit_amplitudes=qubit_amplitudes,
             num_higher_states=num_higher_states,
             use_block_hierarchy_bridge=not no_block_hierarchy_bridge,
+            bridge_causal_memory=not no_bridge_causal_memory,
             use_last_layer_softmax=last_layer_softmax,
             use_two_beam_kboson_readout=two_beam_kboson_readout,
             diffuse_rank=diffuse_rank,
+            diffuse_schedule=diffuse_schedule,
+            lambda_diff_min=lambda_diff_min,
+            lambda_diff_max=lambda_diff_max,
+            lambda_diff_start=lambda_diff_start,
+            lambda_diff_end=lambda_diff_end,
+            contextual_purity_gain=contextual_purity_gain,
+            use_stereographic_lift=stereographic_lift,
+            use_cosine_phase_beam_gate=cosine_phase_beam_gate,
+            quadratic_diffuse_fidelity=quadratic_diffuse_fidelity,
+            use_bipolar_kboson=bipolar_kboson,
+            bipolar_hole_weight=bipolar_hole_weight,
             logit_softcap=logit_softcap,
             mtp_horizons=mtp_horizons,
             mtp_loss_weight=mtp_weight,
@@ -1953,6 +2157,8 @@ def run_cuda_benchmark(
                     init_steps=120,
                     seed=42 + 10 * l_idx,
                     device=device,
+                    use_stereographic_lift=stereographic_lift,
+                    use_cosine_phase_beam_gate=cosine_phase_beam_gate,
                 ).to(device)
         elif overcomplete_frame and not sparse_density_layer:
             target_iso = default_overcomplete_target_iso_scale(frame_expansion)
@@ -2042,7 +2248,7 @@ def run_cuda_benchmark(
         else:
             q_prefix = "10-Qubit"
         if two_beam_kboson_readout:
-            eff_readout_lbl = f"two_beam_kboson_povm(r={diffuse_rank})"
+            eff_readout_lbl = f"two_beam_kboson_povm(r={diffuse_rank},sched={diffuse_schedule})"
         elif last_layer_softmax and hierarchical_16qubit:
             eff_readout_lbl = f"calibrated_hierarchical_softmax(cap={logit_softcap:g})"
         elif last_layer_softmax:
@@ -2050,7 +2256,7 @@ def run_cuda_benchmark(
         else:
             eff_readout_lbl = readout_mode
         print(
-            f"Architecture: {q_prefix} QuantumBornGPT (d={eff_q_embed_dim}, H={num_heads}, L={num_layers}, d_ff={mlp_label}, d_seed={seed_dim}, Readout={eff_readout_lbl}, LastLayerSoftmax={last_layer_softmax}, TwoBeamKBoson={two_beam_kboson_readout}, DiffRank={diffuse_rank}, Softcap={logit_softcap:g}, Hier16Q={hierarchical_16qubit}, HigherStates={num_higher_states}, BlockBridge={not no_block_hierarchy_bridge}, Sparse64Q={sparse_64qubit}, SparseK={sparse_ngram_k}, DensityLayer={sparse_density_layer}, Rank={density_matrix_rank}, Coupler={not no_fock_coupler}, DynBeta={dynamic_povm_beta}, OrthoDec={ortho_decouple}, LogPrior={povm_log_prior}, GatedRes={gated_spherical_residual}, PurifiedAttn={purified_born_attn}, TrueV0={true_layer0_v_residual}, UNetSkip={unet_skip_mode}, FusedQKV={fused_qkv}, ValEmbeds={num_value_embeddings}, SkipAttn={skip_attn_tuple}, ZeroHalfRoPE={zero_half_rope}, Win={sliding_window}, DocMask={doc_mask_attn}, PPMISVD={ppmi_svd_init}, NgramHash={ngram_hash}, MUDD={mudd_and_gates}, SmearGate={smear_gate}, ResScale={model.residual_scale:.4f}, SeedAdapter={adapter_label}, MTP={mtp_horizons}, stride={mtp_stride}, KrausBeams={kraus_beams}, Opt={stiefel_optimizer}/{optimizer_mode}, DirectCE={direct_chunked_ce}, FusedTile={fused_povm_tile_size}) | Params: {n_params:,}",
+            f"Architecture: {q_prefix} QuantumBornGPT (d={eff_q_embed_dim}, H={num_heads}, L={num_layers}, d_ff={mlp_label}, d_seed={seed_dim}, Readout={eff_readout_lbl}, LastLayerSoftmax={last_layer_softmax}, TwoBeamKBoson={two_beam_kboson_readout}, DiffRank={diffuse_rank}, DiffSched={diffuse_schedule}, StereoLift={stereographic_lift}, PhaseGate={cosine_phase_beam_gate}, QuadDiff={quadratic_diffuse_fidelity:g}, Softcap={logit_softcap:g}, Hier16Q={hierarchical_16qubit}, HigherStates={num_higher_states}, BlockBridge={not no_block_hierarchy_bridge}, BridgeCausalMem={not no_bridge_causal_memory}, Sparse64Q={sparse_64qubit}, SparseK={sparse_ngram_k}, DensityLayer={sparse_density_layer}, Rank={density_matrix_rank}, Coupler={not no_fock_coupler}, DynBeta={dynamic_povm_beta}, OrthoDec={ortho_decouple}, LogPrior={povm_log_prior}, GatedRes={gated_spherical_residual}, PurifiedAttn={purified_born_attn}, TrueV0={true_layer0_v_residual}, UNetSkip={unet_skip_mode}, FusedQKV={fused_qkv}, ValEmbeds={num_value_embeddings}, SkipAttn={skip_attn_tuple}, ZeroHalfRoPE={zero_half_rope}, Win={sliding_window}, DocMask={doc_mask_attn}, PPMISVD={ppmi_svd_init}, NgramHash={ngram_hash}, MUDD={mudd_and_gates}, SmearGate={smear_gate}, ResScale={model.residual_scale:.4f}, SeedAdapter={adapter_label}, MTP={mtp_horizons}, stride={mtp_stride}, KrausBeams={kraus_beams}, Opt={stiefel_optimizer}/{optimizer_mode}, DirectCE={direct_chunked_ce}, FusedTile={fused_povm_tile_size}) | Params: {n_params:,}",
             flush=True,
         )
     if muon_lr is None:
@@ -2086,6 +2292,8 @@ def run_cuda_benchmark(
             "kraus",
             "kboson",
             "diffuse",
+            "stereo",
+            "phase",
             "causal_mem",
             "block_even_odd_mix",
             "block_out_parity_mix",
@@ -2270,7 +2478,7 @@ def run_cuda_benchmark(
         )
     else:
         readout_softmax_ids: set[int] = set()
-        if last_layer_softmax:
+        if last_layer_softmax or two_beam_kboson_readout:
             readout_softmax_ids = {
                 id(p)
                 for n, p in model.named_parameters()
@@ -2284,8 +2492,14 @@ def run_cuda_benchmark(
                         "token_radial_scale",
                         "readout_rms_gain",
                         "qubit_readout_gain",
+                        "hier_readout_gain",
                         "hier_even_proj",
                         "povm_log_prior",
+                        "kraus_u_diff",
+                        "kraus_v_diff",
+                        "kboson_copies",
+                        "diffuse_mix_logit",
+                        "readout_stereo",
                     )
                 )
             }
@@ -2419,6 +2633,10 @@ def run_cuda_benchmark(
 
             for b_pos in range(steps_per_shard):
                 global_step += 1
+                if getattr(model, "hierarchical_povm_readout", None) is not None:
+                    model.hierarchical_povm_readout.set_diffuse_schedule_progress(  # type: ignore[union-attr]
+                        global_step, total_steps
+                    )
                 if progressive_window and isinstance(model, ClassicalModdedGPT):
                     prog_w = min(
                         1792,
@@ -2534,10 +2752,16 @@ def run_cuda_benchmark(
                             loss_m.backward()
                             step_loss_det = step_loss_det + loss_m.detach().float()
                 if not leaderboard_exact_classical:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    if len(muon_params) > 0:
+                        torch.nn.utils.clip_grad_norm_(muon_params, 1.0)
+                    for g in opt_adamw.param_groups:
+                        if len(g["params"]) > 0:
+                            torch.nn.utils.clip_grad_norm_(g["params"], 1.0)
                 opt_muon.step()
                 if (global_step % eff_embed_step_every == 0) or (global_step == total_steps):
                     opt_adamw.step()
+                    if getattr(model, "hierarchical_povm_readout", None) is not None:
+                        model.hierarchical_povm_readout.retract_kraus_stiefel()  # type: ignore[union-attr]
                 if averager is not None:
                     averager.step(model, current_step=global_step, total_steps=total_steps)
 
@@ -3551,9 +3775,21 @@ def main() -> None:
             qubit_amplitudes=args.qubit_amplitudes,
             num_higher_states=args.num_higher_states,
             no_block_hierarchy_bridge=args.no_block_hierarchy_bridge,
+            no_bridge_causal_memory=args.no_bridge_causal_memory,
             last_layer_softmax=args.last_layer_softmax,
             two_beam_kboson_readout=args.two_beam_kboson_readout,
             diffuse_rank=args.diffuse_rank,
+            diffuse_schedule=args.diffuse_schedule,
+            lambda_diff_min=args.lambda_diff_min,
+            lambda_diff_max=args.lambda_diff_max,
+            lambda_diff_start=args.lambda_diff_start,
+            lambda_diff_end=args.lambda_diff_end,
+            contextual_purity_gain=args.contextual_purity_gain,
+            stereographic_lift=args.stereographic_lift,
+            cosine_phase_beam_gate=args.cosine_phase_beam_gate,
+            quadratic_diffuse_fidelity=args.quadratic_diffuse_fidelity,
+            bipolar_kboson=args.bipolar_kboson,
+            bipolar_hole_weight=args.bipolar_hole_weight,
             logit_softcap=args.logit_softcap,
             muon_momentum_warmup=args.muon_momentum_warmup,
             muon_lr=args.muon_lr,

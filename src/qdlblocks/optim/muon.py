@@ -347,6 +347,7 @@ def polar_snap_weights(
     steps: int = 5,
     exclude_names: tuple[str, ...] = (
         "wte",
+        "lm_head",
         "povm_head",
         "embed",
         "unigram_qubits",
@@ -360,6 +361,8 @@ def polar_snap_weights(
         "kraus",
         "kboson",
         "diffuse",
+        "stereo",
+        "phase",
         "gate",
         "mudd",
         "smear",
@@ -405,12 +408,16 @@ def polar_snap_weights(
             else:
                 u_3d = zeropower_via_newtonschulz5_batched(p.data, steps=steps)
             p.data.copy_(torch.nn.functional.normalize(u_3d.float(), p=2.0, dim=-2).to(p.dtype))
+    for mod in model.modules():
+        if hasattr(mod, "retract_kraus_stiefel"):
+            mod.retract_kraus_stiefel()
 
 
 def split_muon_adamw_params(
     model: nn.Module,
     adamw_name_patterns: tuple[str, ...] = (
         "wte",
+        "lm_head",
         "povm_head",
         "embed",
         "unigram_qubits",
@@ -424,6 +431,8 @@ def split_muon_adamw_params(
         "kraus",
         "kboson",
         "diffuse",
+        "stereo",
+        "phase",
         "gate",
         "mudd",
         "smear",

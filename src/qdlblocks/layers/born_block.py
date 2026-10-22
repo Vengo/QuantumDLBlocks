@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 
@@ -11,6 +12,7 @@ from .attention import SubspaceProjectorBornAttention
 from .moe import QuantumBornMoE
 from .overcomplete_two_beam import OvercompleteTwoBeamInterference
 from .parameter_scaling import default_overcomplete_target_iso_scale
+from .stereographic_lift import apply_dimension_preserving_stereographic_rotation
 
 
 
@@ -61,6 +63,8 @@ class QuantumBornBlock(nn.Module):
         use_partial_key_offset: bool = False,
         use_paired_heads: bool = False,
         qk_head_dim: int | None = None,
+        use_stereographic_lift: bool = False,
+        use_cosine_phase_beam_gate: bool = False,
         eps: float = 1e-12,
     ) -> None:
         super().__init__()
@@ -86,6 +90,8 @@ class QuantumBornBlock(nn.Module):
         self.use_partial_key_offset = bool(use_partial_key_offset)
         self.use_paired_heads = bool(use_paired_heads)
         self.qk_head_dim = qk_head_dim
+        self.use_stereographic_lift = bool(use_stereographic_lift)
+        self.use_cosine_phase_beam_gate = bool(use_cosine_phase_beam_gate)
         self.eps = eps
 
         if self.skip_attention:
@@ -143,6 +149,8 @@ class QuantumBornBlock(nn.Module):
                 init_steps=60,
                 seed=block_seed,
                 eps=eps,
+                use_stereographic_lift=self.use_stereographic_lift,
+                use_cosine_phase_beam_gate=self.use_cosine_phase_beam_gate,
             )
             self.ff1 = None
             self.act = None
@@ -172,6 +180,24 @@ class QuantumBornBlock(nn.Module):
             self.highway_logit = nn.Parameter(torch.tensor(-2.0))
         else:
             self.register_parameter("highway_logit", None)
+
+        if self.use_stereographic_lift and not self.skip_attention:
+            gen_s = torch.Generator(device="cpu")
+            gen_s.manual_seed(1337 + int(self.embed_dim))
+            p_init = torch.randn((self.embed_dim,), generator=gen_s, dtype=torch.float32) / math.sqrt(
+                float(self.embed_dim)
+            )
+            self.attn_stereo_pole: nn.Parameter | None = nn.Parameter(p_init)
+            self.attn_stereo_tau: nn.Parameter | None = nn.Parameter(
+                torch.tensor(0.55, dtype=torch.float32)
+            )
+            self.attn_stereo_gain: nn.Parameter | None = nn.Parameter(
+                torch.tensor(0.40, dtype=torch.float32)
+            )
+        else:
+            self.register_parameter("attn_stereo_pole", None)
+            self.register_parameter("attn_stereo_tau", None)
+            self.register_parameter("attn_stereo_gain", None)
         self.last_beam2: torch.Tensor | None = None
 
     @property
@@ -189,24 +215,50 @@ class QuantumBornBlock(nn.Module):
             return riemannian_center(x, dim=-1, eps=self.eps)
         return l2_normalize(x, dim=-1, eps=self.eps)
 
-    def _channel_forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _channel_forward(
+        self, x: torch.Tensor, need_beam2: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.moe is not None:
-            return self.moe(x)
+            return self.moe(x), None
         if self.two_beam_mlp is not None:
-            return self.two_beam_mlp(x)
+            if isinstance(self.two_beam_mlp, OvercompleteTwoBeamInterference) and (
+                need_beam2 or not torch.compiler.is_compiling()
+            ):
+                return self.two_beam_mlp(x, return_second_beam=True)  # type: ignore[return-value]
+            h = self.two_beam_mlp(x)
+            b2 = getattr(self.two_beam_mlp, "last_beam2", None) if not torch.compiler.is_compiling() else None
+            return h, b2
         assert self.ff1 is not None and self.act is not None and self.ff2 is not None
-        return self.ff2(self.act(self.ff1(x)))
+        h = self.ff2(self.act(self.ff1(x)))
+        b2 = getattr(self.act, "last_beam2", None) if not torch.compiler.is_compiling() else None
+        return h, b2
 
-    def _update_last_beam2(self, x_attn: torch.Tensor, h: torch.Tensor) -> None:
-        raw_beam2 = (
-            getattr(self.two_beam_mlp, "last_beam2", None)
-            if self.two_beam_mlp is not None
-            else (getattr(self.act, "last_beam2", None) if self.act is not None else None)
-        )
+    def _compute_beam2(
+        self,
+        x_attn: torch.Tensor,
+        h: torch.Tensor,
+        raw_beam2: torch.Tensor | None,
+    ) -> torch.Tensor:
         if raw_beam2 is not None:
-            self.last_beam2 = self._spherical_norm(x_attn + 0.5 * raw_beam2.to(x_attn.dtype))
-        else:
-            self.last_beam2 = self._spherical_norm(x_attn - 0.25 * self._spherical_norm(h))
+            return self._spherical_norm(x_attn + 0.5 * raw_beam2.to(x_attn.dtype))
+        return self._spherical_norm(x_attn - 0.25 * self._spherical_norm(h))
+
+    def _update_last_beam2(
+        self,
+        x_attn: torch.Tensor,
+        h: torch.Tensor,
+        raw_beam2: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if raw_beam2 is None and not torch.compiler.is_compiling():
+            raw_beam2 = (
+                getattr(self.two_beam_mlp, "last_beam2", None)
+                if self.two_beam_mlp is not None
+                else (getattr(self.act, "last_beam2", None) if self.act is not None else None)
+            )
+        psi_beam2 = self._compute_beam2(x_attn, h, raw_beam2)
+        if not torch.compiler.is_compiling():
+            self.last_beam2 = psi_beam2
+        return psi_beam2
 
     def forward(
         self,
@@ -219,13 +271,16 @@ class QuantumBornBlock(nn.Module):
         ve: torch.Tensor | None = None,
         window_size: int = 0,
         doc_ids: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return_beam2: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Forward pass on S^{embed_dim - 1}."""
         if self.input_highway_mixing and psi_0 is not None and self.highway_logit is not None:
             gamma = torch.sigmoid(self.highway_logit).to(x.dtype)
             x = self._spherical_norm((1.0 - gamma) * x + gamma * psi_0)
 
         v0_out: torch.Tensor | None = None
+        need_b2 = bool(return_beam2 or not torch.compiler.is_compiling())
+        psi_beam2: torch.Tensor | None = None
         if self.strict_spherical_residual:
             if self.attn is not None:
                 if return_v0:
@@ -252,15 +307,32 @@ class QuantumBornBlock(nn.Module):
                         doc_ids=doc_ids,
                         return_v=False,
                     )  # type: ignore[assignment]
+                if (
+                    self.use_stereographic_lift
+                    and self.attn_stereo_pole is not None
+                    and self.attn_stereo_tau is not None
+                    and self.attn_stereo_gain is not None
+                ):
+                    a_stereo = apply_dimension_preserving_stereographic_rotation(
+                        a,
+                        self.attn_stereo_pole,
+                        self.attn_stereo_tau,
+                        self.attn_stereo_gain,
+                        eps=self.eps,
+                    )
+                else:
+                    a_stereo = None
                 if self.use_gated_spherical_residual and self.attn_res_gate is not None:
-                    a_norm = self._spherical_norm(a)
+                    a_norm = a_stereo if a_stereo is not None else self._spherical_norm(a)
                     x = self._spherical_norm(x + self.attn_res_gate.to(x.dtype) * a_norm)
                 else:
-                    x = self._spherical_norm(x + self.residual_scale * a)
+                    a_eff = a_stereo if a_stereo is not None else a
+                    x = self._spherical_norm(x + self.residual_scale * a_eff)
 
             x_attn = x
-            h = self._channel_forward(x)
-            self._update_last_beam2(x_attn, h)
+            h, raw_b2 = self._channel_forward(x, need_beam2=need_b2)
+            if need_b2:
+                psi_beam2 = self._update_last_beam2(x_attn, h, raw_b2)
             if self.use_gated_spherical_residual and self.mlp_res_gate is not None:
                 h_norm = self._spherical_norm(h)
                 x = self._spherical_norm(x + self.mlp_res_gate.to(x.dtype) * h_norm)
@@ -295,10 +367,28 @@ class QuantumBornBlock(nn.Module):
                     )  # type: ignore[assignment]
                 x = x + self.residual_scale * a
             x_attn = self._spherical_norm(x)
-            h = self._channel_forward(x_attn)
-            self._update_last_beam2(x_attn, h)
+            h, raw_b2 = self._channel_forward(x_attn, need_beam2=need_b2)
+            if need_b2:
+                psi_beam2 = self._update_last_beam2(x_attn, h, raw_b2)
             x = x + self.residual_scale * h
 
+        if self.use_cosine_phase_beam_gate and psi_beam2 is not None:
+            x_f = self._spherical_norm(x).float()
+            b2_f = psi_beam2.float()
+            psi_beam2 = l2_normalize(
+                b2_f - (b2_f * x_f).sum(dim=-1, keepdim=True) * x_f,
+                dim=-1,
+                eps=self.eps,
+            ).to(x.dtype)
+            if not torch.compiler.is_compiling():
+                self.last_beam2 = psi_beam2
+
+        if return_beam2:
+            assert psi_beam2 is not None
+            if return_v0 and v0_out is not None:
+                return x, v0_out, psi_beam2
+            return x, psi_beam2
         if return_v0 and v0_out is not None:
             return x, v0_out
         return x
+

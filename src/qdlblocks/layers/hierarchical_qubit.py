@@ -32,6 +32,7 @@ from .cooccurrence_init import (
     compute_collocation_coherence_metrics,
     compute_ppmi_svd_embeddings,
 )
+from .stereographic_lift import apply_dimension_preserving_stereographic_rotation
 
 
 def _qr_retract_orthogonal_batch(mats: torch.Tensor) -> torch.Tensor:
@@ -56,6 +57,7 @@ class Hierarchical16QubitEmbedder(nn.Module):
         use_ortho_decouple: bool = True,
         use_block_hierarchy_bridge: bool = True,
         bridge_causal_memory: bool = True,
+        use_embed_causal_memory: bool = True,
         eps: float = 1e-12,
         seed: int = 42,
         *,
@@ -92,6 +94,7 @@ class Hierarchical16QubitEmbedder(nn.Module):
         self.use_ortho_decouple = bool(use_ortho_decouple)
         self.use_block_hierarchy_bridge = bool(use_block_hierarchy_bridge)
         self.bridge_causal_memory = bool(bridge_causal_memory)
+        self.use_embed_causal_memory = bool(use_embed_causal_memory)
         self.eps = float(eps)
         self.seed = int(seed)
         self.subregister_scale = 1.0 / math.sqrt(float(self.num_registers))
@@ -363,7 +366,7 @@ class Hierarchical16QubitEmbedder(nn.Module):
         psi_low = self.get_normalized_unigram_qubits(idx)
         psi_out, p_high = self.route_through_hierarchy(
             psi_low,
-            include_causal_memory=(idx.size(1) > 1),
+            include_causal_memory=(self.use_embed_causal_memory and (idx.size(1) > 1)),
         )
         out = self._lift_registers_to_ambient(psi_out)
         if squeeze_1d:
@@ -437,14 +440,29 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
         povm_temperature: float = 0.035,
         use_ortho_decouple: bool = True,
         diffuse_rank: int = 16,
+        diffuse_schedule: str = "free_decay",
+        lambda_diff_min: float = 0.08,
+        lambda_diff_max: float = 0.35,
+        lambda_diff_start: float = 0.22,
+        lambda_diff_end: float = 0.12,
+        contextual_purity_gain: float = 0.20,
+        use_stereographic_lift: bool = False,
+        quadratic_diffuse_fidelity: float = 0.0,
+        use_bipolar_kboson: bool = False,
+        bipolar_hole_weight: float = 0.0,
         eps: float = 1e-12,
         seed: int = 42,
         *,
         reg_dim: int | None = None,
         qubit_registers: int | None = None,
         qubit_amplitudes: int | None = None,
+        quad_diffuse_weight: float | None = None,
+        use_two_beam_kboson_readout: bool | None = None,
     ) -> None:
         super().__init__()
+        self.use_two_beam_kboson_readout = bool(
+            use_two_beam_kboson_readout if use_two_beam_kboson_readout is not None else True
+        )
         if qubit_registers is not None:
             num_registers = int(qubit_registers)
         if reg_dim is not None:
@@ -461,6 +479,25 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
         self.num_higher_states = int(num_higher_states)
         self.use_ortho_decouple = bool(use_ortho_decouple)
         self.diffuse_rank = int(diffuse_rank)
+        self.diffuse_schedule = str(diffuse_schedule)
+        self.lambda_diff_min = float(lambda_diff_min)
+        self.lambda_diff_max = float(lambda_diff_max)
+        self.lambda_diff_start = float(lambda_diff_start)
+        self.lambda_diff_end = float(lambda_diff_end)
+        self.contextual_purity_gain = float(contextual_purity_gain)
+        self.use_stereographic_lift = bool(use_stereographic_lift)
+        self.quadratic_diffuse_fidelity = float(
+            quad_diffuse_weight
+            if quad_diffuse_weight is not None
+            else quadratic_diffuse_fidelity
+        )
+        self.quad_diffuse_weight = self.quadratic_diffuse_fidelity
+        self.use_bipolar_kboson = bool(use_bipolar_kboson or float(bipolar_hole_weight) > 0.0)
+        self.bipolar_hole_weight = (
+            float(bipolar_hole_weight)
+            if float(bipolar_hole_weight) > 0.0
+            else (0.85 if self.use_bipolar_kboson else 0.0)
+        )
         self.eps = float(eps)
         self.seed = int(seed)
         self.subregister_scale = 1.0 / math.sqrt(float(self.num_registers))
@@ -500,7 +537,7 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
         else:
             self.register_parameter("hier_even_proj", None)
 
-        # 5. Two-Beam k-Boson Mixed-State & Non-Isometric Kraus Bath Parameters (Plan 026)
+        # 5. Two-Beam k-Boson Mixed-State & Non-Isometric Kraus Bath Parameters (Plan 026–031)
         self.kraus_u_diff = nn.Parameter(
             torch.empty(self.embed_dim, self.diffuse_rank, dtype=torch.float32)
         )
@@ -509,8 +546,109 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
         )
         self.kboson_copies = nn.Parameter(torch.tensor(34.0, dtype=torch.float32))
         self.diffuse_mix_logit = nn.Parameter(torch.tensor(-0.20, dtype=torch.float32))
+        if self.use_bipolar_kboson and self.num_higher_states > 0:
+            self.hier_diffuse_proj: nn.Parameter | None = nn.Parameter(
+                torch.empty(self.num_higher_states, self.diffuse_rank, dtype=torch.float32)
+            )
+            self.hier_diffuse_gain: nn.Parameter | None = nn.Parameter(
+                torch.tensor(0.25, dtype=torch.float32)
+            )
+        else:
+            self.register_parameter("hier_diffuse_proj", None)
+            self.register_parameter("hier_diffuse_gain", None)
+        if self.use_stereographic_lift:
+            self.readout_stereo_pole: nn.Parameter | None = nn.Parameter(
+                torch.empty(self.embed_dim, dtype=torch.float32)
+            )
+            self.readout_stereo_tau: nn.Parameter | None = nn.Parameter(
+                torch.tensor(0.55, dtype=torch.float32)
+            )
+            self.readout_stereo_gain: nn.Parameter | None = nn.Parameter(
+                torch.tensor(0.35, dtype=torch.float32)
+            )
+        else:
+            self.register_parameter("readout_stereo_pole", None)
+            self.register_parameter("readout_stereo_tau", None)
+            self.register_parameter("readout_stereo_gain", None)
+        self.register_buffer(
+            "_schedule_progress",
+            torch.tensor(0.0, dtype=torch.float32),
+            persistent=False,
+        )
 
         self.reset_parameters()
+
+    def set_diffuse_schedule_progress(self, step: int, total_steps: int) -> float:
+        """Update normalized training progress `s / S in [0, 1]` for scheduled diffuse Kraus bath weight."""
+        prog = min(max(float(step) / float(max(1, total_steps)), 0.0), 1.0)
+        self._schedule_progress.fill_(prog)
+        return prog
+
+    @torch.no_grad()
+    def retract_kraus_stiefel(self) -> float:
+        """Project `kraus_u_diff` and `kraus_v_diff` onto the Stiefel manifold `St(d, r)` via thin QR retraction."""
+        max_err = 0.0
+        for param in (self.kraus_u_diff, self.kraus_v_diff):
+            q, r = torch.linalg.qr(param.data.float(), mode="reduced")
+            diag_r = torch.diagonal(r, 0)
+            signs = torch.where(diag_r >= 0, torch.ones_like(diag_r), -torch.ones_like(diag_r))
+            q_signed = q * signs.unsqueeze(0)
+            param.data.copy_(q_signed.to(param.dtype))
+            gram = param.data.float().t() @ param.data.float()
+            eye_r = torch.eye(gram.size(0), device=gram.device, dtype=torch.float32)
+            err = float(torch.linalg.norm(gram - eye_r, ord="fro").item())
+            if err > max_err:
+                max_err = err
+        if self.hier_diffuse_proj is not None and self.hier_diffuse_proj.size(0) >= self.hier_diffuse_proj.size(1):
+            q_h, r_h = torch.linalg.qr(self.hier_diffuse_proj.data.float(), mode="reduced")
+            d_h = torch.diagonal(r_h, 0)
+            s_h = torch.where(d_h >= 0, torch.ones_like(d_h), -torch.ones_like(d_h))
+            self.hier_diffuse_proj.data.copy_((q_h * s_h.unsqueeze(0)).to(self.hier_diffuse_proj.dtype))
+        return max_err
+
+    def compute_scheduled_lambda_diff(
+        self,
+        beta_t: torch.Tensor | None = None,
+        k_eff: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute diffuse Kraus bath weight `lambda_diff(t, s)` according to `self.diffuse_schedule`."""
+        mode = self.diffuse_schedule.strip().lower()
+        sig = torch.sigmoid(self.diffuse_mix_logit)
+        if mode == "free_decay":
+            return 0.40 * sig
+        if mode == "bounded_floor":
+            l_min = max(0.10, self.lambda_diff_min) if abs(self.lambda_diff_min - 0.08) < 1e-6 else self.lambda_diff_min
+            l_max = self.lambda_diff_max
+            return l_min + (l_max - l_min) * sig
+        prog = float(self._schedule_progress.item())
+        if mode == "cosine_broad_to_sharp":
+            sched = self.lambda_diff_end + 0.5 * (self.lambda_diff_start - self.lambda_diff_end) * (
+                1.0 + math.cos(math.pi * prog)
+            )
+            mod = 0.85 + 0.30 * sig
+            return torch.clamp(sched * mod, min=self.lambda_diff_min, max=self.lambda_diff_max)
+        # Default for 'warmup_hold_anneal' and 'contextual_purity_complement'
+        if prog <= 0.35:
+            sched = self.lambda_diff_start
+        else:
+            u = min(max((prog - 0.35) / 0.65, 0.0), 1.0)
+            sched = self.lambda_diff_end + 0.5 * (self.lambda_diff_start - self.lambda_diff_end) * (
+                1.0 + math.cos(math.pi * u)
+            )
+        mod = 0.90 + 0.20 * sig
+        lam_base = torch.clamp(sched * mod, min=self.lambda_diff_min, max=self.lambda_diff_max)
+        if mode == "contextual_purity_complement" and beta_t is not None and beta_t.numel() > 1:
+            k_val = k_eff if k_eff is not None else self.kboson_copies.clamp(min=28.0, max=48.0)
+            r_cap = 1.35 if self.use_bipolar_kboson else 0.95
+            r_tilde = torch.clamp(beta_t.float() / k_val.float(), min=0.0, max=r_cap)
+            r_ref = torch.clamp(r_tilde.detach().mean(), min=0.55, max=r_cap - 0.03)
+            lam_t = torch.clamp(
+                lam_base + self.contextual_purity_gain * (r_ref - r_tilde),
+                min=self.lambda_diff_min,
+                max=self.lambda_diff_max,
+            )
+            return lam_t
+        return lam_base
 
     @torch.no_grad()
     def reset_parameters(self) -> None:
@@ -534,8 +672,25 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
             torch.manual_seed(self.seed + 202)
             nn.init.orthogonal_(self.kraus_u_diff)
             nn.init.orthogonal_(self.kraus_v_diff)
+            if self.hier_diffuse_proj is not None:
+                nn.init.orthogonal_(self.hier_diffuse_proj)
+        if self.hier_diffuse_gain is not None:
+            self.hier_diffuse_gain.fill_(0.25)
         self.kboson_copies.fill_(34.0)
         self.diffuse_mix_logit.fill_(-0.20)
+        if (
+            self.use_stereographic_lift
+            and self.readout_stereo_pole is not None
+            and self.readout_stereo_tau is not None
+            and self.readout_stereo_gain is not None
+        ):
+            p_init = torch.randn(self.embed_dim, generator=gen, dtype=torch.float32) / math.sqrt(
+                float(self.embed_dim)
+            )
+            self.readout_stereo_pole.copy_(p_init.to(self.readout_stereo_pole.dtype))
+            self.readout_stereo_tau.fill_(0.55)
+            self.readout_stereo_gain.fill_(0.35)
+        self._schedule_progress.zero_()
 
     def format_readout_features(self, psi: torch.Tensor) -> torch.Tensor:
         """Map final hyperspherical states `(..., embed_dim)` to RMS-normalized readout features with learnable channel gain."""
@@ -686,14 +841,33 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
         psi_sharp: torch.Tensor,
         psi_beam2: torch.Tensor | None = None,
         base_povm_head: torch.Tensor | None = None,
+        beta_t: torch.Tensor | None = None,
+        cached_m_sharp: torch.Tensor | None = None,
+        cached_m_diff: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Construct `(psi_sharp_norm, psi_diff_r, m_sharp_norm, m_diff_r, k_eff, lambda_diff)` for Two-Beam k-Boson readout."""
-        m_sharp_norm = l2_normalize(
-            self.get_coupled_povm_matrix(embedder, base_povm_head), dim=-1, eps=self.eps
-        )
-        psi_sharp_norm = l2_normalize(
-            psi_sharp * self.readout_rms_gain.to(psi_sharp.dtype), dim=-1, eps=self.eps
-        )
+        if cached_m_sharp is not None:
+            m_sharp_norm = cached_m_sharp.to(psi_sharp.dtype)
+        else:
+            m_sharp_norm = l2_normalize(
+                self.get_coupled_povm_matrix(embedder, base_povm_head), dim=-1, eps=self.eps
+            )
+        psi_scaled = psi_sharp * self.readout_rms_gain.to(psi_sharp.dtype)
+        if (
+            self.use_stereographic_lift
+            and self.readout_stereo_pole is not None
+            and self.readout_stereo_tau is not None
+            and self.readout_stereo_gain is not None
+        ):
+            psi_sharp_norm = apply_dimension_preserving_stereographic_rotation(
+                psi_scaled,
+                self.readout_stereo_pole,
+                self.readout_stereo_tau,
+                self.readout_stereo_gain,
+                eps=self.eps,
+            )
+        else:
+            psi_sharp_norm = l2_normalize(psi_scaled, dim=-1, eps=self.eps)
         psi_beam2_norm = (
             l2_normalize(psi_beam2, dim=-1, eps=self.eps)
             if psi_beam2 is not None
@@ -701,10 +875,42 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
         )
         # Non-isometric Kraus operator K_diff = sqrt(d/r) * V_diff @ U_diff^T WITHOUT re-normalizing in R^r
         scale_side = (float(self.embed_dim) / float(max(1, self.diffuse_rank))) ** 0.25
-        m_diff_r = scale_side * (m_sharp_norm @ self.kraus_u_diff.to(m_sharp_norm.dtype))
-        psi_diff_r = scale_side * (psi_beam2_norm @ self.kraus_v_diff.to(psi_beam2_norm.dtype))
+        if cached_m_diff is not None:
+            m_diff_r = cached_m_diff.to(psi_sharp.dtype)
+        else:
+            m_diff_r = scale_side * (m_sharp_norm @ self.kraus_u_diff.to(m_sharp_norm.dtype))
+            if (
+                self.use_bipolar_kboson
+                and self.hier_diffuse_proj is not None
+                and self.hier_diffuse_gain is not None
+                and self.vocab_higher_affinity is not None
+            ):
+                aff_norm = l2_normalize(
+                    self.vocab_higher_affinity.to(m_sharp_norm.dtype), dim=-1, eps=self.eps
+                )
+                g_hd = (0.35 * torch.tanh(self.hier_diffuse_gain)).to(m_sharp_norm.dtype)
+                m_diff_r = m_diff_r + scale_side * g_hd * (
+                    aff_norm @ self.hier_diffuse_proj.to(m_sharp_norm.dtype)
+                )
+        raw_p = psi_beam2_norm @ self.kraus_v_diff.to(psi_beam2_norm.dtype)
+        if self.use_bipolar_kboson and raw_p.numel() >= 4 * self.diffuse_rank:
+            r_dim = self.diffuse_rank
+            flat_p = raw_p.reshape(-1, r_dim).float()
+            centered_p = flat_p - flat_p.mean(dim=0, keepdim=True)
+            mode_rms = centered_p.square().mean(dim=0, keepdim=True).add(1e-6).sqrt()
+            u_p = centered_p / mode_rms
+            n_rows = float(max(1, u_p.size(0)))
+            eye_r = torch.eye(r_dim, device=u_p.device, dtype=torch.float32)
+            corr_r = (u_p.t() @ u_p) / n_rows + 1e-4 * eye_r
+            chol_l, _ = torch.linalg.cholesky_ex(corr_r)
+            whitened_p = torch.linalg.solve_triangular(chol_l, u_p.t(), upper=False).t()
+            whitened_rms = whitened_p.square().mean(dim=0, keepdim=True).add(1e-6).sqrt()
+            iso_p = (whitened_p / whitened_rms) * (1.0 / math.sqrt(float(self.embed_dim)))
+            psi_diff_r = (scale_side * iso_p).to(psi_beam2_norm.dtype).reshape(raw_p.shape)
+        else:
+            psi_diff_r = scale_side * raw_p
         k_eff = self.kboson_copies.clamp(min=28.0, max=48.0)
-        lambda_diff = 0.40 * torch.sigmoid(self.diffuse_mix_logit)
+        lambda_diff = self.compute_scheduled_lambda_diff(beta_t=beta_t, k_eff=k_eff)
         return psi_sharp_norm, psi_diff_r, m_sharp_norm, m_diff_r, k_eff, lambda_diff
 
 
@@ -721,6 +927,8 @@ def initialize_hierarchical_16qubit_with_ppmi_svd(
     kmeans_iters: int = 8,
     cache_path: str | Path | None = None,
     device: torch.device | str | None = None,
+    decouple_self_in_full_ambient: bool = True,
+    directed_predecessor_mix: float = 0.35,
 ) -> dict[str, float]:
     """Initialize `Hierarchical16QubitEmbedder` and `Hierarchical16QubitPOVMReadout` with PPMI-SVD + Spectral Centroids."""
     eff_alpha = float(alpha_ppmi if alpha_ppmi is not None else alpha)
@@ -829,12 +1037,37 @@ def initialize_hierarchical_16qubit_with_ppmi_svd(
                             dim=-1,
                         )
 
+    # Directed predecessor context p_v = sum_{u -> v} ln(1 + count(u -> v)) * c_flat[u]
+    c_out_flat = c_flat.clone()
+    if (
+        cu_top is not None
+        and cv_top is not None
+        and w_edge_top is not None
+        and cu_top.numel() > 0
+        and float(directed_predecessor_mix) > 0.0
+    ):
+        pred_agg = torch.zeros_like(c_flat)
+        pred_agg.index_add_(0, cv_top, c_flat[cu_top] * w_edge_top)
+        pred_deg = torch.zeros((V, 1), dtype=torch.float32, device=dev)
+        pred_deg.index_add_(0, cv_top, w_edge_top)
+        has_pred = pred_deg.squeeze(-1) > 0
+        if has_pred.any():
+            p_v = l2_normalize(pred_agg[has_pred] / pred_deg[has_pred].clamp_min(1e-6), dim=-1)
+            mix_b = float(min(max(directed_predecessor_mix, 0.0), 1.0))
+            c_out_flat[has_pred] = l2_normalize(
+                (1.0 - mix_b) * c_flat[has_pred] + mix_b * p_v,
+                dim=-1,
+            )
+
     # Interleave spectral modes across the Q=16 registers (`q::Q`) so every register `q`
     # receives both top global collocation singular vectors and fine local modes!
     c_reg = torch.zeros((V, Q, A), dtype=torch.float32, device=dev)
+    c_out_reg = torch.zeros((V, Q, A), dtype=torch.float32, device=dev)
     for q in range(Q):
         c_reg[:, q, :] = c_flat[:, q::Q][:, :A]
+        c_out_reg[:, q, :] = c_out_flat[:, q::Q][:, :A]
     c_reg = l2_normalize(c_reg, dim=-1, eps=1e-12)
+    c_out_reg = l2_normalize(c_out_reg, dim=-1, eps=1e-12)
 
     z_even = l2_normalize(
         torch.randn((V, Q, A), generator=gen, dtype=torch.float32).to(dev),
@@ -853,10 +1086,50 @@ def initialize_hierarchical_16qubit_with_ppmi_svd(
         torch.full((V, 1, 1), iso_mix_tail, dtype=torch.float32, device=dev),
     )
     u_even = l2_normalize(iso_mix_vec * z_even + alpha_f * c_reg, dim=-1)
-    u_odd = l2_normalize(iso_mix_vec * z_odd + alpha_f * c_reg, dim=-1)
+    u_odd = l2_normalize(iso_mix_vec * z_odd + alpha_f * c_out_reg, dim=-1)
     if (~active_mask).any():
         u_even[~active_mask] = z_even[~active_mask]
         u_odd[~active_mask] = z_odd[~active_mask]
+
+    full_ambient_mode = bool(embed_dim == flat_dim or not bool(getattr(model, "use_ortho_decouple", True)))
+    alt_signs: torch.Tensor | None = None
+    if full_ambient_mode and bool(decouple_self_in_full_ambient):
+        u_even = F.normalize(u_even.float(), p=2.0, dim=-1, eps=1e-12)
+        u_odd = F.normalize(u_odd.float(), p=2.0, dim=-1, eps=1e-12)
+        for _ in range(2):
+            proj_self = (u_odd * u_even).sum(dim=-1, keepdim=True)
+            u_odd = F.normalize(u_odd - proj_self * u_even, p=2.0, dim=-1, eps=1e-12)
+        if A % 2 == 0 and float(directed_predecessor_mix) > 0.0:
+            alt_signs = torch.tensor(
+                [1.0 if (i % 2 == 0) else -1.0 for i in range(A)],
+                dtype=torch.float32,
+                device=dev,
+            ).view(1, 1, A)
+            u_anti = torch.flip(u_even, dims=[-1]) * alt_signs
+            if cu_top is not None and cv_top is not None and cu_top.numel() > 0:
+                pred_mask = torch.zeros((V, 1, 1), dtype=torch.bool, device=dev)
+                pred_mask[cv_top] = True
+                pred_w = 0.62 if V <= 4096 else 0.28
+                non_pred_w = 0.15 if V <= 4096 else 0.06
+                mix_vec = torch.where(
+                    pred_mask,
+                    torch.full((V, 1, 1), pred_w, dtype=torch.float32, device=dev),
+                    torch.full((V, 1, 1), non_pred_w, dtype=torch.float32, device=dev),
+                )
+            else:
+                mix_vec = torch.full((V, 1, 1), 0.25, dtype=torch.float32, device=dev)
+            u_odd = F.normalize((1.0 - mix_vec) * u_anti + mix_vec * u_odd, p=2.0, dim=-1, eps=1e-12)
+            for _ in range(2):
+                proj_self = (u_odd * u_even).sum(dim=-1, keepdim=True)
+                u_odd = F.normalize(u_odd - proj_self * u_even, p=2.0, dim=-1, eps=1e-12)
+
+    self_register_overlap_max = float(
+        (F.normalize(u_even.float(), p=2.0, dim=-1, eps=1e-12) * F.normalize(u_odd.float(), p=2.0, dim=-1, eps=1e-12))
+        .sum(dim=-1)
+        .abs()
+        .max()
+        .item()
+    )
 
     if embedder is not None:
         embedder.unigram_qubits.copy_((u_even * sub_scale).to(embedder.unigram_qubits.dtype))
@@ -925,7 +1198,16 @@ def initialize_hierarchical_16qubit_with_ppmi_svd(
             embedder.higher_states.copy_((higher_reg * sub_scale).to(embedder.higher_states.dtype))
             embedder.higher_interaction.copy_(h_int_orth.to(embedder.higher_interaction.dtype))
 
-        aff_vm = torch.einsum("vqa,mqa->vm", u_odd, higher_reg) / float(Q)
+        if full_ambient_mode and bool(decouple_self_in_full_ambient) and alt_signs is not None:
+            higher_anti = torch.flip(higher_reg, dims=[-1]) * alt_signs
+            aff_vm = torch.einsum("vqa,mqa->vm", u_odd, higher_anti) / float(Q)
+            aff_self = torch.einsum("vqa,mqa->vm", u_even, higher_reg) / float(Q)
+            aff_vm = aff_vm - aff_vm.mean(dim=0, keepdim=True) - 0.50 * aff_self
+        else:
+            aff_vm = torch.einsum("vqa,mqa->vm", u_odd, higher_reg) / float(Q)
+            if full_ambient_mode and bool(decouple_self_in_full_ambient):
+                aff_self = torch.einsum("vqa,mqa->vm", u_even, higher_reg) / float(Q)
+                aff_vm = aff_vm - 0.50 * aff_self
     else:
         aff_vm = None
 
@@ -995,7 +1277,8 @@ def initialize_hierarchical_16qubit_with_ppmi_svd(
             counts_p = torch.bincount(s_prior, minlength=V).float() + 1.0
             probs_p = counts_p / counts_p.sum()
             log_p = torch.log(probs_p)
-            log_p = (log_p - log_p.mean()) * 0.50
+            prior_scale = 0.58 if bool(getattr(model, "use_two_beam_kboson_readout", False)) else 0.50
+            log_p = (log_p - log_p.mean()) * prior_scale
             prior_param.copy_(log_p.to(device=prior_param.device, dtype=prior_param.dtype))
         if bool(getattr(model, "use_last_layer_softmax", False)) and float(prior_param.detach().mean().item()) > -2.0:
             cap_val = float(getattr(model, "logit_softcap", 15.0))
@@ -1005,7 +1288,10 @@ def initialize_hierarchical_16qubit_with_ppmi_svd(
     # 5. Compute Step-0 Self-Overlap, Sub-Register Norms, Collocation Coherence, & 2-Level Hierarchy Concept Similarity
     if embedder is not None:
         all_ids = torch.arange(V, device=dev, dtype=torch.int64)
-        psi_0_all = embedder.forward_unigram_only(all_ids).float()
+        psi_0_all = torch.cat(
+            [embedder.forward_unigram_only(all_ids[s : s + 8192]).float() for s in range(0, V, 8192)],
+            dim=0,
+        )
         sub_norms = embedder.get_normalized_unigram_qubits().float().norm(dim=-1)
         min_sub_norm = float(sub_norms.min().item())
         max_sub_norm = float(sub_norms.max().item())
@@ -1040,6 +1326,16 @@ def initialize_hierarchical_16qubit_with_ppmi_svd(
     max_self_overlap = float((psi_0_all * m_all).sum(dim=-1).abs().max().item())
     row_norms = psi_0_all.norm(dim=-1)
 
+    directed_bigram_overlap_ratio = 1.0
+    if cu_top is not None and cv_top is not None and cu_top.numel() > 0:
+        dir_cos = float((u_even_flat[cu_top] * u_odd_flat[cv_top]).sum(dim=-1).mean().item())
+        n_dir = int(cu_top.numel())
+        g_dir = torch.Generator(device="cpu").manual_seed(int(seed) + 777)
+        ru_d = torch.randint(0, V, (n_dir,), generator=g_dir, dtype=torch.int64).to(dev)
+        rv_d = torch.randint(0, V, (n_dir,), generator=g_dir, dtype=torch.int64).to(dev)
+        rand_dir_cos = float((u_even_flat[ru_d] * u_odd_flat[rv_d]).sum(dim=-1).abs().mean().item())
+        directed_bigram_overlap_ratio = float(dir_cos / max(rand_dir_cos, 1e-6))
+
     colloc_stats: dict[str, float] = {}
     hierarchy_concept_sim_ratio = 3.2
     if token_shards is not None and len(token_shards) > 0:
@@ -1071,11 +1367,13 @@ def initialize_hierarchical_16qubit_with_ppmi_svd(
             _, cr_v_prop = embedder.compute_token_hierarchy_distribution(embedder.unigram_qubits[r_v])
             cr_u_norm = l2_normalize(cr_u_prop.float(), dim=-1)
             cr_v_norm = l2_normalize(cr_v_prop.float(), dim=-1)
-            rand_hier_sim = float((cr_u_norm * cr_v_norm).sum(dim=-1).abs().mean().item())
+            rand_hier_sim = float((cr_u_norm * cr_v_prop.float()).sum(dim=-1).abs().mean().item()) if False else float((cr_u_norm * cr_v_norm).sum(dim=-1).abs().mean().item())
             hierarchy_concept_sim_ratio = float(colloc_hier_sim / max(rand_hier_sim, 1e-6))
 
     return {
         "max_self_overlap": max_self_overlap,
+        "self_register_overlap_max": self_register_overlap_max,
+        "directed_bigram_overlap_ratio": round(directed_bigram_overlap_ratio, 4),
         "collocation_cosine_ratio": float(colloc_stats.get("cos_ratio", 0.0)),
         "hierarchy_concept_sim_ratio": round(hierarchy_concept_sim_ratio, 4),
         "colloc_mean_cos": float(colloc_stats.get("colloc_mean_cos", 0.0)),

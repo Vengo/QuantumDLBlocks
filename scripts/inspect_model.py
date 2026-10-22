@@ -65,12 +65,17 @@ def categorize_parameters(model: torch.nn.Module) -> dict[str, int]:
             or "readout" in name
             or "hierarchical_povm_readout" in name
             or "hierarchical_readout" in name
+            or "kraus" in name
+            or "kboson" in name
+            or "diffuse" in name
         ):
             buckets["readout_and_adapters"] += n
         elif (
             "purity" in name
             or "beta" in name
             or "gate" in name
+            or "stereo" in name
+            or "phase" in name
             or "lambdas" in name
             or "coherence_tau" in name
             or "mudd" in name
@@ -137,7 +142,21 @@ def build_model_from_args(args: argparse.Namespace) -> torch.nn.Module:
         qubit_amplitudes=args.qubit_amplitudes,
         num_higher_states=args.num_higher_states,
         use_block_hierarchy_bridge=not args.no_block_hierarchy_bridge,
+        bridge_causal_memory=not args.no_bridge_causal_memory,
         use_last_layer_softmax=args.last_layer_softmax,
+        use_two_beam_kboson_readout=args.two_beam_kboson_readout,
+        diffuse_rank=args.diffuse_rank,
+        diffuse_schedule=args.diffuse_schedule,
+        lambda_diff_min=args.lambda_diff_min,
+        lambda_diff_max=args.lambda_diff_max,
+        lambda_diff_start=args.lambda_diff_start,
+        lambda_diff_end=args.lambda_diff_end,
+        contextual_purity_gain=args.contextual_purity_gain,
+        use_stereographic_lift=args.stereographic_lift,
+        use_cosine_phase_beam_gate=args.cosine_phase_beam_gate,
+        quadratic_diffuse_fidelity=args.quadratic_diffuse_fidelity,
+        use_bipolar_kboson=args.bipolar_kboson,
+        bipolar_hole_weight=args.bipolar_hole_weight,
         logit_softcap=args.logit_softcap,
     )
     model = QuantumBornGPT(**kwargs)
@@ -195,7 +214,21 @@ def main() -> int:
     parser.add_argument("--qubit-amplitudes", type=int, default=32)
     parser.add_argument("--num-higher-states", type=int, default=256)
     parser.add_argument("--no-block-hierarchy-bridge", action="store_true")
+    parser.add_argument("--no-bridge-causal-memory", "--embed-only-causal-memory", dest="no_bridge_causal_memory", action="store_true")
     parser.add_argument("--last-layer-softmax", action="store_true")
+    parser.add_argument("--two-beam-kboson-readout", "--two-beam-kboson", dest="two_beam_kboson_readout", action="store_true")
+    parser.add_argument("--diffuse-rank", "--diffuse-bath-rank", dest="diffuse_rank", type=int, default=16)
+    parser.add_argument("--diffuse-schedule", type=str, default="free_decay")
+    parser.add_argument("--lambda-diff-min", type=float, default=0.08)
+    parser.add_argument("--lambda-diff-max", type=float, default=0.35)
+    parser.add_argument("--lambda-diff-start", type=float, default=0.22)
+    parser.add_argument("--lambda-diff-end", type=float, default=0.12)
+    parser.add_argument("--contextual-purity-gain", type=float, default=0.20)
+    parser.add_argument("--stereographic-lift", action="store_true")
+    parser.add_argument("--cosine-phase-beam-gate", action="store_true")
+    parser.add_argument("--quadratic-diffuse-fidelity", "--quad-diffuse-weight", dest="quadratic_diffuse_fidelity", nargs="?", const=0.50, type=float, default=0.0)
+    parser.add_argument("--bipolar-kboson", action="store_true")
+    parser.add_argument("--bipolar-hole-weight", type=float, default=0.85)
     parser.add_argument("--logit-softcap", type=float, default=15.0)
     parser.add_argument("--zero-init-classical", action="store_true")
     parser.add_argument("--smoke-steps", type=int, default=0, help="Run N forward+backward steps on CUDA/CPU.")

@@ -64,6 +64,19 @@ from .runner import (
     run_lra_benchmark,
     run_vision_benchmark,
 )
+from .synthetic_fineweb_walk import (
+    FineWebSyntheticRandomWalkGenerator,
+    FineWebSyntheticWalkConfig,
+    NaiveQuadraticBornAttnLM,
+    build_fast_classical_softmax_synth_lm,
+    build_fast_quantum_born_synth_lm,
+    compute_synthetic_fineweb_walk_stats,
+    evaluate_oracle_markov_bigram_floor,
+    generate_fineweb_synthetic_random_walk,
+    generate_position_shifted_hub_walk_batch,
+    run_collinear_radial_lag_attention_probe,
+    run_synthetic_fineweb_overfit_suite,
+)
 
 __all__ = [
     "RANK_BUCKETS",
@@ -120,5 +133,16 @@ __all__ = [
     "classify_run_tier",
     "compute_family_pareto_and_obsolete",
     "backfill_micro_verifications",
+    "FineWebSyntheticWalkConfig",
+    "FineWebSyntheticRandomWalkGenerator",
+    "generate_fineweb_synthetic_random_walk",
+    "generate_position_shifted_hub_walk_batch",
+    "compute_synthetic_fineweb_walk_stats",
+    "evaluate_oracle_markov_bigram_floor",
+    "NaiveQuadraticBornAttnLM",
+    "build_fast_quantum_born_synth_lm",
+    "build_fast_classical_softmax_synth_lm",
+    "run_collinear_radial_lag_attention_probe",
+    "run_synthetic_fineweb_overfit_suite",
 ]
 

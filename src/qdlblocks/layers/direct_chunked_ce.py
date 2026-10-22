@@ -660,6 +660,8 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
         chunk_size: int = 8192,
         ignore_index: int = -1,
         valid_vocab_size: int | None = None,
+        quad_diffuse_weight: float = 0.0,
+        bipolar_hole_weight: float = 0.0,
     ) -> torch.Tensor:
         orig_psi_s_shape = psi_sharp.shape
         orig_psi_d_shape = psi_diff.shape
@@ -676,7 +678,17 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
             else v_vocab
         )
         chunk_sz = max(1, min(int(chunk_size), n_tok))
+        if v_vocab >= 16384:
+            is_high_vram = bool(
+                psi_s_flat.is_cuda
+                and (torch.cuda.get_device_properties(psi_s_flat.device).total_memory >= 24 * (1024**3))
+            )
+            chunk_sz = min(chunk_sz, 4096 if is_high_vram else 512)
         ignore_idx = int(ignore_index)
+        quad_w = float(quad_diffuse_weight)
+        hole_w = float(bipolar_hole_weight)
+        use_bipolar = hole_w > 0.0
+        r_max_cap = 1.35 if use_bipolar else 0.95
 
         acc_dtype = torch.float64 if psi_sharp.dtype == torch.float64 else torch.float32
         if psi_sharp.dtype == torch.float64:
@@ -690,7 +702,12 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
         m_d_work = m_diff.to(work_dtype)
 
         k_val = k_copies.to(acc_dtype).reshape(())
-        lam_val = lambda_diff.to(acc_dtype).reshape(())
+        is_per_token_lam = lambda_diff.numel() > 1
+        lam_flat = (
+            lambda_diff.to(acc_dtype).reshape(n_tok, 1)
+            if is_per_token_lam
+            else lambda_diff.to(acc_dtype).reshape(1, 1)
+        )
         is_per_token_beta = beta_t.numel() > 1
         beta_flat = (
             beta_t.to(acc_dtype).reshape(n_tok, 1)
@@ -734,7 +751,11 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
             else None
         )
         dk = torch.zeros((), device=psi_s_flat.device, dtype=acc_dtype) if need_dk else None
-        dlam = torch.zeros((), device=psi_s_flat.device, dtype=acc_dtype) if need_dlam else None
+        dlam = (
+            torch.zeros_like(lam_flat)
+            if need_dlam
+            else None
+        )
         dprior = (
             torch.zeros((v_vocab,), device=psi_s_flat.device, dtype=acc_dtype)
             if need_dprior
@@ -758,23 +779,43 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
 
             c_sharp = F.linear(psi_s_c, m_s_work).to(acc_dtype)
             c_diff = F.linear(psi_d_c, m_d_work).to(acc_dtype)
+            if quad_w > 0.0:
+                c_pos = torch.clamp_min(c_diff, 0.0)
+                f_diff = c_diff + quad_w * (c_pos * c_pos)
+            else:
+                c_pos = None
+                f_diff = c_diff
             beta_c = beta_flat[start:end] if is_per_token_beta else beta_flat
+            lam_c = lam_flat[start:end] if is_per_token_lam else lam_flat
             r_raw = beta_c / k_val
-            r_mask = ((r_raw > 0.0) & (r_raw < 0.95)).to(acc_dtype)
-            r_tilde = torch.clamp(r_raw, min=0.0, max=0.95)
+            r_mask = ((r_raw > 0.0) & (r_raw < r_max_cap)).to(acc_dtype)
+            r_tilde = torch.clamp(r_raw, min=0.0, max=r_max_cap)
 
-            z_raw = 1.0 + r_tilde * c_sharp + lam_val * c_diff
-            z_mask = (z_raw > 1e-4).to(acc_dtype)
-            z = torch.clamp(z_raw, min=1e-4)
-            log_z = torch.log(z)
+            if use_bipolar:
+                x_raw = r_tilde * c_sharp + lam_c * f_diff
+                x_pos = torch.clamp_min(x_raw, 0.0)
+                x_neg = torch.clamp_min(-x_raw, 0.0)
+                log_z = torch.log1p(x_pos) - hole_w * torch.log1p(x_neg)
+                del x_pos, x_neg
+                z = None
+                z_mask = None
+            else:
+                x_raw = None
+                z_raw = 1.0 + r_tilde * c_sharp + lam_c * f_diff
+                z_mask = z_raw > 1e-4
+                z = torch.clamp(z_raw, min=1e-4)
+                del z_raw
+                log_z = torch.log(z)
+
             logits = k_val * log_z
             if log_prior_f is not None:
-                logits = logits + log_prior_f
+                logits.add_(log_prior_f)
 
             max_logits = torch.amax(logits[:, :v_active], dim=-1, keepdim=True)
-            logits = logits - max_logits
+            logits.sub_(max_logits)
             target_logits = logits.gather(1, yc_safe)
             exp_logits = torch.exp(logits)
+            del logits
             if v_active < v_vocab:
                 exp_logits[:, v_active:] = 0.0
             sum_exp = exp_logits.sum(dim=-1, keepdim=True)
@@ -792,7 +833,7 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
                     need_dprior,
                 )
             ):
-                probs = exp_logits / sum_exp
+                probs = exp_logits.div_(sum_exp)
                 probs.scatter_add_(
                     1,
                     yc_safe,
@@ -800,17 +841,35 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
                 )
                 if v_active < v_vocab:
                     probs[:, v_active:] = 0.0
-                g_c = probs * row_scale  # dL / d_logits_{t,v}
+                g_c = probs.mul_(row_scale)  # dL / d_logits_{t,v}
 
                 if need_dprior and dprior is not None:
                     dprior.add_(g_c.sum(dim=0))
 
-                q_c = g_c * (k_val / z) * z_mask  # dL / dz_raw_{t,v}
+                if need_dk and dk is not None:
+                    dk_log_term = (g_c * log_z).sum()
+                else:
+                    dk_log_term = None
+                del log_z
+
+                if use_bipolar:
+                    assert x_raw is not None
+                    slope_factor = torch.where(
+                        x_raw >= 0.0,
+                        torch.ones_like(x_raw),
+                        torch.full_like(x_raw, hole_w),
+                    ) / (1.0 + torch.abs(x_raw))
+                    q_c = g_c * (k_val * slope_factor)
+                    del x_raw, slope_factor, g_c
+                else:
+                    assert z is not None and z_mask is not None
+                    q_c = torch.where(z_mask, g_c * (k_val / z), torch.zeros_like(g_c))
+                    del z, z_mask, g_c
                 dr_tilde = (q_c * c_sharp).sum(dim=-1, keepdim=True)
 
-                if need_dk and dk is not None:
+                if need_dk and dk is not None and dk_log_term is not None:
                     dk.add_(
-                        (g_c * log_z).sum()
+                        dk_log_term
                         - (dr_tilde * (beta_c / (k_val * k_val)) * r_mask).sum()
                     )
 
@@ -822,7 +881,12 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
                         dbeta.add_(dbeta_c.sum())
 
                 if need_dlam and dlam is not None:
-                    dlam.add_((q_c * c_diff).sum())
+                    dlam_c = (q_c * f_diff).sum(dim=-1, keepdim=True)
+                    if is_per_token_lam:
+                        dlam[start:end] = dlam_c
+                    else:
+                        dlam.add_(dlam_c.sum())
+                del c_sharp, c_diff, f_diff
 
                 if need_dpsi_s or need_dm_s:
                     dc_sharp = (q_c * r_tilde).to(work_dtype)
@@ -830,13 +894,21 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
                         torch.mm(dc_sharp, m_s_work, out=dpsi_s[start:end])
                     if need_dm_s and dm_s is not None:
                         dm_s.addmm_(dc_sharp.t(), psi_s_c)
+                    del dc_sharp
 
                 if need_dpsi_d or need_dm_d:
-                    dc_diff = (q_c * lam_val).to(work_dtype)
+                    if quad_w > 0.0 and c_pos is not None:
+                        dc_diff = (q_c * lam_c * (1.0 + (2.0 * quad_w) * c_pos)).to(work_dtype)
+                    else:
+                        dc_diff = (q_c * lam_c).to(work_dtype)
                     if need_dpsi_d and dpsi_d is not None:
                         torch.mm(dc_diff, m_d_work, out=dpsi_d[start:end])
                     if need_dm_d and dm_d is not None:
                         dm_d.addmm_(dc_diff.t(), psi_d_c)
+                    del dc_diff
+                del c_pos, q_c
+            else:
+                del z, z_mask, x_raw, log_z, exp_logits, c_sharp, c_diff, f_diff, c_pos
 
         ctx.save_for_backward(
             dpsi_s.to(psi_sharp.dtype).view(orig_psi_s_shape)
@@ -901,6 +973,8 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -918,6 +992,10 @@ def direct_chunked_two_beam_kboson_ce(
     chunk_tokens: int | None = None,
     ignore_index: int = -1,
     valid_vocab_size: int | None = None,
+    quad_diffuse_weight: float = 0.0,
+    bipolar_hole_weight: float = 0.0,
+    *,
+    quadratic_diffuse_fidelity: float | None = None,
 ) -> torch.Tensor:
     """Compute single-pass chunked Two-Beam k-Boson mixed-state POVM cross-entropy with analytical gradients."""
     ref_dtype = torch.float64 if psi_sharp.dtype == torch.float64 else torch.float32
@@ -937,6 +1015,11 @@ def direct_chunked_two_beam_kboson_ce(
         else torch.tensor(float(lambda_diff), device=psi_sharp.device, dtype=ref_dtype)
     )
     eff_chunk = int(chunk_tokens) if chunk_tokens is not None else int(chunk_size)
+    eff_quad = float(
+        quadratic_diffuse_fidelity
+        if quadratic_diffuse_fidelity is not None
+        else quad_diffuse_weight
+    )
     return _DirectChunkedTwoBeamKBosonCEFn.apply(
         psi_sharp,
         psi_diff,
@@ -950,6 +1033,8 @@ def direct_chunked_two_beam_kboson_ce(
         eff_chunk,
         int(ignore_index),
         valid_vocab_size,
+        eff_quad,
+        float(bipolar_hole_weight),
     )
 
 
@@ -962,11 +1047,25 @@ def compute_two_beam_kboson_logits(
     k_copies: torch.Tensor | float,
     lambda_diff: torch.Tensor | float,
     log_prior: torch.Tensor | None = None,
+    quad_diffuse_weight: float = 0.0,
+    bipolar_hole_weight: float = 0.0,
+    *,
+    quadratic_diffuse_fidelity: float | None = None,
 ) -> torch.Tensor:
     """Compute unchunked Two-Beam k-Boson log-probabilities (up to additive normalization constant)."""
     acc_dtype = torch.float64 if psi_sharp.dtype == torch.float64 else torch.float32
     c_sharp = F.linear(psi_sharp.to(acc_dtype), m_sharp.to(acc_dtype))
     c_diff = F.linear(psi_diff.to(acc_dtype), m_diff.to(acc_dtype))
+    eff_quad = float(
+        quadratic_diffuse_fidelity
+        if quadratic_diffuse_fidelity is not None
+        else quad_diffuse_weight
+    )
+    if eff_quad > 0.0:
+        c_pos = torch.clamp_min(c_diff, 0.0)
+        f_diff = c_diff + eff_quad * (c_pos * c_pos)
+    else:
+        f_diff = c_diff
     beta_f = (
         beta_t.to(acc_dtype)
         if isinstance(beta_t, torch.Tensor)
@@ -984,9 +1083,20 @@ def compute_two_beam_kboson_logits(
         if isinstance(lambda_diff, torch.Tensor)
         else torch.tensor(float(lambda_diff), device=psi_sharp.device, dtype=acc_dtype)
     )
-    r_tilde = torch.clamp(beta_f / k_f, min=0.0, max=0.95)
-    z = torch.clamp(1.0 + r_tilde * c_sharp + lam_f * c_diff, min=1e-4)
-    logits = k_f * torch.log(z)
+    if lam_f.ndim > 0 and lam_f.ndim < c_diff.ndim:
+        lam_f = lam_f.unsqueeze(-1)
+    hole_w = float(bipolar_hole_weight)
+    if hole_w > 0.0:
+        r_tilde = torch.clamp(beta_f / k_f, min=0.0, max=1.35)
+        x_raw = r_tilde * c_sharp + lam_f * f_diff
+        log_z = torch.log1p(torch.clamp_min(x_raw, 0.0)) - hole_w * torch.log1p(
+            torch.clamp_min(-x_raw, 0.0)
+        )
+        logits = k_f * log_z
+    else:
+        r_tilde = torch.clamp(beta_f / k_f, min=0.0, max=0.95)
+        z = torch.clamp(1.0 + r_tilde * c_sharp + lam_f * f_diff, min=1e-4)
+        logits = k_f * torch.log(z)
     if log_prior is not None:
         logits = logits + log_prior.to(acc_dtype)
     return logits if psi_sharp.dtype == torch.float64 else logits.float()

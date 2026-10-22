@@ -158,6 +158,17 @@ from .layers.value_residual_and_norm_control import (
     compute_cross_layer_v_orthogonality_metrics,
     compute_mlp_attn_homogeneity_metrics,
 )
+from .layers.stereographic_lift import (
+    ClassicalSoftmaxMLP,
+    NaiveBornClassifier,
+    StereographicHilbertLift,
+    StereographicSingleBeamKBoson,
+    StereographicTwoBeamKBoson,
+    apply_dimension_preserving_stereographic_rotation,
+    build_concentric_shells_dataset,
+    load_fisher_iris_dataset,
+    run_iris_and_shells_benchmark,
+)
 from .metrics import (
     attention_entropy_and_sparsity,
     effective_rank,
@@ -276,6 +287,15 @@ __all__ = [
     "Hierarchical16QubitEmbedder",
     "Hierarchical16QubitPOVMReadout",
     "initialize_hierarchical_16qubit_with_ppmi_svd",
+    "StereographicHilbertLift",
+    "apply_dimension_preserving_stereographic_rotation",
+    "load_fisher_iris_dataset",
+    "build_concentric_shells_dataset",
+    "NaiveBornClassifier",
+    "StereographicSingleBeamKBoson",
+    "StereographicTwoBeamKBoson",
+    "ClassicalSoftmaxMLP",
+    "run_iris_and_shells_benchmark",
     "InputChannelGate",
     "apply_gated_xsa",
     "MUDDDynamicSkip",

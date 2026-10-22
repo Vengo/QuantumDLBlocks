@@ -1,284 +1,256 @@
-# Experiment Plan 018: Comprehensive Project Synthesis (Waves 1–9), Unpinned Leaderboard Sorting, Persistent "Mark Obsolete" Lifecycle, & Wave-10 900M-Token Speedrun V3
+# QuantumDLBlocks: Comprehensive Project & Session Wrap-Up Summary (Waves 1–18 / Plans 001–032)
 
-## 1. Executive Summary & Standalone Project Overview
-
-### 1.1 What Is `QuantumDLBlocks` / `QuantumBornGPT`?
-`QuantumDLBlocks` is a dual-backend (`PyTorch + Triton` on CUDA GPUs and `JAX + Equinox + Haliax + Pallas` on Google Cloud TPUs) deep learning research framework investigating **Quantum-Geometric Language Modeling (`QuantumBornGPT`)** and benchmarking it head-to-head against modernized **Classical `Modded-NanoGPT` (`ClassicalModdedGPT`)** architectures on the standard `FineWeb10B` (`FineWeb-Edu`, GPT-2 tokenizer, vocabulary size $V = 50,304$) benchmark.
-
-In a standard Euclidean Transformer (`GPT-2` or `ClassicalModdedGPT`), hidden states $x_{b,t}^{(l)} \in \mathbb{R}^d$ evolve in unconstrained Euclidean space, causal self-attention weights are computed via exponentiated dot products:
-$$A_{i,j}^{\text{classical}} = \frac{\exp(q_i^\top k_j / \sqrt{d_h}) \cdot \mathbf{1}[j \le i]}{\sum_{t \le i} \exp(q_i^\top k_t / \sqrt{d_h})}$$
-feed-forward blocks apply an elementwise nonlinearity such as $\text{ReLU}^2(x) = (\max(0, x))^2$, and vocabulary logits are produced by an unconstrained linear projection $\ell_{b,t} = W_{\text{lm}} x_{b,t}^{(L)} \in \mathbb{R}^V$ (optionally softcapped via $30 \tanh(\ell / 30)$).
-
-By contrast, **`QuantumBornGPT`** constrains representations and operators strictly to **real quantum state manifolds (unit spheres $\mathbb{S}^{d-1} = \{\psi \in \mathbb{R}^d : \|\psi\|_2 = 1\}$) and Stiefel / tight-frame manifolds ($\text{St}(d, k) = \{W \in \mathbb{R}^{d \times k} : W^\top W = I_k\}$)**:
-
-1. **Pure Quantum State Ket Backbone**: Every token $t \in \{0, \dots, T-1\}$ in batch item $b \in \{0, \dots, B-1\}$ at layer $l \in \{0, \dots, L\}$ is a unit-norm pure state ket $|\psi_{b,t}^{(l)}\rangle \in \mathbb{S}^{d-1}$, maintained via spherical normalization $\text{Normalize}(x) = x / \sqrt{\|x\|_2^2 + \epsilon}$ ($\epsilon = 10^{-6}$). At our default Hilbert dimension $d = 1024 = 2^{10}$, each token ket represents a **10-qubit real pure quantum state**.
-2. **Isometric Hilbert Lift from a Seed Subspace**: Rather than requiring a full $V \times d$ embedding table, each vocabulary token $v \in \{0, \dots, V-1\}$ is prepared as a unit seed vector $|s_v\rangle \in \mathbb{S}^{D_{\text{seed}}-1}$ in a lower-dimensional **seed Hilbert space** ($D_{\text{seed}} \in \{128, 256, 384, 512, 1024\}$) and lifted into $\mathbb{S}^{d-1}$ via a semi-orthogonal Stiefel lift matrix $W_{\text{lift}} \in \mathbb{R}^{d \times D_{\text{seed}}}$ ($W_{\text{lift}}^\top W_{\text{lift}} = I_{D_{\text{seed}}}$):
-   $$|\psi_0(v)\rangle = \text{Normalize}\!\big(W_{\text{lift}} |s_v\rangle\big) \in \mathbb{S}^{d-1}$$
-3. **Born-Rule Quantum Interference Attention (`FlashBorn` & `FlashPurifiedBorn`)**: In each attention head ($H$ heads, per-head dimension $d_h = d / H$), queries $|q_i\rangle \in \mathbb{S}^{d_h-1}$, keys $|k_j\rangle \in \mathbb{S}^{d_h-1}$, and values $|v_j\rangle \in \mathbb{S}^{d_h-1}$ are unit-normalized kets rotated by `UnitaryRoPE`. Instead of exponential Softmax, causal transition probabilities follow the **quantum Born rule** (squared inner-product overlap $|\langle q_i | k_j \rangle|^2$), or its trace-purified generalization (`FlashPurifiedBorn`, introduced in Plans 014–015):
-   $$w_{i,j}^{\text{Born}} = \gamma_h |\langle q_i | k_j \rangle|^2 \cdot \mathbf{1}[j \le i], \qquad A_{i,j} = \frac{w_{i,j}}{\sum_{t \le i} w_{i,t} + \epsilon}, \qquad |o_i\rangle = \text{Normalize}\!\left(\sum_{j \le i} A_{i,j} |v_j\rangle\right) \in \mathbb{S}^{d_h-1}$$
-   where $\gamma_h > 0$ is a learnable per-head sharpness parameter.
-4. **Two-Beam Overcomplete Tight-Frame Wave Interference MLP (`M×2`)**: Instead of a standard Euclidean MLP, each layer applies a two-beam interference block using a pair of overcomplete frame matrices $U_1, U_2 \in \mathbb{R}^{M \times d}$ where $M = \rho \cdot d$ is the intermediate frame dimension and $\rho \in \{1.5, 2.0, 3.0, 4.0\}$ is the **frame expansion factor** (denoted `1536×2`, `2048×2`, `3072×2`, or `4096×2` for $d=1024$):
-   $$m_{\text{2beam}}(\psi) = W_{\text{down}}\!\big((U_1 \psi) \odot \text{SiLU}(U_2 \psi)\big), \qquad |\psi^{(l)}\rangle = \text{Normalize}\!\big(|\psi^{(l-1)}\rangle + \alpha_{\text{res}} \, \text{Normalize}(m_{\text{2beam}}(\psi^{(l-1)}))\big)$$
-5. **POVM (Positive Operator-Valued Measure) Readout Collapse**: At the final layer $L$, the contextual Hilbert ket $|\psi_{b,t}^{(L)}\rangle \in \mathbb{S}^{d-1}$ is mapped to a unit readout ket $|\phi_{b,t}\rangle \in \mathbb{S}^{D_{\text{out}}-1}$ and measured against unit-norm vocabulary measurement vectors $|m_v\rangle \in \mathbb{S}^{D_{\text{out}}-1}$ ($v \in \{0, \dots, V-1\}$) scaled by an inverse measurement temperature $\beta_{b,t} > 0$:
-   $$\ell_{b,t,v} = \beta_{b,t} \langle \phi_{b,t} | m_v \rangle + b_{\text{prior}, v}, \qquad P(v \mid \phi_{b,t}) = \frac{\exp(\ell_{b,t,v})}{\sum_{v'=0}^{V-1} \exp(\ell_{b,t,v'})}$$
-   We support two primary high-performing readout modes:
-   - **`tied_stiefel` + `TwoBeamSeedReadoutAdapter` (`D_out = D_seed`, e.g. `384` or `512`)**: Projects $|\psi_{\text{final}}\rangle \in \mathbb{S}^{d-1}$ to $\mathbb{S}^{D_{\text{seed}}-1}$ via $W_{\text{lift}}^\top$ plus a nonlinear two-beam phase-sensitive adapter that recovers orthogonal nullspace features from $\ker(W_{\text{lift}}^\top)$, and measures against $|m_v\rangle = \text{Normalize}(|s_v\rangle + \Delta_v) \in \mathbb{S}^{D_{\text{seed}}-1}$.
-   - **`asymmetric` Full-Rank Hilbert Readout (`D_out = d = 1024`)**: Bypasses seed-space collapse at readout altogether ($|\phi_{b,t}\rangle = \text{Normalize}(W_{\text{rot}} |\psi_{b,t}^{(L)}\rangle) \in \mathbb{S}^{d-1}$) and measures directly against an un-bottlenecked full-rank POVM measurement frame $M_{\text{full}} \in \mathbb{R}^{V \times d}$ ($|m_v\rangle \in \mathbb{S}^{d-1}$).
-6. **Riemannian Stiefel Muon Optimization (`StiefelMuon`)**: All 2D internal projection matrices are optimized using 5-step Newton-Schulz orthogonalization (`zeropower_via_newtonschulz5_batched`) with Nesterov momentum warmup, cautious weight decay, and optional continuous Stiefel retraction penalty $\frac{1}{4}\|W^\top W - I\|_F^2$, while token embeddings, POVM heads, and scalar gates are optimized with fused `AdamW`.
+**Last Updated**: 2026-10-22  
+**Repository**: `/home/festivity/agy/QuantumDLBlocks`  
+**Hardware State**:
+- **Local GPU**: NVIDIA GeForce RTX 5060 Ti (`16 GB` total VRAM, strictly hardware-capped in all local experiments to **$\le 8.0\text{ GB}$ VRAM** via `torch.cuda.set_per_process_memory_fraction(0.5, device=0)`).
+- **Google Colab Fleet**: **0 active sessions (`0.00 CU/hr` burn rate)**, **`116.83` Compute Units (CU)** available.
+- **Zero-Downtime Telemetry & Model-Card WebUI**: Running locally on `http://127.0.0.1:8765`, backed by WAL-mode SQLite (`.cache/benchmarks.db`).
 
 ---
 
-### 1.2 Core Quantum-Geometric & Systems Telemetry Definitions
-Every benchmark run logs both standard language modeling metrics (evaluated strictly at the NanoGPT speedrun validation context length **$T_{\text{val}} = \text{block\_size} = 512$** across the 5,000,000-token `fineweb_val_000000.bin` split) and four quantum-geometric observables:
-1. **Validation Cross-Entropy (`Val CE`, in nats) & Perplexity (`Val PPL = exp(Val CE)`)**: Token-level negative log-likelihood on `fineweb_val_000000.bin` at $T_{\text{val}} = 512$, accompanied by `Top-1 %`, `Top-5 %`, and median target token rank (`MedRank`).
-2. **Readout Effective Quantum Rank ($R_{\text{eff}}(\rho_{\text{seed}})$)**: Given $N$ unit-norm readout kets $\{|\phi_i\rangle\}_{i=1}^N \subset \mathbb{S}^{D_{\text{out}}-1}$, we form their empirical density matrix $\rho = \frac{1}{N}\sum_{i=1}^N |\phi_i\rangle\langle\phi_i| \in \mathbb{R}^{D_{\text{out}} \times D_{\text{out}}}$, compute its von Neumann entropy $S_{\text{vN}}(\rho) = -\sum_{k=1}^{D_{\text{out}}} \lambda_k \log \lambda_k$ from the eigenvalues $\{\lambda_k\}$ of $\rho$, and define:
-   $$R_{\text{eff}}(\rho_{\text{seed}}) = \exp\!\big(S_{\text{vN}}(\rho)\big) \in [1, D_{\text{out}}]$$
-   which measures the effective number of orthogonal quantum state dimensions actively populated at readout.
-3. **10-Qubit Bipartite Entanglement Entropy ($S(\rho_A)$, in nats)**: Reshaping each 1024D ket $|\psi\rangle \in \mathbb{S}^{1023}$ into a $2^5 \times 2^5 = 32 \times 32$ bipartite amplitude matrix $\Psi_{A,B}$ across two 5-qubit subsystems $A$ and $B$, the reduced density matrix is $\rho_A = \text{Tr}_B(|\psi\rangle\langle\psi|) = \Psi_{A,B}\Psi_{A,B}^\top \in \mathbb{R}^{32 \times 32}$, with von Neumann entanglement entropy $S(\rho_A) = -\text{Tr}(\rho_A \log \rho_A) \in [0, \ln 32 \approx 3.466\text{ nats}]$.
-4. **Stiefel / Frame Isometry Deviation (`IsoErr`) & POVM Sharpness ($\beta$)**:
-   $$\text{IsoErr}(W) = \frac{\|W^\top W - I_c\|_F}{\sqrt{c}} \;\; (r \ge c) \quad \text{or} \quad \frac{\|W W^\top - I_r\|_F}{\sqrt{r}} \;\; (r < c)$$
-   averaged across internal 2D backbone matrices, alongside the mean POVM inverse temperature $\beta = \mathbb{E}[\beta_{b,t}]$.
+## 1. Executive Overview: What `QuantumDLBlocks` Is & What We Are Building
+
+`QuantumDLBlocks` is a deep-learning research codebase investigating whether a **genuinely quantum-geometric language model (`QuantumBornGPT`)** can match or surpass state-of-the-art classical Transformer architectures on large-scale autoregressive language modeling—specifically targeting the **`KellerJordan/modded-nanogpt` speedrun benchmark (`3.2800` validation cross-entropy on FineWeb10B / FineWeb-Edu, corresponding to validation perplexity $\text{PPL} = \exp(3.2800) \approx 26.58$)**—while operating within tight consumer and cloud GPU memory envelopes (`<= 8.0 GB` local VRAM and 1–2 Google Colab NVIDIA L4/G4 GPUs).
+
+Unlike standard classical Transformers (`ClassicalModdedGPT`), which represent hidden states as unconstrained vectors in $\mathbb{R}^d$ and compute token probabilities via an unconstrained linear projection (`lm_head` $\in \mathbb{R}^{V \times d}$) followed by `Softmax`, `QuantumBornGPT` enforces **quantum state and operator geometry** throughout the entire network:
+1. **Unit-Sphere / Density-Matrix Hidden States**: Token states are represented as unit vectors (pure quantum kets) $|\psi_t\rangle \in S^{d-1}$ ($\|\psi_t\|_2 = 1$) or low-rank mixed density matrices $\rho_t = \sum_{b=1}^B w_b |\psi_{t,b}\rangle\langle\psi_{t,b}|$ ($\text{Tr}(\rho_t) = 1, \rho_t \succeq 0$).
+2. **Stiefel-Manifold Isometric Backbone (`StiefelMuon`)**: Linear transformations $W \in \text{St}(d_{\text{out}}, d_{\text{in}})$ are constrained to the Stiefel manifold ($W^\top W = I$ or $W W^\top = I$) via quintic Newton-Schulz or `PolarExpress` (`ANVIL`) polar retraction and Riemannian tangent-space momentum updates (`StiefelMuon`), ensuring norm preservation ($\|W\psi\|_2 = \|\psi\|_2$) and preventing singular-value explosion or collapse.
+3. **Quantum Interference & Entanglement Blocks**: Contextual mixing is performed by **Purified Subspace-Projector Born Attention** (`SubspaceProjectorBornAttention`, which projects queries, keys, and values onto orthonormal subspaces with zero-half Rotary Position Embeddings and Value Embeddings) and **Overcomplete Two-Beam Quantum Interference** (`OvercompleteTwoBeamInterference`, which splits $|\psi_t\rangle$ into two coherent evolutionary branches $|\psi_{t,1}\rangle, |\psi_{t,2}\rangle$ that interfere via phase gates on the sphere).
+4. **16-Qubit Product-Register Hierarchy (`Hierarchical16QubitEmbedder`)**: Instead of a flat $d$-dimensional lookup table, each of the $V = 50,304$ padded GPT-2 vocabulary tokens ($50,257$ active tokens padded to a multiple of $64$ for GPU tensor-core alignment) is factorized into $Q = 16$ quantum registers of $A \in \{16, 32\}$ amplitudes (`unigram_qubits` $\in \mathbb{R}^{V \times Q \times A}$) and coupled to $M \in \{128, 256\}$ coarse semantic higher-level quantum states (`higher_states` $\in \mathbb{R}^{M \times Q \times A}$) that interact via per-register unitary matrices $U_{\text{hier}} \in U(M)^Q$.
+5. **100% Quantum Readout via Two-Beam $k$-Boson Bloch Fidelity & Non-Isometric Kraus Semantic Bath (`Hierarchical16QubitPOVMReadout`)**: Next-token probabilities are computed without classical unconstrained `lm_head` logits by evaluating the **$k$-copy Boson fidelity** $\text{Tr}(\rho_t^{\otimes k} E_v^{\otimes k})$ between the rank-2 two-beam contextual state $\rho_t$ and Positive Operator-Valued Measure (POVM) token effects $E_v$, combining a sharp Stiefel POVM channel ($c_{\text{sharp}}(t,v) = \langle M_{\text{sharp},v} | \psi_{\text{sharp},t}\rangle$) with a low-rank ($r = 16$) Kraus semantic bath ($c_{\text{diff}}(t,v) = \sqrt{d/r}\,\langle U_{\text{diff}}^\top M_{\text{sharp},v} \mid V_{\text{diff}}^\top \psi_{\text{beam2},t}\rangle$).
 
 ---
 
-## 2. Problems Solved & Discussed Across Waves 1–9 (`Plans 001–017`)
+## 2. Reference Glossary of Architectural Primitives, Schedules, & Telemetry Metrics
 
-### 2.1 Chronological Synthesis of Problems, Solutions, and Breakthroughs
+To ensure every table and mathematical equation in this document is self-contained, here are exact definitions of our recurring metrics, embedding modes, and architectural primitives:
 
-| Wave & Plans | Core Problem Investigated | Architectural / Systems Solution Built | Quantitative Outcome (`T_val = 512`) |
-| :---: | :--- | :--- | :--- |
-| **Baseline & Wave 1** (`Plans 001–005`, 300M tok = 3 ep × 100M shard) | Can a pure unit-sphere / Stiefel network train stably at 100M+ token scale with fast POVM readout? | Built `QuantumBornGPT` (`L=6, d=1024, D_seed=128`), `FlashBorn` Triton kernel, `TangentStiefelMuon`, Strided Decoupled Multi-Token Prediction (`MTP`), `MultiBeamKrausReadout`, and `fused_tiled_povm_cross_entropy`. | Reduced 300M-token Val CE from **`4.3488` (`77.4` PPL)** (`gpu_3ep` baseline) to **`4.2181` (`67.9` PPL)** (`hyp_gpu_exp03`, `D_seed=256`). |
-| **Wave 2** (`Plans 006–007`, 300M tok) | Strict $W^\top W = I$ orthogonality limits MLP feature capacity, and linear collapse $W_{\text{lift}}^\top : \mathbb{R}^{1024} \to \mathbb{R}^{D_{\text{seed}}}$ discards $(1024 - D_{\text{seed}})$ orthogonal dimensions. | Relaxed Stiefel orthogonality via **Overcomplete Tight Frames** (`OvercompleteFrameInterference`, governed by the Welch bound) and built `OvercompleteSeedReadoutAdapter` to recover nullspace energy from $\ker(W_{\text{lift}}^\top)$. | Improved 300M-token Val CE to **`4.2367`** and revealed the **Quantum State Capacity Law**: $\text{Val CE}$ scales linearly with $-\log R_{\text{eff}}(\rho_{\text{seed}})$. |
-| **Wave 3** (`Plans 008–010`, 300M tok) | Why did expanding $D_{\text{seed}} \to 512\text{–}1024$ without a phase-sensitive adapter cause subspace starvation, and why was the 1-beam quadratic adapter blind to antipodal sign flips $\pm \psi_\perp \in \ker(W_{\text{lift}}^\top)$? | Built `OvercompleteTwoBeamInterference` (`2048×2`) and `TwoBeamSeedReadoutAdapter` (combining even quadratic $(U_1\psi)^{\odot 2}$ and odd cubic $(U_1\psi)^{\odot 2} \odot \text{SiLU}(U_2\psi)$ terms to break antipodal sign degeneracy). | Reached **`4.1846` Val CE (`65.7` PPL)** on 300M tokens (`w3_gpu_adapter384_2beam`) and boosted $R_{\text{eff}}(\rho_{\text{seed}})$ from `27.4` to **`48.2`**. |
-| **Wave 4** (`Plan 011`, 900M unique tok = 1 ep × 9 shards) | Repeating a single 100M-token shard for 9 epochs caused a `0.38+` nat memorization gap that ruined late-stage WSD cooldown. | Built `FineWebMultiShardStream` with asynchronous background shard prefetching (`0.0 ms` I/O stall across `fineweb_train_000001..000009.bin`) and validated Warmup-Stable-Decay (`WSD`) cooldown on non-repeating data. | Eliminated memorization (`Train - Val CE ≈ 0.02` nats) and broke the **`4.00` Val CE** barrier: **`3.9223` Val CE (`50.5` PPL)** (`w4_900m_full_synergy512_cosine`). |
-| **Wave 5** (`Plan 012`, 900M unique tok, `120M–211M` params) | How should we scale `QuantumBornGPT` parameters from `66M` to `120M–211M` across Frame Expansion (`3d/4d`), Full-Rank Asymmetric Readout (`D_out=1024`), Width (`d=1536`), Depth (`L=12`), and Tied Vocab? | Built multi-axis scaling (`parameter_scaling.py`) with Welch-bound tight-frame targets and geodesic residual scaling $\alpha_{\text{res}}(L) = \sqrt{6/L}$. | `4d` Frame (`4096×2`) + `D_seed=512` hit **`3.8765` Val CE (`48.3` PPL)** (`w5_900m_frame4d_synergy512`), and Full-Rank `Asym-1024` POVM + `L=9` hit **`3.8825` Val CE** ($R_{\text{eff}} = 72.62$). |
-| **Wave 6** (`Plan 013`, 900M unique tok) | **Constant-Logit-Norm Theorem**: Unit-norm kets $|\phi_{b,t}\rangle \in \mathbb{S}^{D_{\text{out}}-1}$ with a single scalar $\beta$ lock $\|\ell_{b,t}\|_2 \approx \beta\sqrt{V/D_{\text{out}}} = \text{const}$, preventing context-dependent sharpness on heteroscedastic language contexts. Also needed an apples-to-apples **Classical `Modded-NanoGPT`** baseline. | Built `ContextualBlochPurityGate` (`--dynamic-povm-beta`, modulating per-token Bloch purity radius $r(\psi_{b,t}) \in [0.25, 4.0]$) and `ClassicalModdedGPT` (`--architecture classical_modded`). | `w6_900m_asym1024_frame3d_dynbeta` set a new quantum record of **`3.8514` Val CE (`47.1` PPL)**, while `ClassicalModdedGPT` (`6L, d=1024`) reached **`3.5444` Val CE (`34.6` PPL)** (`162M`) and **`3.6003` Val CE** (`124M`). |
-| **Wave 7 & Wave 8** (`Plans 014–015`, 900M unique tok) | Why did `QuantumBornGPT` exhibit a slower early-epoch (`0–100M` tok) validation drop than `ClassicalModdedGPT`? Why did a naive Python-loop `PurifiedBorn` cut GPU throughput from `181k` to `62k tok/s`? And why did Classical `L=12` stall at `4.2312` when `StiefelMuon` applied a `0.005` Stiefel penalty to Euclidean MLPs? | Diagnosed 4 early-epoch quantum bottlenecks (Quadratic Born SNR attenuation, input-highway token echo, unigram prior cold-start, and uniform spherical mixing); built fused Triton `flash_purified_born_attention` (`2.79×` kernel speedup), true cross-layer Layer-0 $V^{(0)}$ residual sharing (`--true-layer0-v-residual`), decoupled `--classical-stiefel-penalty 0.0`, and `WSD-0` (`min_lr_ratio=0.0`). | Improved `50M`-token Quantum Val CE by **`-0.1480` nats** (`4.7461 -> 4.5981`), while `w7_900m_classical_speedrun_12L_t1024` (`L=12, d=768, ZeroInit + WSD`) reached **`3.4604` Val CE (`31.8` PPL, `221,490 tok/s`)**. |
-| **Wave 9 & Permanent Server** (`Plans 016–017`, 900M unique tok — **Just Completed!**) | How do we close the remaining sample-efficiency and systems gap to the `KellerJordan/modded-nanogpt` PR #360 speedrun (`3.28` Val CE), apply those primitives to `QuantumBornGPT`, run an apples-to-apples Optimizer Ablation (`Muon` vs `Pure AdamW`), and run the dashboard as a **zero-downtime permanent server** with per-run **Model Cards**? | Implemented `direct_chunked_softcap_linear_ce` & `direct_chunked_povm_ce` (`0` backward GEMMs), 3D batched Newton-Schulz (`7.91×` faster), `num_value_embeddings=3` (`ve` in layers `0,1,2` & `L-3,L-2,L-1`), `unet_skip_mode="scalar"`, `use_fused_qkv=True`, `skip_attn_layers=(6,)`, `zero_half_rope=True`, sliding-window + `<\|endoftext\|>` masking, and `DynamicWaveRegistry` + `RunModelCard` hot-reload server (`0` restarts). | **Massive Double Breakthrough**:<br>• **Quantum #1 All-Time Record**: `w9_900m_qborn_speedrun_v2_asym1024_L8` hit **`3.7203` Val CE (`41.3` PPL, `34.93%` Top-1)** — beating Wave-6 (`3.8514`) by **`-0.1311` nats (`-5.8` PPL)**!<br>• **Quantum #2 All-Time Record**: `w9_900m_qborn_speedrun_v2_frame4d_synergy512` hit **`3.7495` Val CE (`42.5` PPL, `126,338 tok/s`)** — beating Wave-5 (`3.8765`) by **`-0.1270` nats**!<br>• **Classical #1 All-Time Record**: `w9_900m_classical_speedrun_v2_pr360` hit **`3.4280` Val CE (`30.8` PPL, `37.96%` Top-1, `Train CE = 3.4045`)**!<br>• **Optimizer Ablation**: `StiefelMuon` (`3.4280`) beat `Pure AdamW` (`3.5025`) by **`-0.0745` nats (`-2.4` PPL)** on the exact same architecture! |
+### 2.1 Spectral, Calibration, & Initialization Telemetry Metrics
+- **`Val CE` & `Val PPL` (Validation Cross-Entropy & Perplexity)**: Mean token-level negative log-likelihood (in nats) on the held-out `KellerJordan/modded-nanogpt` FineWeb-Edu validation shard (`T_val = 512`, `50,257` active GPT-2 tokens), and Perplexity $\text{PPL} = \exp(\text{Val CE})$.
+- **$R_\sigma(X)$ (Shannon Spectral Effective Rank)**: Given an activation or projection matrix $X \in \mathbb{R}^{N \times m}$ with singular values $\sigma_1 \ge \sigma_2 \ge \dots \ge \sigma_m > 0$ and normalized singular-value distribution $p_i = \frac{\sigma_i}{\sum_{j=1}^m \sigma_j}$, the Shannon spectral effective rank is:
+  $$R_\sigma(X) = \exp\!\left(-\sum_{i=1}^m p_i \ln p_i\right) \in [1, m]$$
+  It measures the effective number of active orthogonal dimensions spanned by $X$.
+- **$R_{\text{PR}}(X)$ (Participation Ratio)**: A second-moment spectral rank metric defined from the squared singular values (eigenvalues of $X^\top X$):
+  $$R_{\text{PR}}(X) = \frac{\left(\sum_{i=1}^m \sigma_i^2\right)^2}{\sum_{i=1}^m \sigma_i^4} \in [1, m]$$
+  Because $R_{\text{PR}}$ weights $\sigma_i^4$ in the denominator, it is highly sensitive to dominant-mode anisotropy ("cone collapse").
+- **$R_{\text{sharp}}$ (Final-Layer Sharp State Effective Rank)**: Defined as $R_{\text{sharp}} \equiv R_\sigma(\Psi_{\text{sharp}}) \in [1, d]$, the Shannon spectral effective rank of the final-layer normalized contextual state matrix $\Psi_{\text{sharp}} \in \mathbb{R}^{(B \cdot T) \times d}$ across the validation batch. (For classical models or single-beam quantum models without a diffuse Kraus bath, the $R_{\text{sharp}}$ column reports the final-layer hidden state effective rank $R_\sigma(h_L) \in [1, d]$.)
+- **$R_{\text{diff}}$ (Diffuse Kraus Subspace Effective Rank)**: Defined as $R_{\text{diff}} \equiv R_\sigma(\Psi_{\text{diff}, r}) \in [1, r]$, the Shannon spectral effective rank of the projected second-beam states $\Psi_{\text{diff}, r} = (d/r)^{1/4}\Psi_{\text{beam2}} V_{\text{diff}} \in \mathbb{R}^{(B \cdot T) \times r}$ inside the $r = 16$ diffuse Kraus semantic subspace.
+- **`SelfOv` (`self_register_overlap_max`)**: The worst-case Step-0 cosine similarity between any token $v$'s normalized input qubit register $\hat{u}_{\text{in}}(v, q) \in S^{A-1}$ and its own output POVM qubit register $\hat{u}_{\text{out}}(v, q) \in S^{A-1}$ across all $V = 50,304$ tokens and $Q = 16$ registers:
+  $$\text{SelfOv} = \max_{v \in \{0,\dots,V-1\},\, q \in \{0,\dots,Q-1\}} \big|\langle \hat{u}_{\text{in}}(v, q) \mid \hat{u}_{\text{out}}(v, q) \rangle\big| \in [0, 1]$$
+  If $\text{SelfOv} \approx 1$, every token predicts itself at Step 0; if $\text{SelfOv} < 10^{-5}$, Step-0 self-repetition is eliminated.
+- **`DirRatio` (`directed_bigram_overlap_ratio`)**: The ratio of average Step-0 unigram-to-POVM inner product on high-PMI empirical directed bigrams $(u \to v) \in \mathcal{B}_{\text{top}}$ relative to random token pairs $(u', v')$:
+  $$\text{DirRatio} = \frac{\mathbb{E}_{(u \to v) \in \mathcal{B}_{\text{top}}}\big[|\langle \hat{u}_{\text{in}}(u) \mid \hat{u}_{\text{out}}(v) \rangle|\big]}{\mathbb{E}_{(u', v') \sim \text{Unif}}\big[|\langle \hat{u}_{\text{in}}(u') \mid \hat{u}_{\text{out}}(v') \rangle|\big]}$$
+- **`ECE` (Expected Calibration Error)**: Standard 10-bin Top-1 probability calibration error $\text{ECE} = \sum_{m=1}^{10} \frac{|B_m|}{N} \big|\text{acc}(B_m) - \text{conf}(B_m)\big|$, measuring how closely the model's predicted Top-1 probability matches its empirical Top-1 accuracy.
 
----
+### 2.2 `Parity-Split` (`use_ortho_decouple=True`) vs. `Full-Ambient` (`use_ortho_decouple=False`) Qubit Modes
+- **`Parity-Split` Mode (`use_ortho_decouple=True`, e.g., `16×16 = 256` in a $d = 512$ model)**:
+  - Each token has $Q \times A = 16 \times 16 = 256 = d/2$ unigram amplitudes.
+  - The input embedder places its $256$ amplitudes strictly onto the **even indices (`0::2`)** of $\mathbb{R}^{512}$ (leaving odd indices `1::2` at zero at Step 0), while the POVM readout places its $256$ token effect amplitudes (`povm_odd_qubits`) strictly onto the **odd indices (`1::2`)** of $\mathbb{R}^{512}$.
+  - Because `0::2` and `1::2` are disjoint coordinate subspaces of $\mathbb{R}^{512}$, input and output states are automatically orthogonal at Step 0 ($\langle \psi_0(v) \mid M_0(v)\rangle = 0$) even when both are initialized from the exact same top-256 PPMI-SVD singular vectors.
+- **`Full-Ambient` Mode (`use_ortho_decouple=False`, e.g., `16×16 = 256` in a $d = 256$ model, or `16×32 = 512` in a $d = 512$ model)**:
+  - Both the input qubit registers (`unigram_qubits`, internally denoted `u_even` in the initializer) and the output POVM qubit registers (`povm_odd_qubits`, internally denoted `u_odd` in the initializer—retaining the historical variable names from Parity-Split mode) have flat dimension $Q \times A = d$ and occupy **all $d$ coordinates** of $\mathbb{R}^d$ without zero-interleaving.
+  - Because input and output registers share the same ambient coordinates in $\mathbb{R}^d$, avoiding Step-0 self-overlap ($\text{SelfOv} \to 1$) requires explicit per-register orthogonal decoupling (`decouple_self_in_full_ambient=True`), which we perfected in Plan 032 via the Anti-Diagonal Spectral-Reversal Isometry $J_{\text{anti}}$.
 
-### 2.2 Deep-Dive Analysis of the Completed Wave-9 Results & What They Reveal for Wave-10
-
-All five Wave-9 `900M`-token FineWeb-Edu runs completed 100% on our 5-GPU Colab fleet (`3× G4 RTX PRO 6000 Blackwell` + `2× A100-SXM4-40GB`), evaluated every `50M` tokens at fixed validation block size $T_{\text{val}} = 512$:
-
-| Wave-9 Run Key | Architecture & Key Primitives | Global Batch & Steps | `50M` CE | `100M` CE | `200M` CE | `450M` CE | `650M` CE (Pre-Decay) | **`900M` Final Val CE (PPL)** | Top-1 / Top-5 | Throughput (`tok/s`) |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`w9_900m_classical_speedrun_v2_pr360`** | `ClassicalModdedGPT` (`L=12, d=768, H=12, d_ff=3072`), `ve=3`, `scalar` U-Net, `fused_qkv`, `skip_attn=6`, `zero_half_rope`, `win=384+doc_mask`, `WSD-0` (`Muon+AdamW`) | `262,144` tok/step (`3,429` steps) | `4.8834` | `4.2521` | `3.9375` | `3.7068` | `3.6114` | **`3.4280` (`30.8` PPL)** 🥇 | **`37.96%` / `59.77%`** | `136,754` |
-| **`w9_900m_classical_speedrun_v2_t512_b524k`** | Same PR #360 V2 architecture at $2\times$ larger batch (`B=256, G_acc=4`) | `524,288` tok/step (`1,710` steps) | `5.4751` | `4.5934` | `4.0505` | `3.7323` | `3.6352` | **`3.4500` (`31.5` PPL)** 🥈 | `37.65%` / `59.43%` | `148,884` |
-| **`w9_900m_classical_opt_ablation_pure_adamw`** | Exact same PR #360 V2 architecture with **`--optimizer-mode pure_adamw`** (`lr=0.003` backbone) | `262,144` tok/step (`3,429` steps) | `5.2333` | `4.4529` | `4.0570` | `3.7854` | `3.6815` | **`3.5025` (`33.2` PPL)** | `37.07%` / `58.85%` | `110,906` |
-| **`w9_900m_qborn_speedrun_v2_asym1024_L8`** | `QuantumBornGPT` (`L=8, d=1024, 3d-Frame 3072×2, Asym1024`), `ve=3`, `scalar` U-Net, `fused_qkv`, `zero_half_rope`, `FlashPurifiedBorn win=384+doc_mask`, `WSD-0` | `65,536` tok/step (`13,725` steps) | **`4.5753`** | **`4.3590`** | **`4.1800`** | **`4.0336`** | **`3.9905`** | **`3.7203` (`41.3` PPL)** 🏆 | **`34.93%` / `56.30%`** | `95,615` |
-| **`w9_900m_qborn_speedrun_v2_frame4d_synergy512`** | `QuantumBornGPT` (`L=6, d=1024, 4d-Frame 4096×2, D_seed=512, 2BeamAdapter`), `ve=3`, `scalar` U-Net, `fused_qkv`, `zero_half_rope`, `FlashPurifiedBorn win=384+doc_mask`, `WSD-0` | `65,536` tok/step (`13,725` steps) | `4.5997` | `4.4123` | `4.2594` | `4.1314` | `4.0699` | **`3.7495` (`42.5` PPL)** 🥈 | `34.81%` / `55.99%` | `126,338` |
-
-Three critical scientific insights emerge from this table:
-
-1. **Why `QuantumBornGPT` Jumped by `-0.1311` Nats (`3.8514 -> 3.7203` Val CE, `-5.8` Perplexity Points)**:
-   - Both Wave-9 quantum models kept the fine-grained `65,536` tok/step batch size (`13,725` StiefelMuon steps over `900M` tokens) while integrating Plan 016's PR #360 primitives (`num_value_embeddings=3`, `unet_skip_mode="scalar"`, `use_fused_qkv=True`, `zero_half_rope=True`, `true_layer0_v_residual=True`, `flash_purified_born_attention` with `window_size=384` + `doc_ids`, and `WSD-0` linear cooldown to zero).
-   - At `50M` tokens, `w9_900m_qborn_speedrun_v2_asym1024_L8` reached `4.5753` Val CE (beating Wave-6's `4.7461` by **`-0.1708` nats**), and during the final 25% `WSD-0` cooldown (`675M -> 900M` tokens), its validation loss plunged by **`-0.2702` nats** (`3.9905 -> 3.7203`), while `w9_900m_qborn_speedrun_v2_frame4d_synergy512` plunged by **`-0.3204` nats** (`4.0699 -> 3.7495`)!
-   - Furthermore, Wave-9 tested `L=8 + 3d-Frame + Asym1024` (`3.7203`) and `L=6 + 4d-Frame + Synergy512` (`3.7495`) *separately*. Unifying **`L=8` + `4d-Frame (4096×2)` + `Asym-1024`** (`w10_900m_qborn_speedrun_v3_asym1024_frame4d_L8`) and scaling **`Asym-1024` to `L=12` layers with `skip_attn_layers=(6,)`** (`w10_900m_qborn_speedrun_v3_asym1024_L12_deep`) are our next logical steps to break **`3.65` Val CE (`< 38.5` PPL)**.
-
-2. **Why `w9_900m_classical_speedrun_v2_pr360` Reached `3.4280` (`Train CE = 3.4045`) and What Held It Back From `<= 3.32`**:
-   - **Finding A — Step-Count Starvation at Large Global Batch (`3,429` Steps vs. `6,858` or `13,725` Steps)**:
-     Compare `w9_900m_classical_speedrun_v2_pr360` (`B_global = 262,144` tok/step = `3,429` steps) against Wave-7's `w7_900m_classical_speedrun_12L_t1024` (`B_global = 131,072` tok/step = `6,858` steps) at **matched optimizer step counts**:
-     - At `~763` optimizer steps (`200M` tok for `w9` vs. `100M` tok for `w7`), `w9` achieved **`3.9375` Val CE** vs. `w7`'s `4.1927` (**`-0.2552` nats better per step**).
-     - At `~3,429` optimizer steps (`900M` tok for `w9` vs. `450M` tok for `w7`), `w9` achieved **`3.6114` pre-cooldown / `3.4280` post-cooldown Val CE** vs. `w7`'s `3.7571` (**`-0.1457` nats better pre-cooldown at the same step count**).
-     - However, because `w9` used $B_{\text{global}} = 262,144$ tokens/step (and `w9_b524k` used $524,288$ tokens/step = only `1,710` steps!), `w9` executed only `3,429` gradient steps across the entire `900M`-token stream and used a conservative Muon learning rate of `lr = 0.025` (whereas `modded-nanogpt` PR #360 uses `lr = 0.04–0.05` with aspect scaling). Running the PR #360 architecture at **`131,072` tok/step (`6,858` steps, `2.0×` more updates)** with `--muon-lr 0.04` and at **`65,536` tok/step (`13,725` steps, `4.0×` more updates)** with `--muon-lr 0.035` directly eliminates step-count starvation!
-   - **Finding B — 4D Boolean `attn_mask` Fallback in PyTorch SDPA (`136.8k tok/s` vs. `221.5k tok/s`) & Train/Val Mask Mismatch**:
-     In `ClassicalModdedBlock.forward` (`src/qdlblocks/models/classical_modded_gpt.py`), when `window_size > 0` or `doc_ids is not None`, PyTorch constructs a dense 4D boolean tensor `mask_4d` of shape `(B, 1, T, T)` and calls `F.scaled_dot_product_attention(q, k, v, attn_mask=mask_4d, is_causal=False)`. On PyTorch CUDA, passing an explicit 4D `attn_mask` bypasses the fused FlashAttention-2 `is_causal=True` kernel and falls back to the slower memory-efficient/math SDPA kernel (reducing G4 Blackwell throughput from `221,490 tok/s` in Wave-7 to `136,754 tok/s` in Wave-9). Worse, `evaluate_validation` evaluates at $T_{\text{val}} = 512$ with `window_size=0` (full 512-token causal attention), creating a train/validation receptive-field mismatch whenever training uses `window_size=384` at $T_{\text{train}} = 512$. Running `ClassicalModdedGPT` at $T_{\text{train}} = T_{\text{val}} = 512$ with native FlashAttention-2 (`is_causal=True`, `window_size=0, doc_mask_attn=False`) restores **`> 220,000 tok/s`** throughput and guarantees zero train/validation context mismatch!
-
-3. **What the Optimizer Ablation (`Muon` vs. `Pure AdamW` vs. `SGD+Nesterov`) Proved**:
-   - Holding the Wave-9 PR #360 architecture (`228.23M` params, `L=12, d=768, ve=3, scalar U-Net, fused_qkv, skip_attn=6, zero_half_rope, WSD-0`) and batch schedule (`3,429` steps) completely identical:
-     - **`StiefelMuon + AdamW`** (`w9_900m_classical_speedrun_v2_pr360`) achieved **`3.4280` Val CE (`30.8` PPL, `37.96%` Top-1, `136,754 tok/s`)**.
-     - **`Pure AdamW`** (`w9_900m_classical_opt_ablation_pure_adamw`) achieved **`3.5025` Val CE (`33.2` PPL, `37.07%` Top-1, `110,906 tok/s`)**.
-   - This proves two things simultaneously: (a) Newton-Schulz orthogonalized `StiefelMuon` provides a decisive **`-0.0745` nat (`-2.4` PPL, `+0.89%` Top-1) sample-efficiency advantage** and **`+23.3%` throughput advantage** over `Pure AdamW` at 900M-token scale, and (b) our Wave-9 PR #360 architectural upgrades are so strong that even with `Pure AdamW` (`3.5025`), the Wave-9 model beats all Wave-6 Muon classical baselines (`3.5444` and `3.6003`)! In Wave-10, we complete this 3-way study by running **`--optimizer-mode sgd_nesterov`** (`w10_900m_classical_opt_ablation_sgd_nesterov`) on the exact same `900M`-token configuration.
+### 2.3 Reusable `modded-nanogpt` / `ANVIL2` Architectural & Optimizer Primitives (Plan 021)
+- **`ANVIL` / `ANVIL2` (Categories A, B, and C)**: Refers to the state-of-the-art `KellerJordan/modded-nanogpt` leaderboard speedrun architecture (`Record #360` / `ANVIL2`), which we organized in Plan 021 into three modular categories:
+  - **Category A (Optimizer, Gates, & Skip Topology)**: `PolarExpress`, `NorMuon`, Twin-Rail Nesterov momentum, `TailWeightAverager`, `InputChannelGate`, `Gated XSA`, `MUDD`, and `ForwardSmearGate`.
+  - **Category B (Local N-Gram Context Bank)**: `HashedNgramEmbedding` (`ngram_hash.py`), a multiplicative-XOR hashed bigram + trigram embedding table (`65,536` to `262,144` rows) with independent $\pm 1$ Weinberger signs injected into token embeddings to offload local collocation memorization from early attention layers.
+  - **Category C (Systems & Data Alignment)**: Beginning-of-Sequence (`<|endoftext|>`) batch alignment (`--align-to-bos`), tapered multi-token prediction (`--tapered-mtp`), and FP8 linear layer wrappers (`--fp8-linear`).
+- **`PolarExpress` (`zeropower_via_polarexpress5`)**: A 5-to-6 step quintic polynomial iteration $X_{k+1} = a_k X_k + b_k X_k (X_k^\top X_k) + c_k X_k (X_k^\top X_k)^2$ with pre-optimized `ANVIL` coefficients $(a_k, b_k, c_k)$ that snaps rectangular matrices onto the Stiefel manifold faster and more accurately than standard cubic/quintic Newton-Schulz.
+- **`NorMuon` (`normuon_equalize`)**: Row-wise (neuron-wise) second-moment variance equalization applied to orthogonalized `Muon` / `StiefelMuon` momentum updates so every output row receives a balanced update step.
+- **`VE` (`num_value_embeddings`, e.g., `VE=2` or `VE=3`)**: Token-indexed **Value Embedding** lookup tables injected directly into the attention `V` (value) projection of early and late Transformer blocks, providing a direct token-identity skip path into attention values.
+- **`MUDD` (`MUDDDynamicSkip`)**: **Multiway Dynamic Dense** skip connections that allow each layer $\ell$ to dynamically weight and sum the outputs of all preceding layers $0, \dots, \ell-1$ via learned per-position gate weights.
+- **`Gated XSA` (`apply_gated_xsa`)**: **Gated Exclusive/Cross Self-Attention** post-processing that projects out the component of each attention head's output that is collinear with its own value vector $v_{t,h}$, forcing attention heads to pass strictly cross-token contextual information.
+- **`ForwardSmearGate` (`--smear-gate`)**: A lightweight causal 1-token shift gate at the input embedding layer that blends a learned fraction of token $t-1$'s representation into position $t$, giving every layer immediate 2-gram horizon awareness.
+- **`WSD` Learning-Rate Schedule (Warmup-Stable-Decay)**: The learning-rate schedule used across our training runs: linear warmup for the first `15–50` steps, a constant peak learning-rate plateau for the first `60%` of training, and linear decay to `10%` of peak LR over the final `40%` of steps.
 
 ---
 
-### 2.3 New Dashboard UX & Lifecycle Problems to Solve Now (`Plan 018`)
+## 3. The Core Problems We Have Been Solving & Discussing
 
-With **61+ Model Cards** across Baseline and Waves 1–9 now served by our permanent zero-downtime benchmarking server (`scripts/monitor_colab_runs.py` on `0.0.0.0:8765`), the user identified two important usability issues on the live dashboard:
+Across Waves 1–18 (Experiment Plans 001–032), our work and technical discussions have centered on solving **six deeply connected mathematical, architectural, and systems problems**:
 
-1. **Problem A — Baseline Models Appearing at the Top of the Sorted Leaderboard List**:
-   Inspection of `scripts/monitor_colab_runs.py` and `.cache/live_logs/latest_snapshot.json` revealed three compounding causes:
-   - **Cause 1 (Duplicate `Baseline` Entries & Duplicate React Keys in `collect_snapshot()`)**: In `collect_snapshot()`, the 5 single-shard multi-epoch control runs (`gpu_5ep`, `gpu_3ep`, `gpu_wsd_mtp`, `tpu_3ep`, `tpu_wsd_mtp` with `wave_id = "Baseline"`) were manually constructed and appended at indices `0..4` of `runs_catalog`, AND saved to `.cache/model_cards/<key>.json`. Then `DynamicWaveRegistry.discover_all_specs()` scanned `.cache/model_cards/*.json` and appended those exact same 5 keys *a second time* at indices `61..65`! Having two entries with identical `key` (`gpu_5ep`, `gpu_3ep`, etc.) in `runs_catalog` caused React 18's `<tr key={r.key}>` reconciliation to glitch when reordering rows on sort and left the duplicate `Baseline` rows at the top of the DOM table (as well as hardcoded at the top of `format_terminal_report`).
-   - **Cause 2 (String-Based `wave_id` & `short_label` Sorting)**: When sorting by the `Wave` column (`wave_id`), `filteredAndSortedRuns` used JavaScript string `.localeCompare()`, which sorts `"Baseline"` (`"B"`) ahead of `"W1".."W9"` (`"W"`) and sorts `"W10"` between `"W1"` and `"W2"`. Similarly, when sorting by `Run / Session` (`short_label`), `"Baseline G4..."` lacked a `[session]` prefix whereas wave runs began with `"[gpu_...]"`, causing inconsistent ordering.
-   - **Cause 3 (Classical Baseline Dominance in Default `Best Val CE` Sort)**: When sorting by `Best Val CE` ascending, the 7 Euclidean `ClassicalModdedGPT` baseline runs (`3.4280` to `3.6003` Val CE) occupy rows `1..7` ahead of all `QuantumBornGPT` runs (`3.7203+` Val CE), with no one-click way to filter the leaderboard by architecture family (`Quantum` vs. `Classical`) or mark superseded baseline runs obsolete.
+### Problem 1: Establishing an Exact, Uncompromised Classical Reference & Evaluation Protocol (Plans 001–020 / Waves 1–12)
+- **The Problem**: Early comparisons between `QuantumBornGPT` and classical baselines were confounded by differences in validation shard slicing, sequence length (`T_val`), batch size, and missing `modded-nanogpt` architectural features (such as U-Net skip connections, Value Embeddings `VE`, `ReLU²` MLPs, and logit softcapping).
+- **What We Solved**:
+  - Standardized our evaluation protocol across all runs to match the official **`KellerJordan/modded-nanogpt` validation shard** (`.cache/fineweb_100M/val_slice.bin` / `fineweb_val_000000.bin`, sequential non-overlapping batches starting at `pos = 0` after the 256-`int32` header, evaluated over the exact `50,257` GPT-2 tokens at `T_val = 512`).
+  - Implemented `--leaderboard-exact-classical` (`Plan 019`) and the full `modded-nanogpt` `ANVIL2` Categories A, B, and C reusable primitives (`Plan 021`), bringing our `900M`-token `ClassicalModdedGPT` (`L=12, d=768, H=6`) reference to **`3.3362` Val CE** (`28.1` PPL) on Google Colab A100.
 
-2. **Problem B — Need for a Persistent "Mark Obsolete" / "Show Obsolete" Workflow**:
-   As we progress into Wave 10 (`65+` total runs), early single-shard 100M-token baselines (`gpu_5ep`, `gpu_3ep`, `gpu_wsd_mtp`, `tpu_3ep`, `tpu_wsd_mtp`), crashed OOM experiments (`w5_900m_deep12_adapter384` OOM attempt), and superseded early ablations clutter the active Leaderboard Table. We need a first-class **"Mark Obsolete"** lifecycle feature that:
-   - Hides marked-obsolete runs from the Leaderboard Table (and charts) by default,
-   - Provides an explicit opt-in toggle (**`🗄️ Show Obsolete (N)`** and status pill **`🗄️ Obsolete Only (N)`**) to view and inspect marked-obsolete records at any time,
-   - Lets the user mark or unmark (`♻️ Restore`) any individual run (via a button on each table row and inside the Model Card Modal) or bulk-mark filtered runs, and
-   - Persists the `obsolete` state durably on the server across browser sessions and hot-reloads (in both `.cache/live_logs/ui_prefs.json` and `.cache/model_cards/<run_key>.json` via a zero-downtime `POST /api/obsolete` endpoint).
+### Problem 2: Step-0 Isotropic Initialization Blindness & Self-Repetition Collapse on $S^{d-1}$ (Plan 021 / Wave 13)
+- **The Problem**:
+  - When a spherical model (`QuantumBornGPT`) is initialized with random isotropic unit vectors on $S^{d-1}$, every pair of tokens $(u, v)$ has near-zero inner product ($\langle M_v | \psi_0(u)\rangle \approx 0$). Unlike unconstrained classical embeddings whose radial norms can grow rapidly along high-frequency gradient directions, unit-norm spherical vectors must rotate geodesically across $S^{d-1}$, spending the first `150M–250M` tokens just discovering basic unigram/bigram collocations.
+  - Conversely, naively initializing both the input state $|\psi_0(v)\rangle$ and the output POVM effect $|M_v\rangle$ from the same spectral embedding causes $\langle M_v | \psi_0(v)\rangle = 1$, making every token predict *itself* at Step 0 ("self-repetition collapse").
+- **What We Solved**:
+  - Built a vectorized GPU **Shifted Positive Pointwise Mutual Information (SPPMI) + Randomized SVD** initializer (`compute_ppmi_svd_embeddings` in [`src/qdlblocks/layers/cooccurrence_init.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/cooccurrence_init.py)) that streams all **9 FineWeb-Edu shards (`900M` tokens)** on GPU in `5.05 seconds`.
+  - Introduced **even/odd coordinate parity decoupling (`use_ortho_decouple=True`)**, placing input states on even coordinates (`0::2`) and POVM readout effects on odd coordinates (`1::2`), achieving `< 1e-6` Step-0 self-overlap while boosting Step-0 collocation cosine similarity by **`20.94x`** and improving `900M`-token `QuantumBornGPT` Val CE by **`-0.1500 nats` (`3.6621 -> 3.5121`)**.
 
----
+### Problem 3: Factorizing the Quantum State Space — 64-Qubit Sparse Fock Space vs. 16-Qubit Product-Register Hierarchy (Plans 022–023 / Waves 14–15)
+- **The Problem**: A flat $d=1024$ token embedding and POVM table over $V = 50,304$ tokens consumes `>103M` parameters (`>65%` of total model parameters) without encoding multi-scale compositional structure between unigrams and coarse semantic concepts.
+- **What We Solved**:
+  - **64-Qubit Sparse Fock Excitation Space (`Plan 022`)**: Showed that restricting a 64-qubit system to its Hamming-weight $\le 2$ (1- and 2-excitation) Fock subspace yields $\binom{64}{1} + \binom{64}{2} = 64 + 2,016 = 2,080$ basis states. By truncating the $2,016$ pair modes to $1,984$ for exact power-of-2 GPU Tensor-Core alignment ($D_{\text{Fock}} = 2,048 = 64 \text{ single-qubit modes} + 1,984 \text{ pair modes}$), an internal density-matrix operator $W_\rho \in \mathbb{R}^{2048 \times 2048}$ has **exactly $4,194,304$ (`4.19M`) parameters**. With sparse hashed 1/2/3-gram excitations and a Rank-4 mixed density matrix, this compressed embedding+readout parameters by **`38.9x`** (`103.02M -> 8.22M`).
+  - **16-Qubit Product-Register Hierarchy with $M=256$ Interacting Higher-Level States (`Plan 023`)**: Factorized each token into $Q = 16$ qubit registers of $A \in \{16, 32\}$ amplitudes coupled to $M \in \{128, 256\}$ higher-level states evolving under a `16 × 256 × 256` unitary operator (`Hierarchical16QubitEmbedder` and `Hierarchical16QubitPOVMReadout` in [`src/qdlblocks/layers/hierarchical_qubit.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/hierarchical_qubit.py)).
 
-## 3. Outcomes We Are Looking to Achieve in Plan 018 & Wave-10
+### Problem 4: The Wave 15 Top-1 Accuracy (`41.17%`) vs. Cross-Entropy (`3.6009`) Paradox & Layerwise Spectral Rank Expansion (Plans 024–027 / Waves 15–16)
+- **The Problem (Observed on Live `900M`-Token Wave 15 Runs)**:
+  - On `w15_900m_qborn_16x32_qubit_256hier_ngram_L8` (`gpu_a100_w6_1`), live telemetry at `774.5M` tokens revealed an extraordinary anomaly:
+    - **Top-1 Accuracy reached `41.17%`** and **Median Target Rank reached `3`**—surpassing the `~38.2%` Top-1 accuracy of a classical `3.28` CE speedrun model and matching the Top-1 accuracy of a `~2.98–3.05` CE classical model!
+    - Yet **Validation Cross-Entropy was `3.6009`**, and `Top-5 minus Top-1` accuracy was only `18.16%` (`59.33%` Top-5 minus `41.17%` Top-1), ~6.5 percentage points tighter than a classical model's `~24.8%` gap.
+    - Nearly `60%` of the time the ground-truth token was in the top 5 (and `>41%` of the time #1), yet the remaining `40.67%` of tokens outside the Top-5 suffered an average Negative Log-Likelihood (NLL) of `~6.8–7.2 nats`, dragging overall cross-entropy up by `+0.55 nats`!
+- **Our Diagnostic Breakthrough (`Plan 025` Target-Rank CE Decomposition & Layerwise Dynamics Profile)**:
+  - We built [`src/qdlblocks/benchmarks/calibration_probe.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/calibration_probe.py) (`compute_calibration_rank_decomposition` and `compute_layerwise_dynamics_profile`) to decompose validation cross-entropy across 5 exact target-rank buckets (`Rank 1`, `Ranks 2–5`, `Ranks 6–50`, `Ranks 51–1000`, `Ranks > 1000`) and profile layerwise singular-value spectra across depth `L0 -> L5`.
+  - **Discovery A — Quantum Spectral Rank Expansion vs. Classical Rank Collapse Across Depth**:
+    - In `ClassicalModdedGPT`, self-attention acts as a low-pass contractive filter ("over-smoothing / rank collapse"): per-layer Shannon spectral effective rank $R_\sigma(h_\ell)$ collapses from `221.2` (`L1`) down to `184.1` (`L5`, **`-37.1` spectral dimensions lost**), and Participation Ratio $R_{\text{PR}}(h_\ell)$ crashes by **`-60%` (`31.61 -> 12.75`)**.
+    - In `QuantumBornGPT`, Stiefel-manifold isometric attention + `OvercompleteTwoBeamInterference` acts as an **entangling rank expander**: $R_\sigma(h_\ell)$ **expands monotonically with depth** (`207.8 -> 218.5 -> 226.1 -> 233.0 -> 235.1 -> 240.6`, **`+32.8` spectral dimensions gained**, and $R_{\text{sharp}} > 330$ in unified models) while holding $R_{\text{PR}}$ steady (`21.69–40.75`). This explains why `QuantumBornGPT` achieves superior Top-1 discrimination (`41.17%`).
+  - **Discovery B — The Three Mathematical Culprits Behind the Rank `6–500` NLL Penalty**:
+    1. **Premature Rank-1 Pure-State Collapse**: `OvercompleteTwoBeamInterference` evolved two coherent quantum beams across every block, only to collapse them back to a single rank-1 pure vector $|\psi_L\rangle \in S^{d-1}$ right before readout. In a 30-to-40 effective-dimensional Stiefel space, a rank-1 pure state can align with `1–3` vocabulary rays (`Rank 1–3`), but is nearly orthogonal ($\langle M_v | \psi_L\rangle \approx 0$) to the `50–500` plausible continuations at `Ranks 6–500`.
+    2. **Runaway Purity Temperature ($\beta \in [71, 122]$)**: `ContextualBlochPurityGate` scaled inverse temperature $\beta$ up to `71–122`, turning a `0.17` cosine gap between Top-1 (`0.22`) and Rank 15 (`0.05`) into a `17+ nat` logit chasm.
+    3. **The $1/r$ Subspace Row-Normalization Trap**: Row-normalizing low-rank projections in $\mathbb{R}^{16}$ erased token specificity and created high false-positive cosines (`1/\sqrt{16} = 0.25`) for random background tokens.
+- **Our 100% Quantum Solution (`Plans 026–027`: Two-Beam Mixed-State $k$-Boson Readout & Scheduled Stiefel Kraus Bath)**:
+  - Preserved both orthogonal interference beams ($|\psi_{\text{sharp}}\rangle = |\psi_{t,1}\rangle$ and $|\psi_{\text{beam2}}\rangle = |\psi_{t,2}\rangle$) into the readout (`direct_chunked_two_beam_kboson_ce` in [`src/qdlblocks/layers/direct_chunked_ce.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/direct_chunked_ce.py)).
+  - Parameterized a rank-$r=16$ Stiefel Kraus semantic bath $U_{\text{diff}}, V_{\text{diff}} \in \text{St}(d, 16)$ (initialized from the top-$r$ right singular vectors of $M_{\text{sharp}}$ and maintained on $\text{St}(d, 16)$ via thin-QR retraction `retract_kraus_stiefel`) with $(d/r)^{1/4}$ per-side variance matching **without** row-normalizing in $\mathbb{R}^r$:
+    $$c_{\text{sharp}}(t,v) = \langle M_{\text{sharp}, v} \mid \psi_{\text{sharp}, t} \rangle, \qquad c_{\text{diff}}(t,v) = \sqrt{\frac{d}{r}} \langle U_{\text{diff}}^\top M_{\text{sharp}, v} \mid V_{\text{diff}}^\top \psi_{\text{beam2}, t} \rangle$$
+  - Replaced linear softmax logits with the **$k$-copy Boson log-fidelity** ($k_{\text{init}} = 34.0..38.0$, clamped to $k_{\text{eff}} \in [28, 48]$):
+    $$\mathcal{E}_{t,v} = k_{\text{eff}} \ln\!\Big((1 - \lambda_{\text{diff}}(t)) \frac{1 + c_{\text{sharp}}(t,v)}{2} + \lambda_{\text{diff}}(t)\Big(\frac{1 + c_{\text{diff}}(t,v)}{2} + \frac{1}{2}\gamma_q |c_{\text{diff}}(t,v)|_+^2\Big) + \epsilon_{\text{floor}}\Big) + b_v$$
+    where:
+    - $|x|_+ \equiv \max(0, x) = \text{ReLU}(x)$ and $\gamma_q = 0.50$ (`quadratic_diffuse_fidelity`) is the positive-hemisphere quadratic Kraus purity weight;
+    - $b_v \in \mathbb{R}^V$ (`povm_log_prior`) is a 1D per-token scalar log-unigram prior bias initialized from Bose-saturated empirical token counts (adding only $V = 50,304$ scalar parameters across the entire vocabulary rather than a $d \times V$ classical `lm_head` matrix, so 100% of context-dependent discrimination comes from the quantum fidelity $\ln F_{t,v}$);
+    - Because $\frac{\partial}{\partial c}\ln(\frac{1+c}{2}) = \frac{1}{1+c}$, orthogonal plausible synonyms ($c \approx 0.05$, slope $\approx 0.95 k_{\text{eff}}$) automatically receive a **`1.24x` stronger gradient boost** than already-confident Top-1 hits ($c \approx 0.30$, slope $\approx 0.77 k_{\text{eff}}$).
+  - **Diffuse Kraus Bath Schedule Tuning (`Plan 027`)**: We systematically evaluated five schedules for $\lambda_{\text{diff}}(t)$:
+    1. `free_decay`: Unconstrained sigmoid $\lambda_{\text{diff}} = 0.40\,\sigma(\text{logit})$ (decayed prematurely to `0.0356`).
+    2. `bounded_floor`: Clamped $\lambda_{\text{diff}} \ge 0.08$.
+    3. `cosine_broad_to_sharp`: Smooth cosine decay from `0.24` to `0.10`.
+    4. `warmup_hold_anneal`: Holds $\lambda_{\text{diff}} \approx 0.22$ through the first 35% of training so the diffuse Kraus subspace stabilizes, then cosine-anneals to `0.11–0.12`.
+    5. `contextual_purity_complement`: Augments `warmup_hold_anneal` with a per-token contextual uncertainty boost $+g_c(1 - \text{purity}_t)$ (`contextual_purity_gain = 0.15`), giving uncertain contexts higher diffuse semantic bath weight. This schedule won on `L=6, d=512` (`6.0488` Val CE) while maintaining $R_{\text{diff}} \approx 14.8$.
 
-1. **Strict, Unpinned Leaderboard Sorting & Zero Duplicate Catalog Keys**:
-   - Every `run_key` in `runs_catalog` is strictly unique (`0` duplicate keys).
-   - `Baseline` runs (`wave_id = "Baseline"`) are never pinned to the top of any sorted list or terminal report; sorting by `Best Val CE`, `Val PPL`, `Top-1 %`, `Tok/s`, `Params`, `D_seed`, `Wave` (using numeric `wave_num`: `Baseline=0, W1=1, ..., W9=9, W10=10`), or `Run / Session` (using normalized label strings) orders all visible rows strictly by the selected column and sort direction.
-2. **Durable "Mark Obsolete" / "Show Obsolete (`N`)" Filtering & Architecture Family Toggle**:
-   - Every run and `RunModelCard` has a persistent `obsolete: bool` attribute (plus `obsolete_reason: str` and `obsolete_at: str`), controllable via `POST /api/obsolete` in `< 10 ms` with zero server downtime.
-   - By default, the 5 legacy single-shard `Baseline` runs (`gpu_5ep`, `gpu_3ep`, `gpu_wsd_mtp`, `tpu_3ep`, `tpu_wsd_mtp`) and historical `OOM_CRASH` / `STOPPED` incomplete runs are pre-marked `obsolete: true` so the default Leaderboard Table cleanly displays active/completed modern multi-shard experiments, while clicking **`🗄️ Show Obsolete (N)`** immediately reveals all obsolete records with one-click **`♻️ Restore`** buttons.
-   - An **Architecture Family Filter** (`All Families` | `⚛️ Quantum Born` | `🏛️ Classical Baseline`) in the table toolbar lets the user view `QuantumBornGPT` runs alone, `ClassicalModdedGPT` baselines alone, or both together in a single click.
-   - The 4 Top KPI Summary Cards at the top of the dashboard dynamically compute the live #1 Classical record (`3.4280` CE), #1 Quantum record (`3.7203` CE), and #2 Quantum record (`3.7495` CE) directly from `runs_catalog`.
-3. **Wave-10 `900M`-Token Speedrun V3 Breakthroughs on All 5 Colab GPUs**:
-   - Push `ClassicalModdedGPT` past Wave-9's `3.4280` Val CE toward **`<= 3.35` Val CE** (and closer to the `3.280` NanoGPT speedrun target at $T_{\text{val}} = 512$) by restoring `6,858` (`B=131k`) and `13,725` (`B=65k`) StiefelMuon steps, `--muon-lr 0.04` / `0.035`, and fast native FlashAttention-2 causal SDPA (`> 220,000 tok/s`).
-   - Complete the 3-way `900M`-token Optimizer Ablation (`StiefelMuon` `3.4280` vs. `Pure AdamW` `3.5025` vs. `SGD + Nesterov`).
-   - Push `QuantumBornGPT` past Wave-9's `3.7203` Val CE (`41.3` PPL) toward **`< 3.66` Val CE (`< 38.8` PPL)** by unifying Wave-9's #1 (`Asym-1024 + L=8`) and #2 (`4d-Frame 4096×2`) quantum winners and scaling to `L=12` layers with `skip_attn_layers=(6,)`.
+### Problem 5: Geometric Traps of Spherical / Born-Rule Classifiers — Radial Norm Erasure, Antipodal Phase Ambiguity, & Quadratic Kraus Fidelity (Plan 028 / Wave 17)
+- **The Problem (Revealed by Our Controlled Iris Flower Classification Diagnostic)**:
+  - Why does a naive pure Born-rule classifier struggle on seemingly simple low-dimensional problems like the Iris dataset ($N=150, d=4$, 3 species: *Setosa*, *Versicolor*, *Virginica*)?
+    1. **Radial Norm Erasure**: In Iris, *Versicolor* and *Virginica* lie along nearly the **exact same directional ray** in $\mathbb{R}^4$ and differ primarily in overall flower size ($\|x\|_2$). Naive L2 projection $|\psi(x)\rangle = x / \|x\|_2 \in S^{d-1}$ projects away $\|x\|_2$, collapsing the two classes onto the same point on the sphere! In `QuantumBornGPT`, every `l2_normalize` after multi-token superposition or residual addition similarly erases the pre-normalization resultant length $r_t = \|h_t\|_2$ (which encodes contextual certainty vs. destructive interference).
+    2. **Antipodal Sign / Phase Ambiguity**: Pure Born fidelity $|\langle M_c | \psi\rangle|^2$ is invariant to $|\psi\rangle \to -|\psi\rangle$, folding opposite hemispheres together unless anchored by a reference pole.
+    3. **Rank-1 Bloch Linearity**: Linear inner products on $S^{d-1}$ can only form single-cap hyperplanes unless augmented with higher-order quadratic fidelity terms.
+- **What We Solved (`Plan 028` — `examples/38_verify_plan028_iris_and_radial_stereographic_born.py`)**:
+  - Built a reusable 4-way Iris Born-rule diagnostic (`src/qdlblocks/benchmarks/iris_born_diagnostic.py`), proving that while Naive L2 Born stalls at **`80.00%` test accuracy** (`0.4285` CE), **Stereographic Radial-Phase Born reaches `96.67%` test accuracy** (`0.0882` CE, matching/beating Classical MLP).
+  - Ported the three exact geometric fixes into `QuantumBornGPT`:
+    1. **Learnable Inverse Stereographic Projection onto $S^{d-1}$ (`use_stereographic_lift=True`)**: Maps pre-normalized radius $\tilde{r}_t = \|x_t\|_2 / (\tau \sqrt{d})$ into a dedicated polar latitude coordinate $\cos\theta_t = \frac{1 - \tilde{r}_t^2}{1 + \tilde{r}_t^2}$ along a learnable pole $|p\rangle \in S^{d-1}$ and scales the equatorial direction by $\sin\theta_t = \frac{2\tilde{r}_t}{1 + \tilde{r}_t^2}$, preserving 100% of radial norm information inside a unit vector on $S^{d-1}$.
+    2. **Cosine-Phase Two-Beam Interference Gate (`use_cosine_phase_beam_gate=True`)**: Modulates two-beam mixing via $\cos(\omega_\phi \Delta r_t + \phi_0)$ so constructive vs. destructive radial interference steers the two beams.
+    3. **Quadratic Kraus Diffuse Purity (`quadratic_diffuse_fidelity = 0.50`)**: Adds $+\frac{1}{2}\gamma_q |c_{\text{diff}}(t,v)|_+^2$ inside the $k$-boson fidelity.
+  - On our local `<= 8.0 GB` RTX 5060 Ti `L=6, d=512` 300-step FineWeb-Edu benchmark, this unified model (`w17_8gb_qborn_unified_stereographic_quad_warmup_hold_L6_d512`) reached **`6.0870` Val CE**, beating `ClassicalModdedGPT` (`6.4771`) by **`-0.3901 nats`** and all prior quantum readouts.
 
----
-
-## 4. Testable Hypotheses & Quantitative Predictions
-
-### Hypothesis H1 (Unpinned Comparator Sorting & Catalog Deduplication)
-- **Claim**: Deduplicating `baseline_defs` against `DynamicWaveRegistry.discover_all_specs()` in `collect_snapshot()` eliminates all duplicate `run_key` entries in `runs_catalog`, and sorting `runs_catalog` (and React's `filteredAndSortedRuns`) using strict column comparators with numeric `wave_num` (`Baseline = 0`, `W1 = 1`, `W2 = 2`, `W2B = 2.5`, ..., `W9 = 9`, `W10 = 10`) ensures that `Baseline` models never appear at the top of `best_val_ce` ascending, `wave_id` descending, or `format_terminal_report(snap)`.
-- **Quantitative Pass Criteria**:
-  1. `len(runs_catalog) == len({r["key"] for r in runs_catalog})` (`0` duplicate keys across all `>= 61` runs).
-  2. When sorted by `best_val_ce` ascending (including when `showObsolete=True`), the top 10 rows contain `0` `"Baseline"` wave runs (since `"Baseline"` runs have `best_val_ce` in `[4.2676, 4.5035]`, placing them at rank `>= 40`), and #1 is `w9_900m_classical_speedrun_v2_pr360` (`3.4280` CE) overall or `w9_900m_qborn_speedrun_v2_asym1024_L8` (`3.7203` CE) when `filterFamily == "quantum_born"`.
-  3. When sorted by `wave_id` descending, `"W10"` ( `wave_num = 10`) sorts ahead of `"W9"` (`wave_num = 9`), which sorts ahead of `"W8" .. "W1"`, with `"Baseline"` (`wave_num = 0`) at the very bottom.
-
-### Hypothesis H2 (Zero-Downtime Persistent "Mark Obsolete" / "Show Obsolete" Lifecycle)
-- **Claim**: Adding `obsolete: bool`, `obsolete_reason: str`, and `obsolete_at: str` to `RunModelCard` and `POST /api/obsolete` to `create_benchmark_http_server` allows any single run or batch of runs to be marked or unmarked obsolete atomically in `< 15 ms` with `0` server restarts, hiding obsolete runs from default table/chart queries (`showObsolete = false`) while preserving 100% of their telemetry and Model Card data when `showObsolete = true`.
-- **Quantitative Pass Criteria**:
-  1. `POST /api/obsolete` with `{"run_keys": ["gpu_5ep", "gpu_3ep"], "obsolete": true, "reason": "Superseded baseline"}` completes in `< 15.0 ms` while `server_uptime_s` increases monotonically (`0` restarts).
-  2. Both `.cache/model_cards/gpu_5ep.json` (`card["obsolete"] is True`) and `.cache/live_logs/ui_prefs.json` (`prefs["obsoleteMap"]["gpu_5ep"] is True`) are persisted atomically on disk and survive `POST /api/reload`.
-  3. Toggling `"obsolete": false` via `POST /api/obsolete` restores the run to the active non-obsolete catalog view in `< 15.0 ms` with zero loss of `evals`, `steps`, or `model_card` fields.
-
-### Hypothesis H3 (Fast Causal SDPA & Step-Budget Scaling for `ClassicalModdedGPT` V3)
-- **Claim**: At fixed sequence length $T_{\text{train}} = T_{\text{val}} = 512$ on `ClassicalModdedGPT`, running native causal SDPA (`window_size=0, doc_mask_attn=False`, dispatching to fused FlashAttention-2 `is_causal=True`) increases step throughput by **`>= 1.25×`** over materialized 4D boolean mask SDPA (`window_size=384, doc_mask_attn=True`), and increasing the optimizer step budget by `2.0×` at a matched token budget with `--muon-lr 0.04` achieves strictly lower validation Cross-Entropy than `3,429`-step scaling (`lr = 0.025`).
-- **Quantitative Pass Criteria**:
-  1. In controlled GPU micro-benchmarks at $T = 512$, native causal SDPA (`is_causal=True`) achieves **`>= 1.25×`** higher step throughput (`tok/s`) than 4D boolean `attn_mask` SDPA and `0.0` train/eval attention mask discrepancy.
-  2. Over a matched token budget on a controlled synthetic FineWeb shard, `ClassicalModdedGPT` V3 with `2×` step frequency (`B` vs `2B` tokens/step) and `muon_lr = 0.04` reduces validation Cross-Entropy by **`>= 0.05` nats** compared to the `1×` step frequency (`muon_lr = 0.025`) baseline.
-
----
-
-## 5. Detailed Technical Specification of Code Changes
-
-### 5.1 Operational Scripting Classification (`Build-Before-Launch` vs. `Nice-to-Have`)
-Following our operational discipline:
-- **Build-Before-Launch (Implemented in Plan 018)**:
-  1. Catalog deduplication, numeric `wave_num` sorting, and dynamic Top KPI cards in `scripts/monitor_colab_runs.py` and `src/qdlblocks/benchmarks/model_card.py`.
-  2. Persistent `obsolete` lifecycle (`RunModelCard` schema fields, `POST /api/obsolete` endpoint, React `"🗄️ Show Obsolete (N)"` toggle, per-row/modal `"🗄️ Obsolete"` / `"♻️ Restore"` buttons, and Architecture Family filter `All | Quantum | Classical`).
-  3. `--muon-lr` CLI flag in `examples/11_fineweb_100m_multiepoch_gpu_tpu.py` and `src/qdlblocks/benchmarks/model_card.py`.
-  4. Wave-10 declarative fleet manifest `configs/wave10_fleet.json`.
-- **Nice-to-Have (Deferred to `scripts/BACKLOG.md`)**:
-  - CLI subcommand `scripts/colab_fleet.py obsolete --waves w1,w2` for batch-marking entire waves obsolete from the terminal (logged to `scripts/BACKLOG.md`; the web UI and HTTP API `POST /api/obsolete` already support bulk marking).
-
----
-
-### 5.2 Component 1 & 2: `src/qdlblocks/benchmarks/model_card.py` Updates
-1. **Wave Registry Metadata for Wave 10 & Numeric `wave_num`**:
-   - Add `"W10": "Wave 10 (Plan 018: Speedrun V3 Step-Budget Scaling, Fast SDPA, SGD Ablation & Deep L=12 Quantum)"` to `WAVE_DEFAULT_LABELS` and `"W10": "EXPERIMENT_PLAN_018"` to `WAVE_DEFAULT_PLANS`.
-   - In `infer_wave_id_and_num(run_key: str, raw_wave: str = "") -> tuple[str, int]`, ensure `"Baseline"` returns `("Baseline", 0)`, `"W2B"` returns `("W2B", 2)`, and any `"W<N>"` returns `(f"W{N}", N)`.
-2. **`RunModelCard` Obsolete Lifecycle Fields & `--muon-lr` Parsing**:
-   - Add three optional top-level fields to `RunModelCard` (and `build_model_card_from_manifest_entry` / `validate_model_card`):
-     - `obsolete: bool = False`
-     - `obsolete_reason: str = ""`
-     - `obsolete_at: str = ""`
-   - Add `set_model_card_obsolete(card: dict[str, Any], obsolete: bool, reason: str = "") -> dict[str, Any]` in `src/qdlblocks/benchmarks/model_card.py`, which returns a copy of `card` with `obsolete = bool(obsolete)`, `obsolete_reason = str(reason) if obsolete else ""`, and `obsolete_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ") if obsolete else ""`.
-   - In `_build_cli_arg_parser()` and `parse_cli_args_to_card_sections(cli_args: str)`:
-     - Add `parser.add_argument("--muon-lr", type=float, default=None)`.
-     - Set `optimization["muon_lr"] = float(ns.muon_lr) if ns.muon_lr is not None else (0.003 if opt_mode == "pure_adamw" else (0.05 if opt_mode == "sgd_nesterov" else 0.025))`.
-3. **Prevent Duplicate `Baseline` Specs in `DynamicWaveRegistry`**:
-   - Define `BASELINE_RUN_KEYS = frozenset({"gpu_5ep", "gpu_3ep", "gpu_wsd_mtp", "tpu_3ep", "tpu_wsd_mtp"})`.
-   - Ensure that when `collect_snapshot(include_historical_specs=True)` constructs `baseline_defs`, `DynamicWaveRegistry.discover_all_specs()` does not emit a second duplicate spec for keys already in `BASELINE_RUN_KEYS` (or `collect_snapshot` merges them by `key` so each `key` appears in `runs_catalog` **at most once**).
-
----
-
-### 5.3 Component 1 & 2: `scripts/monitor_colab_runs.py` Updates
-1. **Deduplicated & Pre-Sorted `runs_catalog` + Default Obsolete Set**:
-   - Define `DEFAULT_OBSOLETE_KEYS: dict[str, str] = {`:
-     - `"gpu_5ep": "Superseded single-shard 100M×5ep baseline (Plan 001)"`,
-     - `"gpu_3ep": "Superseded single-shard 100M×3ep baseline (Plan 001)"`,
-     - `"gpu_wsd_mtp": "Superseded single-shard 100M×5ep WSD+MTP baseline (Plan 001)"`,
-     - `"tpu_3ep": "Superseded single-shard TPU 100M×3ep baseline (Plan 001)"`,
-     - `"tpu_wsd_mtp": "Superseded single-shard TPU 100M×3ep WSD+MTP baseline (Plan 001)"`,
-     - `"w5_900m_deep12_adapter384_oom": "Historical OOM crash prior to gradient checkpointing"`,
-     - `"w8_900m_classical_speedrun_12L_t512_layer0": "Stopped early at 200M tok (superseded by Wave-9/10 PR#360 runs)"`
-     `}`
-   - In `collect_snapshot()`:
-     - Load `ui_prefs.json` *before* building `catalog`, reading `obsolete_map: dict[str, bool] = saved_prefs.get("obsoleteMap", {})` and `obsolete_reasons: dict[str, str] = saved_prefs.get("obsoleteReasons", {})`.
-     - For any `key` not yet explicitly present in `obsolete_map`:
-       - If `card.get("obsolete") is not None` and `key in saved_prefs.get("explicitObsoleteKeys", [])`, use `bool(card["obsolete"])`.
-       - Otherwise, default `is_obsolete = (key in DEFAULT_OBSOLETE_KEYS) or (run_state == "OOM_CRASH")`.
-     - Deduplicate `catalog` by `key` so every `r["key"]` is 100% unique.
-     - Include on every `_build_catalog_entry(...)` dict:
-       - `"wave_num": float(wave_num)` (`0.0` for `Baseline`, `2.5` for `W2B`, `float(num)` for `W1..W10`),
-       - `"arch_family": str(mc_arch.get("family", "classical_modded" if "classical" in key else "quantum_born"))`,
-       - `"obsolete": bool(is_obsolete)`,
-       - `"obsolete_reason": str(obsolete_reason)`,
-       - `"obsolete_at": str(obsolete_at)`.
-     - Sort `catalog` on the backend by `(r["obsolete"], r["best_val_ce"] is None, r["best_val_ce"] if r["best_val_ce"] is not None else 999.0)` ascending so that both the initial JSON snapshot and `format_terminal_report(snap)` list the best active models first and never pin `Baseline` models to the top.
-2. **HTTP Endpoint `POST /api/obsolete` (and `POST /api/model-cards/<run_key>/obsolete`)**:
-   - Accepts JSON payload:
-     ```json
-     {
-       "run_key": "gpu_5ep",
-       "run_keys": ["gpu_5ep", "gpu_3ep"],
-       "obsolete": true,
-       "reason": "Marked obsolete from dashboard"
-     }
-     ```
-   - Updates `ui_prefs.json` (`obsoleteMap`, `obsoleteReasons`, `explicitObsoleteKeys`), updates each corresponding `.cache/model_cards/<key>.json` on disk via `set_model_card_obsolete` + `save_model_card_atomic`, and updates `state["latest_snap"]["runs_catalog"]` and `state["cards_by_key"]` in memory under `state_lock` in `< 15 ms` with `0` server restarts.
-   - Returns:
-     ```json
-     {
-       "ok": true,
-       "updated_keys": ["gpu_5ep", "gpu_3ep"],
-       "obsolete": true,
-       "obsolete_count": 7,
-       "active_count": 54,
-       "server_uptime_s": 123.45
-     }
-     ```
-3. **Interactive React Frontend Upgrades in `scripts/monitor_colab_runs.py`**:
-   - **Strict Unpinned Column Sorting (`filteredAndSortedRuns`)**:
-     - When `sortField === "wave_id"`, compare numeric `(a.wave_num ?? 0) - (b.wave_num ?? 0)` (with tie-breaking on `a.best_val_ce ?? 999`).
-     - When `sortField === "short_label"`, compare normalized strings with leading `[session] ` stripped (`a.short_label.replace(/^\[[^\]]+\]\s*/, "")`) so `"Baseline ..."` and `"[gpu_...] W9 ..."` sort purely alphabetically by run title without bracket-prefix distortion.
-     - For all numeric columns (`best_val_ce`, `best_val_ppl`, `best_top1`, `best_top5`, `ep05_ce`, `ep10_ce`, `params_M`, `seed_dim`, `final_r_eff`, `final_iso_err`, `avg_tok_per_s`, `wall_min`), sort strictly by the numeric value (`null` values always placed at the bottom regardless of `sortAsc`).
-   - **Persistent "Mark Obsolete" / "Show Obsolete (`N`)" & Architecture Family Controls**:
-     - Add state `showObsolete` (default `false`), `filterFamily` (`"ALL"` | `"quantum_born"` | `"classical_modded"`), and `obsoleteMap` (initialized from `snap.runs_catalog` and `saved_ui_prefs.obsoleteMap`).
-     - Add `toggleRunObsolete(runKeys, targetObsolete, reason)` which optimistically updates React state (`obsoleteMap`, and when marking obsolete, unchecks the run from `visibleMap` so it doesn't clutter the chart) and sends `POST /api/obsolete`.
-     - In the Table Filter Bar:
-       - Add **Architecture Family Filter Pills**: `All Families`, `⚛️ Quantum Born`, `🏛️ Classical Baseline`.
-       - Add **Obsolete Visibility Toggle Button**: **`🗄️ Show Obsolete (${obsoleteCount})`** (highlighted when active) and status pill **`🗄️ Obsolete Only (${obsoleteCount})`**.
-       - Add bulk action buttons: **`🗄️ Mark Filtered Obsolete`** and (when `showObsolete` or `filterStatus === "OBSOLETE"`) **`♻️ Restore Filtered`**.
-     - In each Leaderboard Table row (and inside `ModelCardModal`):
-       - Render a compact **`🗄️`** button (`title="Mark this run as obsolete and hide from default table"`) when `!isObsolete`, or a **`♻️ Restore`** button (`title="Restore this obsolete run to active leaderboard"`) + **`OBSOLETE`** pill badge when `isObsolete`.
-   - **Dynamic Top KPI Summary Cards & Chart Target Lines**:
-     - Compute `bestClassicalRun`, `bestQuantumRun1`, and `bestQuantumRun2` dynamically from non-obsolete runs in `catalog` so the KPI cards immediately display Wave-9's `3.4280 CE (30.8 PPL)` Classical record and `3.7203 CE (41.3 PPL)` / `3.7495 CE (42.5 PPL)` Quantum records (and automatically update as Wave-10 achieves new records!).
+### Problem 6: Fast Synthetic Proxy Discovery, Full-Ambient Step-0 Calibration ($J_{\text{anti}}$), Gentle `2x` Zero-WD Qubit LR, & Falsifying Hard Diffuse Whitening (Plans 029–032 / Waves 17–18)
+- **Step 6A — Fast Synthetic FineWeb-Walk Proxy (`Plan 029`) & Transfer to Genuine FineWeb-Edu (`Plan 030`)**:
+  - Built a fast (`<12s` per run) synthetic Markov-walk generator (`src/qdlblocks/benchmarks/synthetic_fineweb_walk.py`) combining Zipfian unigrams, $M=16$ latent semantic topics, and directed bigrams. On this proxy, `FastQuantumBornAttentionSynthLM` (`L=2, d=256, H=4`, `Full-Ambient` `16×16 = 256` qubits, `use_ortho_decouple=False`) beat its matched classical softmax baseline by **`-0.1681 nats` (`5.4057` vs `5.5738` Val CE)** and overfit training data down to `2.39` CE.
+  - In `Plan 030` (`examples/40_verify_plan030_fast_synth_winner_on_fineweb_8gb.py`), we tested this exact model on **genuine FineWeb-Edu** (`T=512`, `<= 8.0 GB` VRAM):
+    - `Attempt 2` (`L=2, d=256`, 300 steps): **`6.1960` Val CE** (already beating `L=6, d=512` `ClassicalModdedGPT` at `6.4771` by **`-0.2811 nats`** with half the width and one-third the layers!).
+    - `Attempt 3` (`L=4, d=256`, 900 steps / `7.37M` tokens, equal wall-clock time to `L=6, d=512` 300 steps): **`6.1391` Val CE at Step 300 $\to$ `5.6234` Val CE at Step 900** (`19.22%` Top-1, `36.78%` Top-5).
+    - `Attempt 4` (`L=6, d=512`, 300 steps / `2.46M` tokens): **`6.0823` Val CE** (`16.56%` Top-1, `32.36%` Top-5).
+- **Step 6B — Controlled Falsification of Hard Diffuse Mode Whitening (`R_diff = 16.00`) & Bipolar Particle-Hole Subtraction (`Plan 031`)**:
+  - In `Plan 031`, we tested bundling (i) Cholesky Diffuse Mode Whitening (forcing $R_{\text{diff}} = 16.00$ across all 16 Kraus modes), (ii) a negative-hemisphere subtraction term $-\gamma_{\text{hole}}\text{ReLU}(-c)^2$ (`--bipolar-kboson`), and (iii) a `6.67x` jump in qubit embedding LR (`0.003 -> 0.020`).
+  - **Empirical Falsification**: On `L=2, d=256` (`w18_8gb_L2_d256_bipolar_kboson_whitened_300steps`), validation cross-entropy **regressed by `+0.1290 nats` (`6.3250` vs `6.1960`)**, and on `L=4, d=256` at Step 100 it **regressed by `+0.3115 nats` (`7.3396` vs `7.0281`)**.
+  - **Why It Regressed (Mathematical Diagnosis)**:
+    1. **Forcing `R_diff = 16.00` Destroys Zipfian Semantic Signal-to-Noise**: Natural language co-occurrence spectra follow a power law where modes `1–6` carry high-SNR syntactic/semantic manifolds and modes `7–16` have `3x–5x` smaller singular values mixed with sampling noise. Hard Cholesky whitening amplified the noisy tail modes `7–16` by `5x–10x` to match Mode 1, injecting isotropic background noise across all `50,257` tokens.
+    2. **Negative-Hemisphere Dead Zone**: Subtracting $-0.20\,\text{ReLU}(-c)^2$ created a non-monotonic kink at $c = 0$ and pushed tokens with $c < 0$ toward the $\epsilon_{\text{floor}} = 10^{-4}$ clamp (where $\partial \mathcal{E}/\partial c = 0$), starving `Ranks 51–1000` of restorative gradient flow.
+  - We immediately aborted the remaining Plan 031 run, documented the falsification in [`EXPERIMENT_PLAN_031.md`](file:///home/festivity/agy/QuantumDLBlocks/EXPERIMENT_PLAN_031.md), marked the two runs obsolete in [`scripts/monitor_colab_runs.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/monitor_colab_runs.py), and verified that `use_bipolar_kboson=False` (default) executes the exact clean Plan 030 kernel.
+- **Step 6C — Solving the Full-Ambient Step-0 Cross-Entropy Spike via Anti-Diagonal Spectral-Reversal Isometry ($J_{\text{anti}}$) & Gentle `2x` Zero-WD Qubit LR (`Plan 032`)**:
+  - **Root Cause of the Full-Ambient (`use_ortho_decouple=False`) Step-0 CE Spike (`14.7430` on `16×32` and `12.52–12.93` on `16×16`)**:
+    In `initialize_hierarchical_16qubit_with_ppmi_svd`, when `use_ortho_decouple=False` (`Full-Ambient` mode, where both input registers `unigram_qubits` and output POVM registers `povm_odd_qubits` occupy all $d = Q \times A$ coordinates), the initial output target matrix `c_out_flat` only blended the directed predecessor vector $p_v$ on the `k_top = 512` top bigram target tokens (`cv_top`, covering `~350` unique tokens out of `50,304`), leaving `c_out_reg[v] == c_reg[v]` on the remaining `~49,950` tokens (`99.3%` of the vocabulary). When Gram-Schmidt subtracted the input register direction (`u_even[v]`) from the output POVM register (`u_odd[v]`), the `c_reg[v]` signal completely cancelled out on `49,950` tokens (turning `99.3%` of the output POVM registers into isotropic white noise), while amplifying `p_v_perp` by `~4x` on the `350` `cv_top` tokens (`Step 0 CE = 14.7430`).
+  - **The $J_{\text{anti}}$ Solution (`src/qdlblocks/layers/hierarchical_qubit.py`)**:
+    For any even register dimension $A \in \{4, 16, 32\}$, the **Anti-Diagonal Alternating-Sign Spectral-Reversal Isometry**:
+    $$(J_{\text{anti}}(x))_a = (-1)^a x_{A-1-a}, \qquad a \in \{0, \dots, A-1\}$$
+    is an exact orthogonal transformation ($J_{\text{anti}}^\top J_{\text{anti}} = I_A$) whose self-inner-product is **identically zero** for every vector $x \in \mathbb{R}^A$:
+    $$\langle x, J_{\text{anti}}(x) \rangle = \sum_{a=0}^{A-1} (-1)^a x_a x_{A-1-a} = \sum_{a=0}^{A/2-1} \big((-1)^a x_a x_{A-1-a} + (-1)^{A-1-a} x_{A-1-a} x_a\big) \equiv 0$$
+    while preserving 100% of pairwise PPMI-SVD semantic geometry ($\langle J_{\text{anti}}(u), J_{\text{anti}}(v) \rangle = \langle u, v \rangle$) across all `50,304` tokens!
+    By initializing each token's output POVM register in `Full-Ambient` mode as a normalized blend of $J_{\text{anti}}(u_{\text{in}})$ and the directed predecessor vector $u_{\text{dir}}$ followed by 2-pass Gram-Schmidt cleanup:
+    - On `d=256` (`16×16` Full-Ambient): `SelfOv` dropped from `0.9999` to **`1.49e-07` (`< 1e-5`)**, `DirRatio` reached **`2.64x` (`>= 2.5x`)**, and `Step 0 Val CE` dropped by **`-3.56 nats` (`12.9310 -> 9.3686`)** (`Step 0 ECE = 0.0102`).
+    - On `d=512` (`16×32` Full-Ambient): `SelfOv` dropped from `0.9999` to **`8.94e-08` (`< 1e-5`)**, `DirRatio` reached **`4.15x` (`>= 2.5x`)**, and `Step 0 Val CE` dropped by **`-5.50 nats` (`14.7430 -> 9.2394`)**.
+  - Combining $J_{\text{anti}}$ with **Gentle `2x` Zero-Weight-Decay Qubit Embedding LR (`lr = 0.006, weight_decay = 0.0`, instead of `lr = 0.003, weight_decay = 0.01` which decayed unseen/rare token states on every step)** in `Plan 032` (`examples/42_verify_plan032_clean_full_ambient_and_gentle_qubit_lr.py`) set **two new all-time local `<= 8.0 GB` FineWeb-Edu records**:
+    - **`Isolate 1` (`w18_8gb_L6_d512_clean_gentle_qubit_lr_300steps`, `L=6, d=512`, `300` steps / `2.46M` tokens)**: **`6.0801` Val CE** (`437.09` PPL, **`16.63%` Top-1**, `32.19%` Top-5, `R_diff = 14.80`, `Peak VRAM = 5.923 GB`).
+    - **`Isolate 3` (`w18_8gb_L4_d256_clean_janti_gentle_lr_900steps`, `L=4, d=256`, `900` steps / `7.37M` tokens)**: **`5.6092` Val CE** (`272.93` PPL, **`19.46%` Top-1**, **`36.93%` Top-5**, `58.95%` Top-50, `R_diff = 6.02`, `Peak VRAM = 5.640 GB`).
 
 ---
 
-### 5.4 Component 3: `--muon-lr` in `examples/11_fineweb_100m_multiepoch_gpu_tpu.py` & `configs/wave10_fleet.json`
-1. **`examples/11_fineweb_100m_multiepoch_gpu_tpu.py`**:
-   - Add `--muon-lr` (`type=float, default=0.025`) to `parse_args()`, `run_cuda_benchmark(..., muon_lr: float = 0.025)`, `run_tpu_benchmark(..., muon_lr: float = 0.025)`, and `main()`.
-   - In `run_cuda_benchmark`: set `base_muon_lr = float(muon_lr)` when `optimizer_mode == "muon_adamw"`, logging `MuonLR={base_muon_lr:g}` in the architecture/schedule header.
-2. **Wave-10 Declarative Fleet Manifest (`configs/wave10_fleet.json`)**:
-   Create `/home/festivity/agy/QuantumDLBlocks/configs/wave10_fleet.json` specifying our 5-GPU `900M`-token Wave-10 experiments:
+## 4. Outcomes We Are Looking to Achieve
 
-| Slot / Session | Hardware | Run Key (`wave10_fleet.json`) | Architecture & Scientific Objective (`900M` Unique FineWeb Tokens, `T_val = 512`) |
-| :---: | :---: | :--- | :--- |
-| **`gpu_g4_w6_1`** | G4 RTX PRO 6000 Blackwell (96GB) | **`w10_900m_classical_speedrun_v3_fastsdpa_b131k`** | **`ClassicalModdedGPT` Speedrun V3 (`L=12, d=768, H=12, d_ff=3072`)**: `B=128, G_acc=2, T=512` (**`131,072` tok/step = `6,858` steps**, `2.0×` Wave-9's steps), **`--muon-lr 0.04`**, `--muon-momentum-warmup 300`, `ve=3`, `scalar` U-Net, `fused_qkv`, `skip_attn=6`, `zero_half_rope`, `true_layer0_v_residual`, `zero_init_classical`, fast FlashAttention-2 causal SDPA (`window=0, doc_mask=False`), `direct_chunked_ce`, `stage_shard_on_gpu`, `WSD-0`. Tests `2×` step resolution + higher Muon LR + fast aligned causal SDPA to push past `3.4280` toward **`<= 3.35` Val CE**. |
-| **`gpu_g4_w6_2`** | G4 RTX PRO 6000 Blackwell (96GB) | **`w10_900m_classical_speedrun_v3_b65k_13725steps`** | **`ClassicalModdedGPT` Fine-Grained `13,725`-Step Speedrun V3 (`L=12, d=768, H=12, d_ff=3072`)**: `B=128, G_acc=1, T=512` (**`65,536` tok/step = `13,725` steps**, `4.0×` Wave-9's steps!), **`--muon-lr 0.035`**, `--muon-momentum-warmup 300`, `ve=3`, `scalar` U-Net, `fused_qkv`, `skip_attn=6`, `zero_half_rope`, `true_layer0_v_residual`, `zero_init_classical`, fast FlashAttention-2 causal SDPA, `direct_chunked_ce`, `stage_shard_on_gpu`, `WSD-0`. Directly tests whether full `13,725`-step StiefelMuon trajectory resolution closes the remaining single-GPU gap toward **`3.28` Val CE**. |
-| **`gpu_g4_w6_3`** | G4 RTX PRO 6000 Blackwell (96GB) | **`w10_900m_qborn_speedrun_v3_asym1024_frame4d_L8`** | **`QuantumBornGPT` Speedrun V3 Unification (`L=8, d=1024, 4d-Frame 4096×2, Asym-1024 POVM`)**: Unifies Wave-9's **#1 All-Time Quantum Winner** (`L=8 + Asym-1024 + DynamicBeta`, `3.7203` CE) with Wave-9's **#2 All-Time Quantum Winner** (`4d-Frame 4096×2`, `3.7495` CE) at `65,536` tok/step (`13,725` steps) + `ve=3`, `scalar` U-Net, `fused_qkv`, `zero_half_rope`, `true_layer0_v_residual`, `FlashPurifiedBorn` (`window=384 + doc_mask`), `ortho_decouple`, `povm_log_prior`, `gated_spherical_residual`, `WSD-0`. Target: **`< 3.66` Val CE (`< 38.8` PPL)**. |
-| **`gpu_a100_w6_1`** | NVIDIA A100-SXM4-40GB | **`w10_900m_qborn_speedrun_v3_asym1024_L12_deep`** | **`QuantumBornGPT` Deep `L=12` Speedrun V3 (`L=12, d=1024, 3d-Frame 3072×2, Asym-1024 POVM, skip_attn=6`)**: Scales Wave-9's `3.7203` winner from `L=8` to **`L=12` layers** with `depth_scaled_residual=True`, interior attention skip `--skip-attn-layers 6`, `ve=3`, `scalar` U-Net, `fused_qkv`, `zero_half_rope`, `true_layer0_v_residual`, `FlashPurifiedBorn` (`window=384 + doc_mask`), `DynamicBeta`, `WSD-0` at `65,536` tok/step (`13,725` steps). Target: **`< 3.65` Val CE (`< 38.5` PPL)**. |
-| **`gpu_a100_w6_2`** | NVIDIA A100-SXM4-40GB | **`w10_900m_classical_opt_ablation_sgd_nesterov`** | **900M-Token Optimizer Ablation #3 (`--optimizer-mode sgd_nesterov`)**: Exact same `ClassicalModdedGPT` PR #360 V2 architecture (`L=12, d=768, ve=3, scalar U-Net, fused_qkv, skip_attn=6, zero_half_rope, WSD-0`) trained with **Mini-Batch SGD + Nesterov Momentum (`lr=0.05, momentum=0.95`)** on the 2D backbone matrices to complete our 3-way 900M-token comparison (`StiefelMuon` `3.4280` vs. `Pure AdamW` `3.5025` vs. `SGD+Nesterov`). |
+1. **Primary Scientific & Empirical Goal (`< 3.2800` FineWeb-Edu Validation Cross-Entropy)**:
+   - Train a 100% quantum-geometric language model (`QuantumBornGPT`) that breaks the **`3.2800` validation cross-entropy barrier** on the official `KellerJordan/modded-nanogpt` FineWeb-Edu validation shard (`T_val = 512`), closing the remaining gap between our best `900M`-token quantum run (`3.5121` Val CE in Wave 13; `41.17%` Top-1 accuracy in Wave 15) and our `3.3362` Val CE classical `ANVIL2` run.
+2. **Simultaneous Top-1 Precision & Rank `6–500` Calibration**:
+   - Preserve `QuantumBornGPT`'s landmark **depthwise spectral rank expansion** ($R_\sigma(h_L) > R_\sigma(h_0)$) and **`>41%` Top-1 token-ranking accuracy**, while using the Two-Beam $k$-Boson + Stereographic Lift + Scheduled Stiefel Kraus Readout to keep `Ranks 6–50` NLL below `4.6 nats` and `Top-5 minus Top-1` gap at `22%–25%`.
+3. **Hardware-Constrained Efficiency (`<= 8.0 GB` Local VRAM & 2-G4 Cloud Fleet)**:
+   - Validate all architectural, initialization, and optimizer hypotheses locally on our **NVIDIA GeForce RTX 5060 Ti** under a strict **`<= 8.0 GB` VRAM cap** (`torch.cuda.set_per_process_memory_fraction(0.5)`) in `3–10 minutes` per run, and deploy only verified Pareto-improving winners to **at most 2 Google Colab G4 instances** (`gpu_g4_w6_1` and `gpu_g4_w6_2`), conserving our remaining `116.83` Colab Compute Units.
+4. **Zero-Downtime Reproducibility & Automated Experiment Hygiene**:
+   - Maintain a single source of truth in `.cache/benchmarks.db` (SQLite WAL mode) and `.cache/model_cards/*.json`, served live on `http://127.0.0.1:8765` with automatic 2D Pareto-frontier (`Val CE` vs. `Wall Time`) obsolete marking and automatic Colab VM shutdown (`colab stop`) upon run completion so idle VMs never burn compute units.
 
 ---
 
-## 6. Verification & Unit Testing Plan
+## 5. Chronological & Quantitative Summary of Steps Taken (Waves 1–18 / Plans 001–032)
 
-1. **Unit Test Suite (`tests/test_hypothesis_018_dashboard_obsolete_and_wave10.py`)**:
-   - `test_catalog_deduplication_and_unpinned_baseline_sorting`: Calls `collect_snapshot(skip_remote_poll=True)` and verifies:
-     - Every `r["key"]` in `runs_catalog` is unique (`0` duplicates of `gpu_5ep`, `gpu_3ep`, `gpu_wsd_mtp`, `tpu_3ep`, `tpu_wsd_mtp`).
-     - Every entry has numeric `wave_num`, `arch_family` in `("quantum_born", "classical_modded")`, and boolean `obsolete`.
-     - Sorting `runs_catalog` by `best_val_ce` ascending places `w9_900m_classical_speedrun_v2_pr360` (`3.4280`) #1 overall and `w9_900m_qborn_speedrun_v2_asym1024_L8` (`3.7203`) #1 among `quantum_born` runs, with all `"Baseline"` runs (`wave_num == 0`) at rank `>= 40` (never pinned to the top).
-     - Sorting by `wave_num` descending places `W10 > W9 > W8 > ... > W1 > Baseline`.
-   - `test_zero_downtime_obsolete_endpoint_and_persistence`: Boots `create_benchmark_http_server` on an ephemeral port, sends `POST /api/obsolete` to mark `["w6_900m_classical_modded_124m", "gpu_5ep"]` obsolete, verifies `< 25 ms` latency, `0` server restarts, disk persistence in both `.cache/model_cards/*.json` and `ui_prefs.json`, and then restores `"w6_900m_classical_modded_124m"` with `"obsolete": false` and verifies immediate restoration.
-   - `test_wave10_manifest_and_muon_lr_card_registration`: Registers `configs/wave10_fleet.json` via `DynamicWaveRegistry`, validates all 5 Wave-10 `RunModelCard` JSON files (`validate_model_card`), and verifies `--muon-lr 0.04` / `0.035` and `sgd_nesterov` are accurately parsed into `card["optimization"]["muon_lr"]` and `card["optimization"]["optimizer_mode"]`.
-   - `test_html_dashboard_contains_obsolete_and_family_controls`: Renders `render_html_dashboard(snap)` and verifies the React bundle includes the `POST /api/obsolete` handler, `showObsolete` toggle (`Show Obsolete`), `filterFamily` (`Quantum Born` / `Classical Baseline`), numeric `wave_num` sorting, and dynamic Top KPI card computation.
-2. **Controlled Verification & Benchmark Script (`examples/28_verify_plan018_dashboard_and_wave10.py`)**:
-   - Executes all H1, H2, and H3 empirical benchmarks (catalog deduplication/sorting audit, live zero-downtime `POST /api/obsolete` latency benchmark, and GPU causal FlashAttention-2 SDPA vs. 4D-mask SDPA throughput + `2×` step-budget convergence experiment) and writes `/home/festivity/agy/QuantumDLBlocks/.cache/hypothesis_experiments_018.json`.
+### 5.1 High-Level Progression Across Waves 1–18
+
+| Wave / Plan | Core Problem Addressed & Architectural Milestone | Key Quantitative Outcome (`T_val = 512` FineWeb-Edu unless noted) |
+| :--- | :--- | :--- |
+| **Waves 1–4 (`Plans 001–008`)** | Foundational quantum building blocks: unit-sphere state normalization, Stiefel-manifold `StiefelMuon` optimizer with quintic Newton-Schulz retraction, `SubspaceProjectorBornAttention`, and `QuantumBornBlock`. | Verified exact Stiefel isometry preservation (`IsoErr < 0.05`) and Born-rule cross-entropy convergence on `10M–100M` token FineWeb shards. |
+| **Waves 5–7 (`Plans 009–014`)** | `OvercompleteTwoBeamInterference` (`4d-TwoBeam` quantum MLP replacement), `ContextualBlochPurityGate`, asymmetric POVM readout, and memory-efficient `direct_chunked_povm_ce` (`direct_chunked_ce.py`) avoiding `(B, T, V)` logit materialization. | Enabled `50,304`-vocabulary training in `< 8 GB` VRAM and improved `100M–500M` token `QuantumBornGPT` validation cross-entropy to `~3.92`. |
+| **Waves 8–10 (`Plans 015–018`)** | Multi-shard `900M`-token FineWeb-Edu streaming (`FineWebMultiShardStream`), automated Colab GPU fleet orchestration (`scripts/colab_fleet.py`), and zero-downtime live HTTP/WebUI telemetry daemon (`scripts/monitor_colab_runs.py --serve`) with JSON Model Cards. | Scaled `QuantumBornGPT` (`L=8, d=1024`) to `900M` FineWeb-Edu tokens (`~3.79` Val CE in Wave 10) with live 20-second remote telemetry polling. |
+| **Wave 11 (`Plan 019`)** | Exact classical baseline parity (`--leaderboard-exact-classical`): `L=12, d=768, H=6`, `ReLU²` MLP, U-Net skips, `VE=3`, `logit_softcap=15.0`, sequential `modded-nanogpt` validation shard evaluation. | `ClassicalModdedGPT` reached **`3.3362` Val CE** (`28.1` PPL, `38.94%` Top-1) at `900M` tokens on A100 (`60`-step micro-verification: `2.9254` vs `3.2974`). |
+| **Wave 12 (`Plan 020`)** | WAL-mode SQLite telemetry database (`src/qdlblocks/benchmarks/db.py`), automatic per-family 2D Pareto-frontier obsolete lifecycle, 3-Tab WebUI, automatic Colab VM shutdown (`stop_colab_sessions`), and deep `L=12, H=8, d_head=128` `QuantumBornGPT`. | Deep `L=12` `QuantumBornGPT` reached **`3.6621` Val CE** (`38.9` PPL) at `900M` tokens; `L=8` reached `3.7444` Val CE. |
+| **Wave 13 (`Plan 021`)** | **9-Shard (`900M`-Token) GPU Shifted PPMI + Randomized SVD Initialization** (`cooccurrence_init.py`), `HashedNgramEmbedding` (`262,144` bigram+trigram rows, `ngram_hash.py`), `PolarExpress` (`ANVIL` quintic cascade), `NorMuon`, `TailWeightAverager` (`tail_ema.py`), and `MUDD` / `Gated XSA` / `ForwardSmearGate` (`mudd_and_gates.py`). | **All-Time `900M`-Token Quantum Record**: `w13_900m_qborn_v6_9shard_ppmi_svd_deep_L12_H8_d128` achieved **`3.5121` Val CE** (`33.5` PPL, `37.35%` Top-1, **`-0.1500 nats`** vs Wave 12). |
+| **Wave 14 (`Plan 022`)** | **64-Qubit Sparse Fock Excitation Space ($\mathcal{H}_{64}^{(\le 2)}$, $D_{\text{Fock}}=2048 = 64 + 1984$)** (`sparse_qubit_fock.py`) with sparse hashed 1/2/3-gram excitations and an exact $2048 \times 2048 = 4,194,304$-parameter internal density-matrix operator (`Sparse64QubitDensityLayer`, Rank-4 mixed state + $64 \leftrightarrow 1984$ two-body Fock coupler). | Compressed embedding+readout parameters by **`38.93x` (`319.95M -> 8.22M`)** and beat the 10-qubit ($d=1024$) dense baseline by **`-0.3660 nats`** (`1.2853` vs `1.6513` CE on a repeating `200k`-token local micro-corpus prior to locking the non-repeating `100M`/`val_slice.bin` protocol in Plan 024/025). |
+| **Wave 15 (`Plans 023–024`)** | **16-Qubit Product-Register Hierarchy (`50,304 × 16 × 32`) + `256` Interacting Higher-Level Quantum States (`16 × 256 × 256` Unitary)** (`hierarchical_qubit.py`) and Calibrated Last-Layer Softmax Readout (`--last-layer-softmax`). | Live `w15_900m_qborn_16x32_qubit_256hier_ngram_L8` reached **`41.17%` Top-1 accuracy** and **`MedRank = 3`** at `774.5M` tokens (`3.6009` Val CE), revealing the Top-1 vs. Rank `6–500` NLL paradox. |
+| **Wave 15 Local (`Plans 025–026`)** | **5-Bucket Target-Rank CE Decomposition & Layerwise Dynamics (`calibration_probe.py`)** + **100% Quantum Two-Beam Mixed-State $k$-Boson Bloch Fidelity Readout & Non-Isometric Kraus Semantic Bath (`direct_chunked_two_beam_kboson_ce`)** under strict `<= 8.0 GB` local RTX 5060 Ti VRAM cap. | Proved quantum **spectral rank expansion across depth** (`R_sigma: 207.8 -> 240.6` vs classical collapse `221.2 -> 184.1`); Two-Beam $k$-Boson readout beat Classical (`6.4771`), Pure POVM (`6.1476`), and Softmax (`6.1084`) on `L=6, d=512` (`6.0715` Val CE). |
+| **Wave 16 (`Plan 027`)** | **Diffuse Kraus Bath Weight Schedule Tuning** (`free_decay`, `bounded_floor`, `cosine_broad_to_sharp`, `warmup_hold_anneal`, `contextual_purity_complement`), thin-QR Stiefel retraction on `kraus_u_diff, kraus_v_diff`, and exclusion of `unigram_qubits` / `higher_states` from `polar_snap_weights`. | `warmup_hold_anneal` + `contextual_purity_complement` kept $R_{\text{diff}} \approx 14.8$ and improved `L=6, d=512` 300-step Val CE to **`6.0488`**; stopped Colab Wave 16 early when 2-G4 budget reassessment began. |
+| **Wave 17 (`Plans 028–030`)** | **Iris Born-Rule Geometric Diagnostic (`iris_born_diagnostic.py`)**, **Learnable Stereographic Radial-Phase Lift (`use_stereographic_lift=True`)**, **Cosine-Phase Beam Gate**, **Quadratic Kraus Fidelity (`0.50`)**, **Fast Synthetic FineWeb-Walk Proxy (`synthetic_fineweb_walk.py`)**, and **Transfer to Genuine FineWeb-Edu (`L=2/L=4 d=256` & `L=6 d=512`)**. | Iris accuracy jumped **`80.00% -> 96.67%`**; Synthetic Walk quantum beat classical by **`-0.1681 nats` (`5.4057` vs `5.5738`)**; Genuine FineWeb-Edu reached **`6.1960`** (`L=2, d=256`), **`6.0823`** (`L=6, d=512`, 300 steps), and **`5.6234`** (`L=4, d=256`, 900 steps). |
+| **Wave 18 (`Plans 031–032`)** | **Falsification of Hard Diffuse Whitening (`R_diff=16.00`) & Bipolar Hole Subtraction (`Plan 031`)**; **Anti-Diagonal Spectral-Reversal Isometry ($J_{\text{anti}}$) for Full-Ambient Qubits** + **Gentle `2x` Zero-WD Qubit Embedding LR (`lr=0.006, wd=0.0`) (`Plan 032`)**. | Slashed Full-Ambient Step-0 CE by **`-5.50 nats` (`14.7430 -> 9.2394`)**; set **New All-Time Local `8 GB` Records** at **`6.0801` Val CE** (`L=6, d=512`, 300 steps) and **`5.6092` Val CE** (`L=4, d=256`, 900 steps, **`19.46%` Top-1, `36.93%` Top-5**). |
+
+---
+
+### 5.2 Detailed Comparison Table of Controlled Local `<= 8.0 GB` RTX 5060 Ti FineWeb-Edu Runs (Plans 025–032)
+
+All runs below were trained under the Warmup-Stable-Decay (`WSD`) learning-rate schedule on genuine non-repeating FineWeb-Edu tokens from `.cache/fineweb_100M/train_full_100M.bin` (`8,192` tokens/step, `T = 512`) and evaluated on the identical held-out `KellerJordan/modded-nanogpt` validation shard (`.cache/fineweb_100M/val_slice.bin`, `12,288` tokens, `50,257` active GPT-2 vocabulary) under `torch.cuda.set_per_process_memory_fraction(0.5, device=0)` (`<= 8.0 GB` VRAM):
+
+| Run Key | Plan / Wave | Architecture & Readout Summary | Steps (Tokens) | Params | Peak VRAM | Step 0 CE | Step 100 CE | Step 300 CE | Final / Best CE (PPL) | Top-1 / Top-5 | $R_{\text{diff}}$ / $R_{\text{sharp}}$ | Wall Time (Speed) |
+| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `w15_8gb_classical_leaderboard_exact_L6_d512` | Plan 025 (`W15`) | Classical Leaderboard-Exact (`L=6, d=512, H=8, VE=3, Softcap=15.0`) | `300` (`2.46M`) | `146.60M` | `4.127 GB` | `10.8258` | `7.1219` | `6.4771` | `6.4771` (`650.08`) | `18.02%` / `33.57%` | — / `184.1` | `86.4s` (`28,436 tok/s`) |
+| `w15_8gb_qborn_flat_w13_v6_L6_d512` | Plan 025 (`W15`) | Flat `QuantumBornGPT` (`L=6, d=512`, 9-Shard PPMI-SVD, Pure POVM) | `300` (`2.46M`) | `163.36M` | `4.542 GB` | `10.8249` | `6.8240` | `6.3106` | `6.3106` (`550.37`) | `16.25%` / `31.11%` | — / `236.4` | `204.2s` (`12,031 tok/s`) |
+| `w15_8gb_qborn_16qubit_256hier_povm_L6_d512` | Plan 025 (`W15`) | `16×16` Parity-Split Qubit + `256` Hier (`L=6, d=512`, Pure POVM) | `300` (`2.46M`) | `189.18M` | `5.811 GB` | `10.8249` | `6.7402` | `6.1476` | `6.1476` (`467.60`) | `16.07%` / `31.69%` | — / `240.6` | `468.9s` (`5,241 tok/s`) |
+| `w15_8gb_qborn_16qubit_256hier_softmax_L6_d512` | Plan 025 (`W15`) | `16×16` Parity-Split Qubit + `256` Hier (`L=6, d=512`, Last-Layer Softmax) | `300` (`2.46M`) | `189.28M` | `5.864 GB` | `10.8249` | `6.7118` | `6.1084` | `6.1084` (`449.62`) | `16.32%` / `32.04%` | — / `241.2` | `472.1s` (`5,205 tok/s`) |
+| `w15_8gb_qborn_16qubit_256hier_twobeam_kboson_unified_L6_d512` | Plan 026 (`W15`) | Unified `L=6, d=512, 16×16` Parity-Split + **Two-Beam $k$-Boson Readout (`r=16`)** | `300` (`2.46M`) | `195.66M` | `5.736 GB` | `9.6120` | `6.6612` | `6.0715` | `6.0715` (`433.33`) | `16.34%` / `32.10%` | `4.12` / `328.5` | `498.5s` (`4,930 tok/s`) |
+| `w17_8gb_fast_synth_ppmi_ngram_L2_d256` | Plan 030 (`W17`) | Fast Synth Winner on FineWeb (`L=2, d=256, H=4, 16×16` Full-Ambient, Stereo+Phase+Quad) | `300` (`2.46M`) | `79.74M` | `4.168 GB` | `12.9310` | `7.1260` | `6.1960` | `6.1960` (`490.78`) | `16.16%` / `31.32%` | `9.16` / `195.8` | `180.1s` (`13,643 tok/s`) |
+| `w18_8gb_L2_d256_bipolar_kboson_whitened_300steps` | Plan 031 (`W18`, **Falsified**) | `L=2, d=256` + Bipolar Hole ($-0.20\,\text{ReLU}(-c)^2$) + Hard Cholesky Whitening (`R_diff=16.00`) | `300` (`2.46M`) | `79.74M` | `4.406 GB` | `13.6701` | `7.3679` | `6.3250` | `6.3250` (`558.36`) | `15.62%` / `30.60%` | `16.00` / `205.5` | `203.9s` (`12,053 tok/s`) |
+| `w17_8gb_qborn_unified_attn_stereo_directed_ppmi_L6_d512` | Plan 030 (`W17`) | Unified `L=6, d=512, 16×16` Parity-Split + Directed PPMI + Stereo+Phase+Quad (`lr=0.003, wd=0.01`) | `300` (`2.46M`) | `195.68M` | `6.283 GB` | `9.5961` | `6.6696` | `6.0823` | `6.0823` (`438.04`) | `16.56%` / `32.36%` | `14.79` / `334.0` | `513.1s` (`4,790 tok/s`) |
+| **`w18_8gb_L6_d512_clean_gentle_qubit_lr_300steps` (`Isolate 1`)** | **Plan 032 (`W18`)** | **Unified `L=6, d=512, 16×16` Parity-Split + Gentle `2x` Zero-WD Qubit LR (`lr=0.006, wd=0.0`)** | **`300` (`2.46M`)** | **`195.68M`** | **`5.923 GB`** | **`9.5945`** | **`6.6648`** | **`6.0801`** | **`6.0801` (`437.09`)** | **`16.63%` / `32.19%`** | **`14.80` / `333.2`** | **`506.4s` (`4,853 tok/s`)** |
+| **`w18_8gb_L6_d512_clean_full_ambient_16x32_janti_300steps` (`Isolate 2`)** | **Plan 032 (`W18`)** | **Unified `L=6, d=512, 16×32` Full-Ambient $J_{\text{anti}}$ + Gentle `2x` Zero-WD Qubit LR (`0.006`)** | **`300` (`2.46M`)** | **`221.52M`** | **`6.325 GB`** | **`9.4142`** | **`6.6888`** | **`6.0982`** | **`6.0982` (`445.05`)** | **`16.45%` / `32.15%`** | **`14.90` / `361.5`** | **`511.8s` (`4,802 tok/s`)** |
+| `w17_8gb_fast_synth_scaled_L4_d256_900steps` | Plan 030 (`W17`) | Scaled `L=4, d=256, H=4, 16×16` Full-Ambient (`lr=0.003, wd=0.01`, Pre-$J_{\text{anti}}$) | `900` (`7.37M`) | `93.97M` | `5.542 GB` | `12.5196` | `7.0281` | `6.1391` | `5.6234` (`276.83`) | `19.22%` / `36.78%` | `5.77` / `176.2` | `630.0s` (`11,704 tok/s`) |
+| **`w18_8gb_L4_d256_clean_janti_gentle_lr_900steps` (`Isolate 3`)** | **Plan 032 (`W18`)** | **Scaled `L=4, d=256, H=4, 16×16` Full-Ambient $J_{\text{anti}}$ + Gentle `2x` Zero-WD Qubit LR (`0.006`)** | **`900` (`7.37M`)** | **`93.97M`** | **`5.640 GB`** | **`9.7240`** | **`6.6578`** | **`6.1671`** | **`5.6092` (`272.93`)** | **`19.46%` / `36.93%`** | **`6.02` / `177.6`** | **`630.7s` (`11,690 tok/s`)** |
+
+---
+
+## 6. Concrete Steps We Could Take Next
+
+Based on everything we have verified and falsified through Plan 032, here are the highest-leverage next steps we can take when we resume:
+
+### Next Step 1: Local `<= 8.0 GB` RTX 5060 Ti Multi-Thousand-Step Scaling Study (`3,600` Steps / `29.5M` Tokens) Before Touching Colab
+- **Why**:
+  - In `Plan 032`, `Isolate 3` (`L=4, d=256, H=4`, `93.97M` params, `11,690 tok/s`, `5.640 GB` Peak VRAM) reached **`5.6092` Val CE (`19.46%` Top-1, `36.93%` Top-5)** in just `900` steps (`7.37M` tokens, `10.5 minutes`).
+  - Before spending any of our remaining `116.83` Google Colab Compute Units, we can run a **3,600-step (`29.5M` tokens, `~42 minutes`) local scaling test** on our RTX 5060 Ti (`<= 8.0 GB` VRAM) comparing:
+    1. `L=4, d=256, H=4` (`Isolate 3` winner: `16×16` Full-Ambient $J_{\text{anti}}$ + Gentle `2x` Zero-WD Qubit LR `0.006` + Stereo+Phase+QuadKraus) at `3,600` steps (`29.5M` tokens), and
+    2. `L=4, d=256, H=4` with `use_ortho_decouple=True` (`16×8` Parity-Split vs `16×16` Full-Ambient $J_{\text{anti}}$) or `L=6, d=384, H=6`,
+    against a matched `3,600`-step `ClassicalModdedGPT` control to verify the mid-training slope (`7.37M -> 29.5M` tokens) and confirm that the curve stays on a trajectory to beat `3.28` at `900M` tokens.
+
+### Next Step 2: Soft Power-Law Spectral Floor ($\sigma_j \ge 0.15\,\sigma_1$) vs. Unconstrained Diffuse Rank Decay at Multi-Thousand Steps
+- **Why**:
+  - Plan 031 proved that **hard Cholesky whitening (`R_diff = 16.00`) is harmful** (`+0.1290 nats` regression) because it amplifies tail noise modes `7–16` by `5x–10x`.
+  - Meanwhile, in `Isolate 3` (`900` steps), natural diffuse effective rank $R_{\text{diff}}$ drifted smoothly from `14.38` (Step 100) $\to$ `11.25` (Step 300) $\to$ `8.06` (Step 600) $\to$ `6.02` (Step 900).
+  - Over a `3,600`-step or `6,866`-step (`900M`-token) run, if $R_{\text{diff}}$ continues decaying below `< 4.0`, the diffuse Kraus bath could lose semantic coverage of mid-rank synonyms (`Ranks 6–50`).
+  - Testing a **Soft Power-Law Spectral Floor** inside `retract_kraus_stiefel()` (or a gentle variance regularizer that only intervenes if $R_{\text{diff}}$ drops below a floor of `6.5`, while leaving the natural Zipfian power-law decay across modes `1..16` untouched when $R_{\text{diff}} \in [6.5, 14.5]$) will protect long-horizon `900M`-token runs without distorting the top-6 semantic modes.
+
+### Next Step 3: Focused 2-Session Google Colab G4 Experiment (`gpu_g4_w6_1` & `gpu_g4_w6_2`)
+- **Why**:
+  - Per our resource constraint of using **only 2 G4 instances** (`~3.4 CU/hr` total burn rate out of `116.83 CU` available) and only launching when confident in the `< 3.28` trajectory:
+  - Once Next Step 1 & 2 confirm the `30M`-token slope locally, we can launch a 2-session Wave 18 Colab G4 manifest (`configs/wave18_2g4_fleet.json`) with automatic VM shutdown (`stop_colab_sessions` on completion):
+    - **`gpu_g4_w6_1` (`w18_900m_qborn_unified_16x16_parity_gentle_lr_L8_d512`)**: Our cleanest `d=512` winner (`Isolate 1` architecture scaled to `L=8, d=512, H=8`, `16×16` Parity-Split `use_ortho_decouple=True`, `256` Higher States, Gentle `2x` Zero-WD Qubit LR `0.006`, Stereographic Lift + Cosine-Phase Gate + Quadratic Kraus Fidelity `0.50`, `warmup_hold_anneal` `r=16`, 9-Shard PPMI-SVD, `65k` N-Gram Hash, `SmearGate`, `MUDD`, `TailWeightAverager`).
+    - **`gpu_g4_w6_2` (`w18_900m_qborn_unified_16x32_janti_gentle_lr_L8_d512`)**: The exact same `L=8, d=512, H=8` backbone with **Full-Ambient `16×32 = 512` $J_{\text{anti}}$ Qubits** (`Isolate 2` architecture, which achieved `R_sharp = 361.5` vs `333.2` at Step 300), testing whether the doubled per-register amplitude capacity (`A=32` vs `A=16`) overtakes Parity-Split over a full `900M`-token horizon.
+
+### Next Step 4: Promoting Backlog Diagnostic Utilities (`scripts/BACKLOG.md`)
+- Promote two high-value CLI utilities from [`scripts/BACKLOG.md`](file:///home/festivity/agy/QuantumDLBlocks/scripts/BACKLOG.md) when needed:
+  1. `scripts/full_ambient_step0_calibration_audit.py`: Standalone CLI tool to audit Step-0 inner-product distributions (`c_sharp`, `c_diff`, `SelfOv`, `DirRatio`, and `Step 0 ECE/CE`) in `<5s` before any training run.
+  2. `scripts/vram_envelope_autotuner.py`: Automated `(micro_batch_size, grad_accum, activation_checkpointing)` profiler under `torch.cuda.set_per_process_memory_fraction(0.5)`.

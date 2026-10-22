@@ -45,3 +45,31 @@ See also [`scripts/TOOLING_BACKLOG.md`](file:///home/festivity/agy/QuantumDLBloc
 ## Plan 025 Candidate (`Nice-to-Have`) Tooling
 - **`scripts/vram_envelope_autotuner.py`**:
   - Given a hardware VRAM cap (e.g., `--max-vram-gb 8.0` or `16.0`) and a `QuantumBornGPT` or `ClassicalModdedGPT` architecture config, binary-searches `(micro_batch_size, grad_accum, checkpoint_blocks, chunk_tokens)` under `torch.cuda.set_per_process_memory_fraction` to find the highest-throughput configuration that guarantees zero OOMs.
+
+## Plan 026 Candidate (`Nice-to-Have`) Tooling
+- **`scripts/kboson_fidelity_landscape_visualizer.py`**:
+  - Plots the empirical cosine similarity histogram $p(c_{\text{sharp}})$ and $p(c_{\text{diff}})$ and gradient gain $k / (2 F_{t,v})$ across target rank buckets `1`, `2–5`, `6–50`, `51–1000`, and `>1000` for trained Two-Beam $k$-Boson Mixed-State Readout checkpoints.
+
+## Plan 027 Candidate (`Nice-to-Have`) Tooling
+- **`scripts/kraus_schedule_visualizer.py`**:
+  - A standalone CLI tool that plots $\lambda_{\text{diff}}(s)$, $k_{\text{eff}}(s)$, $\beta_t(s)$, and the 5-bucket Target-Rank NLL trajectories across schedule arms from `.cache/hypothesis_experiments_027.json` into an interactive SVG/HTML comparison card.
+
+## Plan 028 Candidate (`Nice-to-Have`) Tooling
+- **`scripts/stereographic_latitude_probe.py`**:
+  - A diagnostic CLI that inspects a trained `--stereographic-lift` checkpoint on `fineweb_val_000000.bin` and plots the layerwise distribution of stereographic polar latitudes $\theta_{\text{lat}}(h_\ell)$ and phase-interference gates $\cos(\omega(z_1 - z_2) + \phi)$ across token frequency and target-rank buckets.
+
+## Plan 029 Candidate (`Nice-to-Have`) Tooling
+- **`scripts/synthetic_walk_attention_heatmap_exporter.py`**:
+  - A diagnostic CLI that exports per-head Purified Born attention matrices $A_{ij}^{(h)}$ and stereographic polar-latitude trajectories $\theta_{\text{lat}}(t)$ on synthetic FineWeb random-walk sequences into an interactive SVG/HTML visual card.
+
+## Plan 030 Candidate (`Nice-to-Have`) Tooling
+- **`scripts/iso_wallclock_pareto_profiler.py`**:
+  - A CLI benchmark utility that sweeps `(num_layers, embed_dim, frame_expansion)` under a fixed wall-clock budget (e.g., `--wall-seconds 300 --max-vram-gb 8.0`) on FineWeb-Edu to plot the Iso-Wall-Clock Validation Cross-Entropy vs. Token-Throughput Pareto curve on a single consumer GPU.
+
+## Plan 031 Candidate (`Nice-to-Have`) Tooling
+- **`scripts/bipolar_vs_concave_kboson_curve_plotter.py`**:
+  - A standalone CLI diagnostic that plots the exact log-fidelity curve $\mathcal{E}(x)$, slope $\partial \mathcal{E}/\partial x$, and empirical per-bucket cosine similarity distribution $p(x_{t, y_t} \mid \text{Rank Bucket})$ comparing legacy concave $k \ln(1+x)$ vs. Bipolar Particle-Hole $k$-Boson across validation checkpoints.
+
+## Plan 032 Candidate (`Nice-to-Have`) Tooling
+- **`scripts/full_ambient_step0_calibration_audit.py`**:
+  - A lightweight CLI utility that inspects Step-0 inner-product distributions (`c_sharp`, `c_diff`, `max_self_overlap`, `self_register_overlap_max`, `directed_bigram_overlap_ratio`, and `Step 0 ECE`) across `(Q, A, use_ortho_decouple, decouple_self_in_full_ambient)` configurations before launching training runs.

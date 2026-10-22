@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from ..functional import l2_normalize
 from .overcomplete_frame import frame_coherence_metrics
+from .stereographic_lift import apply_dimension_preserving_stereographic_rotation
 
 __all__ = [
     "two_beam_frame_penalty",
@@ -140,6 +141,8 @@ class OvercompleteTwoBeamInterference(nn.Module):
         seed: int = 42,
         eps: float = 1e-12,
         device: torch.device | str | None = None,
+        use_stereographic_lift: bool = False,
+        use_cosine_phase_beam_gate: bool = False,
     ) -> None:
         super().__init__()
         self.embed_dim = int(embed_dim)
@@ -149,13 +152,16 @@ class OvercompleteTwoBeamInterference(nn.Module):
         self.seed = int(seed)
         self.eps = float(eps)
         self.frame_dim = int(round(self.embed_dim * self.frame_expansion))
+        self.use_stereographic_lift = bool(use_stereographic_lift)
+        self.use_cosine_phase_beam_gate = bool(use_cosine_phase_beam_gate)
 
+        dev_init = torch.device(device) if device is not None else torch.device("cpu")
         w1_init, w2_init = optimize_orthogonal_pair_tight_frames(
             self.frame_dim,
             self.embed_dim,
             steps=self.init_steps,
             seed=self.seed,
-            device=device or "cpu",
+            device=dev_init,
         )
         self.W_beam1 = nn.Parameter(w1_init * self.target_iso_scale)
         self.W_beam2 = nn.Parameter(w2_init * self.target_iso_scale)
@@ -164,6 +170,44 @@ class OvercompleteTwoBeamInterference(nn.Module):
             * (self.target_iso_scale * math.sqrt(float(self.embed_dim) / float(self.frame_dim)))
         )
         self.post_norm = nn.LayerNorm(self.embed_dim, eps=1e-6)
+
+        if self.use_cosine_phase_beam_gate:
+            self.phase_omega: nn.Parameter | None = nn.Parameter(
+                torch.full((self.frame_dim,), 0.50, dtype=torch.float32, device=dev_init)
+            )
+            self.phase_phi: nn.Parameter | None = nn.Parameter(
+                torch.zeros(self.frame_dim, dtype=torch.float32, device=dev_init)
+            )
+            self.phase_gate_scale: nn.Parameter | None = nn.Parameter(
+                torch.tensor(0.35, dtype=torch.float32, device=dev_init)
+            )
+        else:
+            self.register_parameter("phase_omega", None)
+            self.register_parameter("phase_phi", None)
+            self.register_parameter("phase_gate_scale", None)
+
+        if self.use_stereographic_lift:
+            gen_s = torch.Generator(device="cpu").manual_seed(self.seed + 303)
+            p1_init = l2_normalize(
+                torch.randn(self.embed_dim, generator=gen_s, dtype=torch.float32), dim=-1
+            ).to(dev_init)
+            p2_init = l2_normalize(
+                torch.randn(self.embed_dim, generator=gen_s, dtype=torch.float32), dim=-1
+            ).to(dev_init)
+            self.stereo_pole_1: nn.Parameter | None = nn.Parameter(p1_init)
+            self.stereo_pole_2: nn.Parameter | None = nn.Parameter(p2_init)
+            self.stereo_tau: nn.Parameter | None = nn.Parameter(
+                torch.tensor(0.55, dtype=torch.float32, device=dev_init)
+            )
+            self.stereo_gain: nn.Parameter | None = nn.Parameter(
+                torch.tensor(0.40, dtype=torch.float32, device=dev_init)
+            )
+        else:
+            self.register_parameter("stereo_pole_1", None)
+            self.register_parameter("stereo_pole_2", None)
+            self.register_parameter("stereo_tau", None)
+            self.register_parameter("stereo_gain", None)
+
         self.last_beam2: torch.Tensor | None = None
 
     def forward(
@@ -177,15 +221,71 @@ class OvercompleteTwoBeamInterference(nn.Module):
         z1 = F.linear(psi, u1) * scale
         z2 = F.linear(psi, u2) * scale
         interf = (z1 * z1) * F.silu(z2)
-        out_1 = F.linear(interf, self.W_out.to(psi.dtype))
-        psi_main = l2_normalize(self.post_norm(out_1.float()).to(psi.dtype), dim=-1, eps=self.eps)
-
         b2 = (z2 * z2) * F.silu(z1)
+
+        if (
+            self.use_cosine_phase_beam_gate
+            and self.phase_omega is not None
+            and self.phase_phi is not None
+            and self.phase_gate_scale is not None
+        ):
+            delta_theta = self.phase_omega.to(z1.dtype) * (z1 - z2) + self.phase_phi.to(z1.dtype)
+            alpha_p = (0.50 * torch.tanh(self.phase_gate_scale)).to(z1.dtype)
+            interf = interf * (1.0 + alpha_p * torch.cos(delta_theta))
+            b2 = b2 * (1.0 + alpha_p * torch.sin(delta_theta))
+
+        out_1 = F.linear(interf, self.W_out.to(psi.dtype))
+        normed_1 = self.post_norm(out_1.float()).to(psi.dtype)
+        if (
+            self.use_stereographic_lift
+            and self.stereo_pole_1 is not None
+            and self.stereo_tau is not None
+            and self.stereo_gain is not None
+        ):
+            out1_radial = out_1.float().norm(p=2, dim=-1, keepdim=True)
+            psi_main = apply_dimension_preserving_stereographic_rotation(
+                normed_1,
+                self.stereo_pole_1,
+                self.stereo_tau,
+                self.stereo_gain,
+                eps=self.eps,
+                radial_norm_override=out1_radial,
+            )
+        else:
+            psi_main = l2_normalize(normed_1, dim=-1, eps=self.eps)
+
         out_2 = F.linear(b2, u2.t().to(psi.dtype)) * (
             self.target_iso_scale * math.sqrt(float(self.embed_dim) / float(self.frame_dim))
         )
-        psi_beam2 = l2_normalize(out_2 - 0.25 * out_1, dim=-1, eps=self.eps)
-        self.last_beam2 = psi_beam2
+        raw_b2 = out_2 - 0.25 * out_1
+        if (
+            self.use_stereographic_lift
+            and self.stereo_pole_2 is not None
+            and self.stereo_tau is not None
+            and self.stereo_gain is not None
+        ):
+            psi_beam2 = apply_dimension_preserving_stereographic_rotation(
+                raw_b2,
+                self.stereo_pole_2,
+                self.stereo_tau,
+                self.stereo_gain,
+                eps=self.eps,
+                radial_norm_override=raw_b2.float().norm(p=2, dim=-1, keepdim=True),
+            )
+        else:
+            psi_beam2 = l2_normalize(raw_b2, dim=-1, eps=self.eps)
+
+        if self.use_cosine_phase_beam_gate:
+            b2_f = psi_beam2.float()
+            m_f = psi_main.float()
+            psi_beam2 = l2_normalize(
+                b2_f - (b2_f * m_f).sum(dim=-1, keepdim=True) * m_f,
+                dim=-1,
+                eps=self.eps,
+            ).to(psi.dtype)
+
+        if not torch.compiler.is_compiling():
+            self.last_beam2 = psi_beam2
         if return_second_beam:
             return psi_main, psi_beam2
         return psi_main
@@ -195,3 +295,4 @@ class OvercompleteTwoBeamInterference(nn.Module):
 
     def coherence_metrics(self) -> dict[str, float]:
         return overcomplete_two_beam_metrics(self.W_beam1, self.W_beam2, eps=self.eps)
+

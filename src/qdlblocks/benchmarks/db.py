@@ -1988,6 +1988,89 @@ def backfill_micro_verifications(
         except Exception:
             pass
 
+    # 12. Plans 026–030 (.cache/hypothesis_experiments_026..030.json if already present)
+    for plan_num, default_col, default_desc in (
+        (
+            26,
+            "#ff9e00",
+            "Controlled Plan 026 <=8.0 GB VRAM verification of 100% Quantum Two-Beam Mixed-State Density Readout, Non-Isometric Kraus Semantic Bath, and k-Copy Bloch Fidelity.",
+        ),
+        (
+            27,
+            "#00f5d4",
+            "Controlled Plan 027 <=8.0 GB VRAM verification of Scheduled Rank-r Stiefel Kraus Semantic Bath and Per-Token Contextual Purity Routing.",
+        ),
+        (
+            28,
+            "#00ff87",
+            "Controlled Plan 028 <=8.0 GB VRAM verification of Stereographic Radial-Norm-Preserving Lift, Cosine Phase-Interference Two-Beam Readout, and Positive-Part Quadratic Kraus Fidelity.",
+        ),
+        (
+            29,
+            "#38b000",
+            "Controlled Plan 029 <=8.0 GB VRAM verification of FineWeb-Matched 50,257-Vocab Synthetic Random-Walk Dataset and FastQuantumBornAttentionSynthLM Overfitting & Variable-Lag Hub Disambiguation.",
+        ),
+        (
+            30,
+            "#00bbf9",
+            "Controlled Plan 030 <=8.0 GB VRAM verification of Fast Synthetic-Walk Quantum Born Attention Winner on Genuine FineWeb-Edu, Directed Predecessor Self-Decoupled PPMI-SVD, and Iso-Wall-Clock Scaling.",
+        ),
+        (
+            31,
+            "#ffbe0b",
+            "Controlled Plan 031 <=8.0 GB VRAM verification of Bipolar Particle-Hole k-Boson Log-Fidelity, Diffuse Mode Whitening, Concept-Cluster Diffuse Bath, and Full-Ambient 16x32 Qubits.",
+        ),
+        (
+            32,
+            "#00f5d4",
+            "Controlled Plan 032 <=8.0 GB VRAM verification of Anti-Diagonal Spectral-Reversal Isometry (J_anti) for Full-Ambient 16x32/16x16 Qubits and Gentle 2x Zero-Weight-Decay Qubit Embedding LR.",
+        ),
+    ):
+        p_file = cdir / f"hypothesis_experiments_{plan_num:03d}.json"
+        if p_file.exists():
+            try:
+                d_plan = json.loads(p_file.read_text(encoding="utf-8"))
+                micro_arms_p = d_plan.get("micro_verification_arms", {})
+                if isinstance(micro_arms_p, dict):
+                    for rk, arm in micro_arms_p.items():
+                        if not isinstance(arm, dict):
+                            continue
+                        ce_raw = arm.get("best_val_ce", arm.get("val_final"))
+                        if ce_raw is None:
+                            continue
+                        vf = round(float(ce_raw), 4)
+                        evs = arm.get("evals") or arm.get("history") or []
+                        w_min = float(arm.get("wall_min", round(float(arm.get("wall_s", 5.0)) / 60.0, 4)))
+                        short_lbl = str(arm.get("short_label") or rk)
+                        cli_sfx = str(
+                            arm.get("cli_args")
+                            or "--architecture quantum_born --hierarchical-16qubit --num-higher-states 256 --two-beam-kboson-readout --diffuse-rank 16"
+                        )
+                        tot_st = int(arm.get("total_steps", 300))
+                        tok_m_val = float(arm.get("target_tokens_M", 2.46))
+                        col = str(arm.get("color") or default_col)
+                        extracted.append(
+                            _make_micro_entry(
+                                run_key=rk,
+                                plan_num=plan_num,
+                                arch_family=str(arm.get("arch_family") or "quantum_born"),
+                                label=f"Plan {plan_num:03d} Verification ({tot_st} Steps, <=8GB VRAM): {short_lbl} ({vf:.4f} Val CE)",
+                                short_label=f"{short_lbl} ({vf:.4f} CE)",
+                                hypothesis_summary=str(arm.get("hypothesis_summary") or default_desc),
+                                cli_args=cli_sfx if cli_sfx.startswith("--backend") else f"--backend cuda {cli_sfx}",
+                                total_steps=tot_st,
+                                target_tokens_M=tok_m_val,
+                                best_val_ce=vf,
+                                evals=evs,
+                                wall_min=max(0.01, w_min),
+                                top1_acc=float(arm.get("best_top1", 25.0)),
+                                iso_err=float(arm.get("iso_err", 0.01)),
+                                color=col,
+                            )
+                        )
+            except Exception:
+                pass
+
     out_entries: list[dict[str, Any]] = []
     for cat_entry, card in extracted:
         if model_cards_dir is not None:
@@ -1995,3 +2078,4 @@ def backfill_micro_verifications(
         db.upsert_run(cat_entry, model_card=card, explicit_user_override=False)
         out_entries.append(cat_entry)
     return out_entries
+
