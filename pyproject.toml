@@ -25,6 +25,9 @@ keywords = [
 dependencies = [
     "torch>=2.0.0",
     "numpy>=1.24.0",
+    "datasets>=4.0.0",
+    "hf-xet>=1.7.0",
+    "huggingface-hub[xet]>=0.36.2",
 ]
 
 [project.optional-dependencies]
@@ -41,7 +44,7 @@ jax = [
     "haliax>=1.2.0",
 ]
 levanter = [
-    "levanter>=1.2.0",
+    "levanter>=1.1.0",
 ]
 dev = [
     "pytest>=7.4.0",

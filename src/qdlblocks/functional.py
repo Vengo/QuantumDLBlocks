@@ -9,6 +9,27 @@ import torch.nn.functional as F
 # =====================================================================
 # 1. Pure-State Hyperspherical & Stiefel Manifold Operations
 # =====================================================================
+class _L2NormalizeFn(torch.autograd.Function):
+    """Memory-efficient L2 normalization saving only `y` (in `x.dtype`) and `r_inv` (`(..., 1)`)."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, dim: int, eps: float) -> torch.Tensor:  # type: ignore[override]
+        x_f = x.float()
+        r_inv = torch.rsqrt(torch.sum(x_f * x_f, dim=dim, keepdim=True) + eps)
+        y = (x_f * r_inv).to(x.dtype)
+        ctx.save_for_backward(y, r_inv)
+        ctx.dim = dim
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):  # type: ignore[override]
+        y, r_inv = ctx.saved_tensors
+        gy = grad_out.float()
+        yf = y.float()
+        dot = torch.sum(gy * yf, dim=ctx.dim, keepdim=True)
+        return ((gy - dot * yf) * r_inv).to(y.dtype), None, None
+
+
 def l2_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-12) -> torch.Tensor:
     """Project state vectors onto the unit hypersphere S^{d-1} (||psi||_2 = 1).
 
@@ -23,8 +44,15 @@ def l2_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-12) -> torch.Te
     if x.is_complex():
         norm_sq = torch.sum(x.real.float().square() + x.imag.float().square(), dim=dim, keepdim=True)
         return x * torch.rsqrt(norm_sq + eps).to(x.real.dtype)
+    if (
+        x.requires_grad
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and not torch.compiler.is_compiling()
+    ):
+        return _L2NormalizeFn.apply(x, int(dim), float(eps))  # type: ignore[return-value]
     x_f = x.float()
     return (x_f * torch.rsqrt(torch.sum(x_f * x_f, dim=dim, keepdim=True) + eps)).type_as(x)
+
 
 
 def riemannian_center(x: torch.Tensor, dim: int = -1, eps: float = 1e-12) -> torch.Tensor:

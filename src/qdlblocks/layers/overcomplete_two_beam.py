@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from ..functional import l2_normalize
 from .overcomplete_frame import frame_coherence_metrics
 from .stereographic_lift import apply_dimension_preserving_stereographic_rotation
+from .wavelet_cholesky import WaveletCholeskyConfig, WaveletCholeskyMultiscaleBranch
 
 __all__ = [
     "two_beam_frame_penalty",
@@ -141,8 +142,7 @@ class OvercompleteTwoBeamInterference(nn.Module):
         seed: int = 42,
         eps: float = 1e-12,
         device: torch.device | str | None = None,
-        use_stereographic_lift: bool = False,
-        use_cosine_phase_beam_gate: bool = False,
+        **kwargs: bool,
     ) -> None:
         super().__init__()
         self.embed_dim = int(embed_dim)
@@ -152,8 +152,10 @@ class OvercompleteTwoBeamInterference(nn.Module):
         self.seed = int(seed)
         self.eps = float(eps)
         self.frame_dim = int(round(self.embed_dim * self.frame_expansion))
-        self.use_stereographic_lift = bool(use_stereographic_lift)
-        self.use_cosine_phase_beam_gate = bool(use_cosine_phase_beam_gate)
+        self.use_stereographic_lift = bool(kwargs.get("use_stereographic_lift", False))
+        self.use_cosine_phase_beam_gate = bool(kwargs.get("use_cosine_phase_beam_gate", False))
+        self.use_mach_zehnder_beamsplitter = bool(kwargs.get("use_mach_zehnder_beamsplitter", False))
+        self.use_wavelet_cholesky_branch = bool(kwargs.get("use_wavelet_cholesky_branch", False))
 
         dev_init = torch.device(device) if device is not None else torch.device("cpu")
         w1_init, w2_init = optimize_orthogonal_pair_tight_frames(
@@ -170,6 +172,28 @@ class OvercompleteTwoBeamInterference(nn.Module):
             * (self.target_iso_scale * math.sqrt(float(self.embed_dim) / float(self.frame_dim)))
         )
         self.post_norm = nn.LayerNorm(self.embed_dim, eps=1e-6)
+
+        if self.use_mach_zehnder_beamsplitter:
+            self.beamsplitter_theta: nn.Parameter | None = nn.Parameter(
+                torch.full((self.frame_dim,), math.pi / 8.0, dtype=torch.float32, device=dev_init)
+            )
+        else:
+            self.register_parameter("beamsplitter_theta", None)
+
+        if self.use_wavelet_cholesky_branch:
+            self.wavelet_cholesky_branch: WaveletCholeskyMultiscaleBranch | None = (
+                WaveletCholeskyMultiscaleBranch(
+                    WaveletCholeskyConfig(
+                        embed_dim=self.embed_dim,
+                        num_levels=3,
+                        max_block_size=32,
+                        init_nonlin_gate=0.10,
+                        init_branch_scale=0.25,
+                    )
+                ).to(dev_init)
+            )
+        else:
+            self.wavelet_cholesky_branch = None
 
         if self.use_cosine_phase_beam_gate:
             self.phase_omega: nn.Parameter | None = nn.Parameter(
@@ -210,32 +234,100 @@ class OvercompleteTwoBeamInterference(nn.Module):
 
         self.last_beam2: torch.Tensor | None = None
 
+    @staticmethod
+    def _mz_phase_elementwise(
+        z1_raw: torch.Tensor,
+        z2_raw: torch.Tensor,
+        scale: float,
+        theta_bs: torch.Tensor | None,
+        omega: torch.Tensor | None,
+        phi: torch.Tensor | None,
+        gate_scale: torch.Tensor | None,
+    ) -> torch.Tensor:
+        work_dtype = z1_raw.dtype
+        z1 = z1_raw * scale
+        z2 = z2_raw * scale
+        if theta_bs is not None:
+            th = theta_bs.to(work_dtype)
+            cos_t, sin_t = torch.cos(th), torch.sin(th)
+            z1, z2 = cos_t * z1 - sin_t * z2, sin_t * z1 + cos_t * z2
+        interf = (z1 * z1) * F.silu(z2)
+        if omega is not None and phi is not None and gate_scale is not None:
+            delta_theta = omega.to(work_dtype) * (z1 - z2) + phi.to(work_dtype)
+            alpha_p = (0.50 * torch.tanh(gate_scale)).to(work_dtype)
+            interf = interf * (1.0 + alpha_p * torch.cos(delta_theta))
+        return interf
+
     def forward(
         self,
         psi: torch.Tensor,
         return_second_beam: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        u1 = l2_normalize(self.W_beam1, dim=-1, eps=self.eps).to(psi.dtype)
-        u2 = l2_normalize(self.W_beam2, dim=-1, eps=self.eps).to(psi.dtype)
+        work_dtype = (
+            torch.get_autocast_gpu_dtype()
+            if (psi.is_cuda and torch.is_autocast_enabled())
+            else psi.dtype
+        )
+        psi_w = psi.to(work_dtype)
+        u1 = l2_normalize(self.W_beam1, dim=-1, eps=self.eps).to(work_dtype)
+        u2 = l2_normalize(self.W_beam2, dim=-1, eps=self.eps).to(work_dtype)
         scale = math.sqrt(float(self.embed_dim))
-        z1 = F.linear(psi, u1) * scale
-        z2 = F.linear(psi, u2) * scale
-        interf = (z1 * z1) * F.silu(z2)
-        b2 = (z2 * z2) * F.silu(z1)
+        z1_raw = F.linear(psi_w, u1)
+        z2_raw = F.linear(psi_w, u2)
 
-        if (
-            self.use_cosine_phase_beam_gate
-            and self.phase_omega is not None
-            and self.phase_phi is not None
-            and self.phase_gate_scale is not None
-        ):
-            delta_theta = self.phase_omega.to(z1.dtype) * (z1 - z2) + self.phase_phi.to(z1.dtype)
-            alpha_p = (0.50 * torch.tanh(self.phase_gate_scale)).to(z1.dtype)
-            interf = interf * (1.0 + alpha_p * torch.cos(delta_theta))
-            b2 = b2 * (1.0 + alpha_p * torch.sin(delta_theta))
+        if not return_second_beam:
+            theta_bs = self.beamsplitter_theta if self.use_mach_zehnder_beamsplitter else None
+            omega = self.phase_omega if self.use_cosine_phase_beam_gate else None
+            phi = self.phase_phi if self.use_cosine_phase_beam_gate else None
+            gate_s = self.phase_gate_scale if self.use_cosine_phase_beam_gate else None
+            if (
+                psi_w.requires_grad
+                and z1_raw.numel() >= 4_194_304
+                and not torch.compiler.is_compiling()
+            ):
+                interf = torch.utils.checkpoint.checkpoint(
+                    self._mz_phase_elementwise,
+                    z1_raw,
+                    z2_raw,
+                    scale,
+                    theta_bs,
+                    omega,
+                    phi,
+                    gate_s,
+                    use_reentrant=False,
+                )
+            else:
+                interf = self._mz_phase_elementwise(
+                    z1_raw, z2_raw, scale, theta_bs, omega, phi, gate_s
+                )
+            b2 = None
+        else:
+            z1 = z1_raw * scale
+            z2 = z2_raw * scale
+            if self.use_mach_zehnder_beamsplitter and self.beamsplitter_theta is not None:
+                theta_bs = self.beamsplitter_theta.to(work_dtype)
+                cos_t = torch.cos(theta_bs)
+                sin_t = torch.sin(theta_bs)
+                z1, z2 = cos_t * z1 - sin_t * z2, sin_t * z1 + cos_t * z2
+            interf = (z1 * z1) * F.silu(z2)
+            b2 = (z2 * z2) * F.silu(z1)
+            if (
+                self.use_cosine_phase_beam_gate
+                and self.phase_omega is not None
+                and self.phase_phi is not None
+                and self.phase_gate_scale is not None
+            ):
+                delta_theta = self.phase_omega.to(work_dtype) * (z1 - z2) + self.phase_phi.to(work_dtype)
+                alpha_p = (0.50 * torch.tanh(self.phase_gate_scale)).to(work_dtype)
+                interf = interf * (1.0 + alpha_p * torch.cos(delta_theta))
+                b2 = b2 * (1.0 + alpha_p * torch.sin(delta_theta))
 
-        out_1 = F.linear(interf, self.W_out.to(psi.dtype))
-        normed_1 = self.post_norm(out_1.float()).to(psi.dtype)
+        out_1 = F.linear(interf, self.W_out.to(work_dtype))
+        if self.use_wavelet_cholesky_branch and self.wavelet_cholesky_branch is not None:
+            wav_delta = self.wavelet_cholesky_branch(psi_w).to(work_dtype)
+            b_scale = (0.35 * torch.tanh(self.wavelet_cholesky_branch.branch_scale)).to(work_dtype)
+            out_1 = out_1 + b_scale * wav_delta
+        normed_1 = self.post_norm(out_1).to(work_dtype)
         if (
             self.use_stereographic_lift
             and self.stereo_pole_1 is not None
@@ -250,11 +342,15 @@ class OvercompleteTwoBeamInterference(nn.Module):
                 self.stereo_gain,
                 eps=self.eps,
                 radial_norm_override=out1_radial,
-            )
+            ).to(work_dtype)
         else:
             psi_main = l2_normalize(normed_1, dim=-1, eps=self.eps)
 
-        out_2 = F.linear(b2, u2.t().to(psi.dtype)) * (
+        if not return_second_beam:
+            return psi_main
+
+        assert b2 is not None
+        out_2 = F.linear(b2, u2.t().to(work_dtype)) * (
             self.target_iso_scale * math.sqrt(float(self.embed_dim) / float(self.frame_dim))
         )
         raw_b2 = out_2 - 0.25 * out_1
@@ -271,7 +367,7 @@ class OvercompleteTwoBeamInterference(nn.Module):
                 self.stereo_gain,
                 eps=self.eps,
                 radial_norm_override=raw_b2.float().norm(p=2, dim=-1, keepdim=True),
-            )
+            ).to(work_dtype)
         else:
             psi_beam2 = l2_normalize(raw_b2, dim=-1, eps=self.eps)
 
@@ -282,13 +378,11 @@ class OvercompleteTwoBeamInterference(nn.Module):
                 b2_f - (b2_f * m_f).sum(dim=-1, keepdim=True) * m_f,
                 dim=-1,
                 eps=self.eps,
-            ).to(psi.dtype)
+            ).to(work_dtype)
 
         if not torch.compiler.is_compiling():
-            self.last_beam2 = psi_beam2
-        if return_second_beam:
-            return psi_main, psi_beam2
-        return psi_main
+            self.last_beam2 = psi_beam2.detach()
+        return psi_main, psi_beam2
 
     def frame_penalty(self) -> torch.Tensor:
         return two_beam_frame_penalty(self.W_beam1, self.W_beam2, eps=self.eps)

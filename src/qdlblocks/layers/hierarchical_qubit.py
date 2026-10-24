@@ -33,6 +33,7 @@ from .cooccurrence_init import (
     compute_ppmi_svd_embeddings,
 )
 from .stereographic_lift import apply_dimension_preserving_stereographic_rotation
+from .wavelet_cholesky import build_lower_triangular_cholesky
 
 
 def _qr_retract_orthogonal_batch(mats: torch.Tensor) -> torch.Tensor:
@@ -450,6 +451,8 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
         quadratic_diffuse_fidelity: float = 0.0,
         use_bipolar_kboson: bool = False,
         bipolar_hole_weight: float = 0.0,
+        kraus_spectral_floor: float = 0.0,
+        use_wavelet_cholesky_basis: bool = False,
         eps: float = 1e-12,
         seed: int = 42,
         *,
@@ -498,14 +501,49 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
             if float(bipolar_hole_weight) > 0.0
             else (0.85 if self.use_bipolar_kboson else 0.0)
         )
+        self.kraus_spectral_floor = float(kraus_spectral_floor)
+        self.use_wavelet_cholesky_basis = bool(use_wavelet_cholesky_basis)
+        self.last_diffuse_r_before_floor: float = 0.0
+        self.last_diffuse_r_after_floor: float = 0.0
         self.eps = float(eps)
         self.seed = int(seed)
         self.subregister_scale = 1.0 / math.sqrt(float(self.num_registers))
 
-        # 1. Fine-Grained Odd-Coordinate 16x32 Detector Table: (50304, 16, 32) = 25,755,648 parameters
-        self.povm_odd_qubits = nn.Parameter(
-            torch.empty(self.vocab_size, self.num_registers, self.register_dim)
-        )
+        # 1. Fine-Grained Odd-Coordinate Detector Table or Tied 2^16 Wavelet-Cholesky Pyramid
+        if self.use_wavelet_cholesky_basis:
+            self.register_parameter("povm_odd_qubits", None)
+            self.wavelet_packets_256: nn.Parameter | None = nn.Parameter(
+                torch.zeros(256, self.num_registers, self.register_dim, dtype=torch.float32)
+            )
+            self.wavelet_packets_1024: nn.Parameter | None = nn.Parameter(
+                torch.zeros(1024, self.num_registers, self.register_dim, dtype=torch.float32)
+            )
+            self.wavelet_packets_4096: nn.Parameter | None = nn.Parameter(
+                torch.zeros(4096, self.num_registers, self.register_dim, dtype=torch.float32)
+            )
+            self.basis_chol_tril: nn.Parameter | None = nn.Parameter(
+                torch.zeros(self.num_registers, self.register_dim, self.register_dim, dtype=torch.float32)
+            )
+            self.basis_chol_diag: nn.Parameter | None = nn.Parameter(
+                torch.zeros(self.num_registers, self.register_dim, dtype=torch.float32)
+            )
+            self.wavelet_scale_gains: nn.Parameter | None = nn.Parameter(
+                torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
+            )
+            self.register_buffer(
+                "dyadic_tree_addr",
+                (torch.arange(self.vocab_size, dtype=torch.long) * 65536) // max(1, self.vocab_size),
+            )
+        else:
+            self.povm_odd_qubits: nn.Parameter | None = nn.Parameter(
+                torch.empty(self.vocab_size, self.num_registers, self.register_dim)
+            )
+            self.register_parameter("wavelet_packets_256", None)
+            self.register_parameter("wavelet_packets_1024", None)
+            self.register_parameter("wavelet_packets_4096", None)
+            self.register_parameter("basis_chol_tril", None)
+            self.register_parameter("basis_chol_diag", None)
+            self.register_parameter("wavelet_scale_gains", None)
 
         # 2. Vocabulary-to-Hierarchy Affinity Matrix: (50304, 256) = 12,877,824 parameters
         if self.num_higher_states > 0:
@@ -660,7 +698,23 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
             dtype=torch.float32,
         )
         m_norm = l2_normalize(m_init, dim=-1, eps=self.eps) * self.subregister_scale
-        self.povm_odd_qubits.copy_(m_norm.to(self.povm_odd_qubits.dtype))
+        if self.povm_odd_qubits is not None:
+            self.povm_odd_qubits.copy_(m_norm.to(self.povm_odd_qubits.dtype))
+        if (
+            self.use_wavelet_cholesky_basis
+            and self.wavelet_packets_256 is not None
+            and self.wavelet_packets_1024 is not None
+            and self.wavelet_packets_4096 is not None
+            and self.basis_chol_tril is not None
+            and self.basis_chol_diag is not None
+            and self.wavelet_scale_gains is not None
+        ):
+            self.wavelet_packets_256.zero_()
+            self.wavelet_packets_1024.zero_()
+            self.wavelet_packets_4096.zero_()
+            self.basis_chol_tril.zero_()
+            self.basis_chol_diag.zero_()
+            self.wavelet_scale_gains.fill_(1.0)
         if self.vocab_higher_affinity is not None:
             self.vocab_higher_affinity.normal_(mean=0.0, std=0.02)
         self.readout_rms_gain.fill_(1.0)
@@ -696,9 +750,52 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
         """Map final hyperspherical states `(..., embed_dim)` to RMS-normalized readout features with learnable channel gain."""
         return F.rms_norm(psi, (self.embed_dim,), eps=self.eps) * self.readout_rms_gain.to(psi.dtype)
 
-    def get_normalized_odd_qubits(self) -> torch.Tensor:
-        """Return `(vocab_size, num_registers, register_dim)` detector states on `(S^{31})^{16}`."""
-        return l2_normalize(self.povm_odd_qubits, dim=-1, eps=self.eps) * self.subregister_scale
+    def get_effective_odd_qubits(
+        self, embedder: Hierarchical16QubitEmbedder | None = None
+    ) -> torch.Tensor:
+        """Return `(vocab_size, num_registers, register_dim)` detector qubits (untied or tied 2^16 Wavelet-Cholesky)."""
+        if not self.use_wavelet_cholesky_basis:
+            assert self.povm_odd_qubits is not None
+            return self.povm_odd_qubits
+        if embedder is None:
+            raise ValueError("embedder is required when use_wavelet_cholesky_basis=True")
+        assert (
+            self.wavelet_packets_256 is not None
+            and self.wavelet_packets_1024 is not None
+            and self.wavelet_packets_4096 is not None
+            and self.basis_chol_tril is not None
+            and self.basis_chol_diag is not None
+            and self.wavelet_scale_gains is not None
+        )
+        u_in = embedder.unigram_qubits.float()
+        alt = (
+            1.0
+            - 2.0 * (torch.arange(self.register_dim, device=u_in.device) % 2).float()
+        ).view(1, 1, -1)
+        u_anti = torch.flip(u_in, dims=[-1]) * alt
+        addr = self.dyadic_tree_addr[: self.vocab_size]
+        idx_256 = (addr >> 8).clamp(0, 255)
+        idx_1024 = (addr >> 6).clamp(0, 1023)
+        idx_4096 = (addr >> 4).clamp(0, 4095)
+        g = self.wavelet_scale_gains.float()
+        w_multi = (
+            g[0] * self.wavelet_packets_256.float().index_select(0, idx_256)
+            + g[1] * self.wavelet_packets_1024.float().index_select(0, idx_1024)
+            + g[2] * self.wavelet_packets_4096.float().index_select(0, idx_4096)
+        )
+        l_reg = build_lower_triangular_cholesky(
+            self.basis_chol_tril.float(), self.basis_chol_diag.float()
+        )
+        return torch.einsum("vqa,qab->vqb", u_anti + w_multi, l_reg).to(
+            embedder.unigram_qubits.dtype
+        )
+
+    def get_normalized_odd_qubits(
+        self, embedder: Hierarchical16QubitEmbedder | None = None
+    ) -> torch.Tensor:
+        """Return `(vocab_size, num_registers, register_dim)` detector states on `(S^{A-1})^Q`."""
+        eff = self.get_effective_odd_qubits(embedder)
+        return l2_normalize(eff, dim=-1, eps=self.eps) * self.subregister_scale
 
     def get_calibrated_softmax_weight(
         self,
@@ -706,7 +803,8 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
         base_povm_head: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Construct the unconstrained `(vocab_size, embed_dim)` readout weight matrix `W_soft` without row-wise `l2_normalize`."""
-        m_odd_unconstrained = self.povm_odd_qubits.reshape(self.vocab_size, self.flat_qubit_dim)
+        eff_odd = self.get_effective_odd_qubits(embedder)
+        m_odd_unconstrained = eff_odd.reshape(self.vocab_size, self.flat_qubit_dim)
         odd_row_norm = m_odd_unconstrained.norm(p=2, dim=-1, keepdim=True).clamp(min=0.25, max=4.0)
         m_odd_base = l2_normalize(m_odd_unconstrained, dim=-1, eps=self.eps)
         g_qubit = self.qubit_readout_gain.clamp(0.05, 0.95).to(m_odd_unconstrained.dtype)
@@ -778,8 +876,9 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
         base_povm_head: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Construct the `(vocab_size, embed_dim)` POVM effect matrix coupling `16x32` detectors and the `256` higher-level states."""
+        eff_odd = self.get_effective_odd_qubits(embedder)
         m_odd_flat = l2_normalize(
-            self.povm_odd_qubits.reshape(self.vocab_size, self.flat_qubit_dim),
+            eff_odd.reshape(self.vocab_size, self.flat_qubit_dim),
             dim=-1,
             eps=self.eps,
         )
@@ -907,11 +1006,68 @@ class Hierarchical16QubitPOVMReadout(nn.Module):
             whitened_rms = whitened_p.square().mean(dim=0, keepdim=True).add(1e-6).sqrt()
             iso_p = (whitened_p / whitened_rms) * (1.0 / math.sqrt(float(self.embed_dim)))
             psi_diff_r = (scale_side * iso_p).to(psi_beam2_norm.dtype).reshape(raw_p.shape)
+        elif self.kraus_spectral_floor > 0.0:
+            floored_p = self.apply_soft_powerlaw_spectral_floor(raw_p, self.kraus_spectral_floor)
+            psi_diff_r = scale_side * floored_p
         else:
             psi_diff_r = scale_side * raw_p
         k_eff = self.kboson_copies.clamp(min=28.0, max=48.0)
         lambda_diff = self.compute_scheduled_lambda_diff(beta_t=beta_t, k_eff=k_eff)
         return psi_sharp_norm, psi_diff_r, m_sharp_norm, m_diff_r, k_eff, lambda_diff
+
+    def apply_soft_powerlaw_spectral_floor(
+        self,
+        raw_p: torch.Tensor,
+        r_diff_floor: float | None = None,
+    ) -> torch.Tensor:
+        """Apply a soft Zipfian power-law spectral floor ONLY when empirical R_diff < r_diff_floor.
+
+        Preserves the exact identity mapping when R_diff >= r_diff_floor (default 6.5), and
+        gently lifts tail singular values toward a power-law envelope `0.48 * s_0 * (j+1)^(-0.62)`
+        while preserving Frobenius energy and strict Zipfian mode hierarchy when R_diff < r_diff_floor.
+        """
+        eff_floor = float(self.kraus_spectral_floor if r_diff_floor is None else r_diff_floor)
+        if eff_floor <= 0.0:
+            return raw_p
+        orig_shape = raw_p.shape
+        r_dim = int(orig_shape[-1])
+        flat_p = raw_p.reshape(-1, r_dim)
+        if flat_p.size(0) < r_dim:
+            return raw_p
+        with torch.no_grad(), torch.amp.autocast(raw_p.device.type, enabled=False):
+            fp = flat_p.detach().float()
+            gram = (fp.t() @ fp).float()
+            evals, evecs = torch.linalg.eigh(gram)
+            s = evals.clamp_min(1e-12).sqrt().flip(0)
+            v = evecs.flip(1)
+            p = s / s.sum().clamp_min(1e-12)
+            r_cur = float(torch.exp(-(p * torch.log(p.clamp_min(1e-12))).sum()).item())
+            if not torch.compiler.is_compiling():
+                self.last_diffuse_r_before_floor = r_cur
+            if r_cur >= eff_floor:
+                if not torch.compiler.is_compiling():
+                    self.last_diffuse_r_after_floor = r_cur
+                return raw_p
+            idx = torch.arange(1, r_dim + 1, device=s.device, dtype=torch.float32)
+            zipf_floor = s[0] * 0.52 * (idx ** -0.55)
+            s_target = torch.maximum(s, zipf_floor)
+            deficit = min(max((eff_floor - r_cur) / max(eff_floor - 3.5, 1.0), 0.30), 1.0)
+            s_blend = (1.0 - deficit) * s + deficit * s_target
+            s_clamped = s * (s_blend / s.clamp_min(1e-6)).clamp(min=0.5, max=2.2)
+            for _ in range(4):
+                p_chk = s_clamped / s_clamped.sum().clamp_min(1e-12)
+                r_chk = float(torch.exp(-(p_chk * torch.log(p_chk.clamp_min(1e-12))).sum()).item())
+                if r_chk >= eff_floor + 0.15:
+                    break
+                s_clamped = 0.65 * s_clamped + 0.35 * s_target
+            s_new = s_clamped * (s.norm(p=2) / s_clamped.norm(p=2).clamp_min(1e-12))
+            p_new = s_new / s_new.sum().clamp_min(1e-12)
+            r_new = float(torch.exp(-(p_new * torch.log(p_new.clamp_min(1e-12))).sum()).item())
+            if not torch.compiler.is_compiling():
+                self.last_diffuse_r_after_floor = r_new
+            ratios = s_new / s.clamp_min(1e-6)
+            m_scale = (v * ratios.unsqueeze(0)) @ v.t()
+        return (flat_p.float() @ m_scale).to(flat_p.dtype).reshape(orig_shape)
 
 
 @torch.no_grad()
@@ -1213,7 +1369,39 @@ def initialize_hierarchical_16qubit_with_ppmi_svd(
 
     # 4. Initialize `Hierarchical16QubitPOVMReadout`, `value_embeds`, & Legacy `wte` / `povm_head`
     if readout is not None:
-        readout.povm_odd_qubits.copy_((u_odd * sub_scale).to(readout.povm_odd_qubits.dtype))
+        if readout.povm_odd_qubits is not None:
+            readout.povm_odd_qubits.copy_((u_odd * sub_scale).to(readout.povm_odd_qubits.dtype))
+        elif (
+            getattr(readout, "use_wavelet_cholesky_basis", False)
+            and readout.wavelet_packets_256 is not None
+            and readout.wavelet_packets_1024 is not None
+            and readout.wavelet_packets_4096 is not None
+        ):
+            spec_coord = u_even.reshape(V, -1)[:, 0] + 0.5 * u_even.reshape(V, -1)[:, 1]
+            order = torch.argsort(spec_coord)
+            ranks = torch.empty_like(order)
+            ranks[order] = torch.arange(V, device=dev, dtype=order.dtype)
+            addr = (ranks * 65536) // max(1, V)
+            readout.dyadic_tree_addr.copy_(addr)
+
+            alt_init = (1.0 - 2.0 * (torch.arange(A, device=dev) % 2).float()).view(1, 1, A)
+            u_anti_init = torch.flip(u_even, dims=[-1]) * alt_init
+            residual = (u_odd - u_anti_init) * sub_scale
+            flat_res = residual.reshape(V, Q * A)
+
+            for n_bins, pkt_param, shift in (
+                (256, readout.wavelet_packets_256, 8),
+                (1024, readout.wavelet_packets_1024, 6),
+                (4096, readout.wavelet_packets_4096, 4),
+            ):
+                b_idx = (addr >> shift).clamp(0, n_bins - 1)
+                sums = torch.zeros((n_bins, Q * A), device=dev, dtype=torch.float32)
+                cnts = torch.zeros((n_bins, 1), device=dev, dtype=torch.float32)
+                sums.index_add_(0, b_idx, flat_res)
+                cnts.index_add_(0, b_idx, torch.ones((V, 1), device=dev, dtype=torch.float32))
+                mean_bin = (sums / cnts.clamp_min(1.0)).reshape(n_bins, Q, A)
+                pkt_param.copy_(mean_bin.to(pkt_param.dtype))
+                flat_res = flat_res - mean_bin.reshape(n_bins, Q * A).index_select(0, b_idx)
         if readout.vocab_higher_affinity is not None and aff_vm is not None and readout.vocab_higher_affinity.shape == (V, M):
             readout.vocab_higher_affinity.copy_(aff_vm.to(readout.vocab_higher_affinity.dtype))
         readout.readout_rms_gain.fill_(1.0)

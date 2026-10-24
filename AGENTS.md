@@ -45,3 +45,19 @@ Every new `EXPERIMENT_PLAN_0XX.md` and subagent workflow MUST include an explici
    - The blind reviewer audits Section 5 alongside Hypotheses, Planned Changes, and Testing to verify that launch/verification steps rely on deterministic scripts rather than fragile ad-hoc commands, and that `Nice-to-Have` script opportunities are clearly articulated.
 3. **In Implementer Subagent Handoffs (Friction & Ad-Hoc Command Audit)**:
    - Every implementer subagent must include a short **Tooling Friction Audit** in its completion report listing any ad-hoc one-liners it ran more than once so they can be promoted into `scripts/`.
+
+## 4. Script & Module Engineering Best Practices (`docs/SCRIPT_BEST_PRACTICES.md`)
+
+All agents and subagents writing or modifying Python files in `examples/`, `scripts/`, and `src/qdlblocks/` MUST enforce the five rules in [`docs/SCRIPT_BEST_PRACTICES.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/SCRIPT_BEST_PRACTICES.md):
+
+1. **Rule 1 — File-Length Budget (`<= 1,000` Lines Target, `<= 1,200` Hard Ceiling, No Semicolon Line-Packing)**:
+   - Keep new scripts and modules in `examples/`, `scripts/`, and `src/qdlblocks/` `<= 1,000` lines target with an absolute hard ceiling of `1,200` lines, and never pack multiple statements onto one line with semicolons (`a; b`). Extract reusable logic into `src/qdlblocks/benchmarks/` or `src/qdlblocks/layers/`.
+2. **Rule 2 — Function Signature Ceiling (`<= 8` Arguments)**:
+   - No new function or method may accept more than `8` positional/keyword arguments (excluding `self`/`cls`). Group domain hyperparameters into frozen `@dataclass(frozen=True)` objects (`BackboneConfig`, `QubitHierarchyConfig`, `KBosonReadoutConfig`, `OptimizerConfig`, `QuantumExperimentSpec` in [`src/qdlblocks/benchmarks/config_models.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/config_models.py)).
+3. **Rule 3 — Strategy / Polymorphic Dispatch Over Boolean Flag Jungles**:
+   - Replace mutually exclusive boolean flags selecting `if / elif / else` branches with explicit strategy classes, enums, or composable sub-configs resolved once at construction time.
+4. **Rule 4 — Single Shared Builders Between Local `8 GB` Scripts & Cloud Runners**:
+   - Never copy-paste `initialize_povm_log_prior`, `build_quantum_born_optimizers`, `build_quantum_model_from_spec`, or validation loops into per-plan scripts; always import them from [`src/qdlblocks/benchmarks/config_models.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/config_models.py) and [`src/qdlblocks/benchmarks/calibration_probe.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/calibration_probe.py).
+5. **Rule 5 — No Giant Closure-Capturing Nested Functions**:
+   - Keep helper functions top-level, pure, and independently unit-testable via `pytest`.
+

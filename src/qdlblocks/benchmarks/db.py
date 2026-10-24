@@ -2025,6 +2025,11 @@ def backfill_micro_verifications(
             "#00f5d4",
             "Controlled Plan 032 <=8.0 GB VRAM verification of Anti-Diagonal Spectral-Reversal Isometry (J_anti) for Full-Ambient 16x32/16x16 Qubits and Gentle 2x Zero-Weight-Decay Qubit Embedding LR.",
         ),
+        (
+            33,
+            "#00ff87",
+            "Controlled Plan 033 <=8.0 GB VRAM verification of Soft Power-Law Spectral Floor (R_diff >= 6.5), Equi-Dimensional Square-O(N) (frame_expansion=1.0), and 3,600-Step (29.5M-Token) FineWeb-Edu Scaling.",
+        ),
     ):
         p_file = cdir / f"hypothesis_experiments_{plan_num:03d}.json"
         if p_file.exists():

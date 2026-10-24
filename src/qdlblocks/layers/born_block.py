@@ -65,6 +65,8 @@ class QuantumBornBlock(nn.Module):
         qk_head_dim: int | None = None,
         use_stereographic_lift: bool = False,
         use_cosine_phase_beam_gate: bool = False,
+        use_mach_zehnder_beamsplitter: bool = False,
+        use_wavelet_cholesky_branch: bool = False,
         eps: float = 1e-12,
     ) -> None:
         super().__init__()
@@ -92,6 +94,8 @@ class QuantumBornBlock(nn.Module):
         self.qk_head_dim = qk_head_dim
         self.use_stereographic_lift = bool(use_stereographic_lift)
         self.use_cosine_phase_beam_gate = bool(use_cosine_phase_beam_gate)
+        self.use_mach_zehnder_beamsplitter = bool(use_mach_zehnder_beamsplitter)
+        self.use_wavelet_cholesky_branch = bool(use_wavelet_cholesky_branch)
         self.eps = eps
 
         if self.skip_attention:
@@ -151,6 +155,8 @@ class QuantumBornBlock(nn.Module):
                 eps=eps,
                 use_stereographic_lift=self.use_stereographic_lift,
                 use_cosine_phase_beam_gate=self.use_cosine_phase_beam_gate,
+                use_mach_zehnder_beamsplitter=self.use_mach_zehnder_beamsplitter,
+                use_wavelet_cholesky_branch=self.use_wavelet_cholesky_branch,
             )
             self.ff1 = None
             self.act = None

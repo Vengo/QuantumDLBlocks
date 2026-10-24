@@ -642,6 +642,77 @@ def sampled_povm_ce(
     )
 
 
+@torch.compile
+def _compiled_kboson_chunk_step(
+    w_sharp: torch.Tensor,
+    w_diff: torch.Tensor,
+    yc_safe: torch.Tensor,
+    valid_and_scale: tuple[torch.Tensor, torch.Tensor],
+    params: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
+    v_idx: torch.Tensor,
+    quad_w: float,
+    trace_g: float = 0.0,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    valid_f, row_scale = valid_and_scale
+    r_tilde, lam_c, k_val, log_prior_f = params
+    c_raw = w_sharp.float()
+    g_abs = abs(trace_g)
+    is_convex = trace_g < 0.0
+    if g_abs > 0.0:
+        c_hat = c_raw - c_raw.mean(dim=-1, keepdim=True)
+        c_hat_pos = torch.clamp_min(c_hat, 0.0)
+        c_hat_sq = c_hat_pos * c_hat_pos
+        c_sharp = c_hat + g_abs * (c_hat_sq - c_hat_sq.mean(dim=-1, keepdim=True))
+    else:
+        c_hat_pos = c_raw
+        c_sharp = c_raw
+    f_raw = w_diff.float()
+    c_pos = torch.clamp_min(f_raw, 0.0)
+    f_diff = f_raw + quad_w * (c_pos * c_pos) if quad_w > 0.0 else f_raw
+    if is_convex:
+        log_z = r_tilde * c_sharp + lam_c * f_diff
+        z = torch.ones_like(log_z)
+        z_mask = z
+    else:
+        z_raw = 1.0 + r_tilde * c_sharp + lam_c * f_diff
+        z_mask = (z_raw > 1e-4).float()
+        z = torch.clamp_min(z_raw, 1e-4)
+        log_z = torch.log(z)
+    logits = k_val * log_z if log_prior_f is None else k_val * log_z + log_prior_f
+    max_logits = torch.amax(logits, dim=-1, keepdim=True)
+    logits_shift = logits - max_logits
+    target_logits = logits_shift.gather(1, yc_safe)
+    exp_logits = torch.exp(logits_shift)
+    sum_exp = exp_logits.sum(dim=-1, keepdim=True)
+    loss_c = ((torch.log(sum_exp) - target_logits) * valid_f).sum()
+
+    probs = exp_logits / sum_exp
+    is_target = (v_idx == yc_safe).float()
+    g_c = (probs - is_target) * row_scale
+    dprior_c = g_c.sum(dim=0)
+    q_c = (g_c * k_val) if is_convex else (g_c * (k_val / z) * z_mask)
+    dr_tilde = (c_sharp * q_c).sum(dim=-1, keepdim=True)
+    dk_log_term = (g_c * log_z).sum()
+    dlam_c = (f_diff * q_c).sum(dim=-1, keepdim=True)
+    u_s = q_c * r_tilde
+    if g_abs > 0.0:
+        u_s_mean = u_s.mean(dim=-1, keepdim=True)
+        g_hat = u_s + (2.0 * g_abs) * c_hat_pos * (u_s - u_s_mean)
+        u_s = g_hat - g_hat.mean(dim=-1, keepdim=True)
+    grad_s = u_s.to(w_sharp.dtype)
+    grad_d_scale = (1.0 + (2.0 * quad_w) * c_pos) if quad_w > 0.0 else 1.0
+    grad_d = (q_c * lam_c * grad_d_scale).to(w_diff.dtype)
+    return loss_c, dprior_c, dr_tilde, dk_log_term, dlam_c, grad_s, grad_d
+
+
 class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
     """Single-pass chunked Two-Beam k-Boson mixed-state POVM cross-entropy with analytical gradients."""
 
@@ -662,6 +733,8 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
         valid_vocab_size: int | None = None,
         quad_diffuse_weight: float = 0.0,
         bipolar_hole_weight: float = 0.0,
+        traceless_gamma: float = 0.0,
+        gemm_precision: str = "bf16",
     ) -> torch.Tensor:
         orig_psi_s_shape = psi_sharp.shape
         orig_psi_d_shape = psi_diff.shape
@@ -681,14 +754,17 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
         if v_vocab >= 16384:
             is_high_vram = bool(
                 psi_s_flat.is_cuda
-                and (torch.cuda.get_device_properties(psi_s_flat.device).total_memory >= 24 * (1024**3))
+                and (torch.cuda.get_device_properties(psi_s_flat.device).total_memory >= 14 * (1024**3))
             )
-            chunk_sz = min(chunk_sz, 4096 if is_high_vram else 512)
+            chunk_sz = min(chunk_sz, 2048 if is_high_vram else 1024)
         ignore_idx = int(ignore_index)
         quad_w = float(quad_diffuse_weight)
         hole_w = float(bipolar_hole_weight)
+        trace_g = float(traceless_gamma)
+        g_abs = abs(trace_g)
+        is_convex = trace_g < 0.0
         use_bipolar = hole_w > 0.0
-        r_max_cap = 1.35 if use_bipolar else 0.95
+        r_max_cap = 4.0 if is_convex else (1.35 if use_bipolar else 0.95)
 
         acc_dtype = torch.float64 if psi_sharp.dtype == torch.float64 else torch.float32
         if psi_sharp.dtype == torch.float64:
@@ -724,6 +800,17 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
         need_dk = bool(ctx.needs_input_grad[5])
         need_dlam = bool(ctx.needs_input_grad[6])
         need_dprior = bool(log_prior is not None and ctx.needs_input_grad[8])
+
+        with torch.no_grad():
+            psi_s_flat = psi_s_flat.detach()
+            psi_d_flat = psi_d_flat.detach()
+            m_s_work = m_s_work.detach()
+            m_d_work = m_d_work.detach()
+            k_val = k_val.detach()
+            lam_flat = lam_flat.detach()
+            beta_flat = beta_flat.detach()
+            if log_prior_f is not None:
+                log_prior_f = log_prior_f.detach()
 
         dpsi_s = (
             torch.empty((n_tok, d), device=psi_s_flat.device, dtype=work_dtype)
@@ -766,149 +853,327 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
         valid_count = valid_all.sum().clamp(min=1).to(acc_dtype)
         inv_n_tok = 1.0 / valid_count
         total_loss = torch.zeros((), device=psi_s_flat.device, dtype=acc_dtype)
-
-        for start in range(0, n_tok, chunk_sz):
-            end = min(start + chunk_sz, n_tok)
-            psi_s_c = psi_s_flat[start:end].to(work_dtype)
-            psi_d_c = psi_d_flat[start:end].to(work_dtype)
-            yc = flat_y[start:end]
-            yc_valid = valid_all[start:end].unsqueeze(1)
-            yc_safe = torch.where(yc_valid, yc.unsqueeze(1), torch.zeros_like(yc.unsqueeze(1)))
-            valid_f = yc_valid.to(acc_dtype)
-            row_scale = valid_f * inv_n_tok
-
-            c_sharp = F.linear(psi_s_c, m_s_work).to(acc_dtype)
-            c_diff = F.linear(psi_d_c, m_d_work).to(acc_dtype)
-            if quad_w > 0.0:
-                c_pos = torch.clamp_min(c_diff, 0.0)
-                f_diff = c_diff + quad_w * (c_pos * c_pos)
-            else:
-                c_pos = None
-                f_diff = c_diff
-            beta_c = beta_flat[start:end] if is_per_token_beta else beta_flat
-            lam_c = lam_flat[start:end] if is_per_token_lam else lam_flat
-            r_raw = beta_c / k_val
-            r_mask = ((r_raw > 0.0) & (r_raw < r_max_cap)).to(acc_dtype)
-            r_tilde = torch.clamp(r_raw, min=0.0, max=r_max_cap)
-
-            if use_bipolar:
-                x_raw = r_tilde * c_sharp + lam_c * f_diff
-                x_pos = torch.clamp_min(x_raw, 0.0)
-                x_neg = torch.clamp_min(-x_raw, 0.0)
-                log_z = torch.log1p(x_pos) - hole_w * torch.log1p(x_neg)
-                del x_pos, x_neg
-                z = None
-                z_mask = None
-            else:
-                x_raw = None
-                z_raw = 1.0 + r_tilde * c_sharp + lam_c * f_diff
-                z_mask = z_raw > 1e-4
-                z = torch.clamp(z_raw, min=1e-4)
-                del z_raw
-                log_z = torch.log(z)
-
-            logits = k_val * log_z
-            if log_prior_f is not None:
-                logits.add_(log_prior_f)
-
-            max_logits = torch.amax(logits[:, :v_active], dim=-1, keepdim=True)
-            logits.sub_(max_logits)
-            target_logits = logits.gather(1, yc_safe)
-            exp_logits = torch.exp(logits)
-            del logits
-            if v_active < v_vocab:
-                exp_logits[:, v_active:] = 0.0
-            sum_exp = exp_logits.sum(dim=-1, keepdim=True)
-            total_loss.add_(((torch.log(sum_exp) - target_logits) * valid_f).sum())
-
-            if any(
-                (
-                    need_dpsi_s,
-                    need_dpsi_d,
-                    need_dm_s,
-                    need_dm_d,
-                    need_dbeta,
-                    need_dk,
-                    need_dlam,
-                    need_dprior,
-                )
-            ):
-                probs = exp_logits.div_(sum_exp)
-                probs.scatter_add_(
-                    1,
-                    yc_safe,
-                    torch.full_like(yc_safe, -1.0, dtype=acc_dtype),
-                )
-                if v_active < v_vocab:
-                    probs[:, v_active:] = 0.0
-                g_c = probs.mul_(row_scale)  # dL / d_logits_{t,v}
-
-                if need_dprior and dprior is not None:
-                    dprior.add_(g_c.sum(dim=0))
-
-                if need_dk and dk is not None:
-                    dk_log_term = (g_c * log_z).sum()
+        any_grad = any(
+            (
+                need_dpsi_s,
+                need_dpsi_d,
+                need_dm_s,
+                need_dm_d,
+                need_dbeta,
+                need_dk,
+                need_dlam,
+                need_dprior,
+            )
+        )
+        prec_mode = str(gemm_precision).lower()
+        can_lowbit_gemm = bool(
+            psi_s_flat.is_cuda
+            and prec_mode in ("fp8", "int8")
+            and (v_vocab % 16 == 0)
+            and (d % 16 == 0)
+            and (r % 16 == 0)
+        )
+        use_compiled_chunk = bool(
+            psi_s_flat.is_cuda
+            and any_grad
+            and not use_bipolar
+            and (v_active == v_vocab or can_lowbit_gemm)
+            and acc_dtype == torch.float32
+        )
+        if use_compiled_chunk:
+            with torch.no_grad():
+                buf_ws = torch.empty((chunk_sz, v_vocab), device=psi_s_flat.device, dtype=work_dtype)
+                buf_wd = torch.empty((chunk_sz, v_vocab), device=psi_s_flat.device, dtype=work_dtype)
+                v_idx = torch.arange(v_active, device=psi_s_flat.device).unsqueeze(0)
+                prior_act = log_prior_f[:, :v_active] if log_prior_f is not None else None
+                m_s_act = m_s_work[:v_active]
+                m_d_act = m_d_work[:v_active]
+                if can_lowbit_gemm and prec_mode == "fp8":
+                    sc_ms = (m_s_work.abs().amax() / 448.0).float().clamp_min(1e-12)
+                    sc_md = (m_d_work.abs().amax() / 448.0).float().clamp_min(1e-12)
+                    ms_q_t = (m_s_work / sc_ms).to(torch.float8_e4m3fn).t()
+                    md_q_t = (m_d_work / sc_md).to(torch.float8_e4m3fn).t()
+                elif can_lowbit_gemm and prec_mode == "int8":
+                    sc_ms = (m_s_work.abs().amax() / 127.0).float().clamp_min(1e-12)
+                    sc_md = (m_d_work.abs().amax() / 127.0).float().clamp_min(1e-12)
+                    ms_q_t = torch.round(m_s_work / sc_ms).clamp(-127, 127).to(torch.int8).t()
+                    md_q_t = torch.round(m_d_work / sc_md).clamp(-127, 127).to(torch.int8).t()
                 else:
-                    dk_log_term = None
-                del log_z
+                    sc_ms = sc_md = ms_q_t = md_q_t = None
 
-                if use_bipolar:
-                    assert x_raw is not None
-                    slope_factor = torch.where(
-                        x_raw >= 0.0,
-                        torch.ones_like(x_raw),
-                        torch.full_like(x_raw, hole_w),
-                    ) / (1.0 + torch.abs(x_raw))
-                    q_c = g_c * (k_val * slope_factor)
-                    del x_raw, slope_factor, g_c
-                else:
-                    assert z is not None and z_mask is not None
-                    q_c = torch.where(z_mask, g_c * (k_val / z), torch.zeros_like(g_c))
-                    del z, z_mask, g_c
-                dr_tilde = (q_c * c_sharp).sum(dim=-1, keepdim=True)
+                for start in range(0, n_tok, chunk_sz):
+                    end = min(start + chunk_sz, n_tok)
+                    c_len = end - start
+                    psi_s_c = psi_s_flat[start:end].to(work_dtype)
+                    psi_d_c = psi_d_flat[start:end].to(work_dtype)
+                    yc = flat_y[start:end]
+                    yc_valid = valid_all[start:end].unsqueeze(1)
+                    yc_safe = torch.where(yc_valid, yc.unsqueeze(1), torch.zeros_like(yc.unsqueeze(1)))
+                    valid_f = yc_valid.to(acc_dtype)
+                    row_scale = valid_f * inv_n_tok
 
-                if need_dk and dk is not None and dk_log_term is not None:
-                    dk.add_(
-                        dk_log_term
-                        - (dr_tilde * (beta_c / (k_val * k_val)) * r_mask).sum()
+                    if can_lowbit_gemm and (c_len % 16 == 0) and ms_q_t is not None and md_q_t is not None:
+                        if prec_mode == "fp8":
+                            sc_ps = (psi_s_c.abs().amax() / 448.0).float().clamp_min(1e-12)
+                            sc_pd = (psi_d_c.abs().amax() / 448.0).float().clamp_min(1e-12)
+                            ws_full = torch._scaled_mm(
+                                (psi_s_c / sc_ps).to(torch.float8_e4m3fn), ms_q_t,
+                                scale_a=sc_ps, scale_b=sc_ms, out_dtype=torch.bfloat16,
+                            ).to(work_dtype)
+                            wd_full = torch._scaled_mm(
+                                (psi_d_c / sc_pd).to(torch.float8_e4m3fn), md_q_t,
+                                scale_a=sc_pd, scale_b=sc_md, out_dtype=torch.bfloat16,
+                            ).to(work_dtype)
+                        else:
+                            sc_ps = (psi_s_c.abs().amax() / 127.0).float().clamp_min(1e-12)
+                            sc_pd = (psi_d_c.abs().amax() / 127.0).float().clamp_min(1e-12)
+                            ps_i8 = torch.round(psi_s_c / sc_ps).clamp(-127, 127).to(torch.int8)
+                            pd_i8 = torch.round(psi_d_c / sc_pd).clamp(-127, 127).to(torch.int8)
+                            ws_full = (torch._int_mm(ps_i8, ms_q_t).float() * (sc_ps * sc_ms)).to(work_dtype)
+                            wd_full = (torch._int_mm(pd_i8, md_q_t).float() * (sc_pd * sc_md)).to(work_dtype)
+                        w_sharp = ws_full[:, :v_active]
+                        w_diff = wd_full[:, :v_active]
+                    else:
+                        w_sharp = buf_ws[:c_len, :v_active]
+                        w_diff = buf_wd[:c_len, :v_active]
+                        torch.mm(psi_s_c, m_s_act.t(), out=w_sharp)
+                        torch.mm(psi_d_c, m_d_act.t(), out=w_diff)
+
+                    beta_c = beta_flat[start:end] if is_per_token_beta else beta_flat
+                    lam_c = lam_flat[start:end] if is_per_token_lam else lam_flat
+                    r_raw = beta_c / k_val
+                    r_mask = ((r_raw > 0.0) & (r_raw < r_max_cap)).to(acc_dtype)
+                    r_tilde = torch.clamp(r_raw, min=0.0, max=r_max_cap)
+
+                    loss_c, dprior_c, dr_tilde, dk_log_term, dlam_c, grad_s, grad_d = (
+                        _compiled_kboson_chunk_step(
+                            w_sharp,
+                            w_diff,
+                            yc_safe,
+                            (valid_f, row_scale),
+                            (r_tilde, lam_c, k_val, prior_act),
+                            v_idx,
+                            quad_w,
+                            trace_g,
+                        )
                     )
-
-                if need_dbeta and dbeta is not None:
-                    dbeta_c = dr_tilde * (1.0 / k_val) * r_mask
-                    if is_per_token_beta:
-                        dbeta[start:end] = dbeta_c
-                    else:
-                        dbeta.add_(dbeta_c.sum())
-
-                if need_dlam and dlam is not None:
-                    dlam_c = (q_c * f_diff).sum(dim=-1, keepdim=True)
-                    if is_per_token_lam:
-                        dlam[start:end] = dlam_c
-                    else:
-                        dlam.add_(dlam_c.sum())
-                del c_sharp, c_diff, f_diff
-
-                if need_dpsi_s or need_dm_s:
-                    dc_sharp = (q_c * r_tilde).to(work_dtype)
+                    total_loss.add_(loss_c)
+                    if need_dprior and dprior is not None:
+                        dprior[:v_active].add_(dprior_c)
+                    if need_dk and dk is not None:
+                        dk.add_(
+                            dk_log_term
+                            - (dr_tilde * (beta_c / (k_val * k_val)) * r_mask).sum()
+                        )
+                    if need_dbeta and dbeta is not None:
+                        dbeta_c = dr_tilde * (1.0 / k_val) * r_mask
+                        if is_per_token_beta:
+                            dbeta[start:end] = dbeta_c
+                        else:
+                            dbeta.add_(dbeta_c.sum())
+                    if need_dlam and dlam is not None:
+                        if is_per_token_lam:
+                            dlam[start:end] = dlam_c
+                        else:
+                            dlam.add_(dlam_c.sum())
                     if need_dpsi_s and dpsi_s is not None:
-                        torch.mm(dc_sharp, m_s_work, out=dpsi_s[start:end])
+                        torch.mm(grad_s, m_s_act, out=dpsi_s[start:end])
                     if need_dm_s and dm_s is not None:
-                        dm_s.addmm_(dc_sharp.t(), psi_s_c)
-                    del dc_sharp
-
-                if need_dpsi_d or need_dm_d:
-                    if quad_w > 0.0 and c_pos is not None:
-                        dc_diff = (q_c * lam_c * (1.0 + (2.0 * quad_w) * c_pos)).to(work_dtype)
-                    else:
-                        dc_diff = (q_c * lam_c).to(work_dtype)
+                        dm_s[:v_active].addmm_(grad_s.t(), psi_s_c)
                     if need_dpsi_d and dpsi_d is not None:
-                        torch.mm(dc_diff, m_d_work, out=dpsi_d[start:end])
+                        torch.mm(grad_d, m_d_act, out=dpsi_d[start:end])
                     if need_dm_d and dm_d is not None:
-                        dm_d.addmm_(dc_diff.t(), psi_d_c)
-                    del dc_diff
-                del c_pos, q_c
-            else:
-                del z, z_mask, x_raw, log_z, exp_logits, c_sharp, c_diff, f_diff, c_pos
+                        dm_d[:v_active].addmm_(grad_d.t(), psi_d_c)
+        else:
+            buf_logits = torch.empty((chunk_sz, v_vocab), device=psi_s_flat.device, dtype=acc_dtype)
+            buf_z = torch.empty((chunk_sz, v_vocab), device=psi_s_flat.device, dtype=acc_dtype)
+            buf_cs = torch.empty((chunk_sz, v_vocab), device=psi_s_flat.device, dtype=acc_dtype)
+            buf_fd = torch.empty((chunk_sz, v_vocab), device=psi_s_flat.device, dtype=acc_dtype)
+            buf_cp = (
+                torch.empty((chunk_sz, v_vocab), device=psi_s_flat.device, dtype=acc_dtype)
+                if quad_w > 0.0
+                else None
+            )
+            buf_work = torch.empty((chunk_sz, v_vocab), device=psi_s_flat.device, dtype=work_dtype)
+            neg_one = torch.full((chunk_sz, 1), -1.0, device=psi_s_flat.device, dtype=acc_dtype)
+
+            for start in range(0, n_tok, chunk_sz):
+                end = min(start + chunk_sz, n_tok)
+                c_len = end - start
+                psi_s_c = psi_s_flat[start:end].to(work_dtype)
+                psi_d_c = psi_d_flat[start:end].to(work_dtype)
+                yc = flat_y[start:end]
+                yc_valid = valid_all[start:end].unsqueeze(1)
+                yc_safe = torch.where(yc_valid, yc.unsqueeze(1), torch.zeros_like(yc.unsqueeze(1)))
+                valid_f = yc_valid.to(acc_dtype)
+                row_scale = valid_f * inv_n_tok
+
+                w_slice = buf_work[:c_len]
+                c_sharp = buf_cs[:c_len]
+                f_diff = buf_fd[:c_len]
+                torch.mm(psi_s_c, m_s_work.t(), out=w_slice)
+                c_sharp.copy_(w_slice)
+                torch.mm(psi_d_c, m_d_work.t(), out=w_slice)
+                f_diff.copy_(w_slice)
+
+                if g_abs > 0.0:
+                    c_act = c_sharp[:, :v_active]
+                    c_hat = c_act - c_act.mean(dim=-1, keepdim=True)
+                    c_hat_pos = torch.clamp_min(c_hat, 0.0)
+                    c_hat_sq = c_hat_pos * c_hat_pos
+                    c_act.copy_(c_hat + g_abs * (c_hat_sq - c_hat_sq.mean(dim=-1, keepdim=True)))
+                    if v_active < v_vocab:
+                        c_sharp[:, v_active:].zero_()
+                else:
+                    c_hat_pos = None
+
+                if quad_w > 0.0 and buf_cp is not None:
+                    c_pos = buf_cp[:c_len]
+                    torch.clamp_min(f_diff, 0.0, out=c_pos)
+                    f_diff.addcmul_(c_pos, c_pos, value=quad_w)
+                else:
+                    c_pos = None
+
+                beta_c = beta_flat[start:end] if is_per_token_beta else beta_flat
+                lam_c = lam_flat[start:end] if is_per_token_lam else lam_flat
+                r_raw = beta_c / k_val
+                r_mask = ((r_raw > 0.0) & (r_raw < r_max_cap)).to(acc_dtype)
+                r_tilde = torch.clamp(r_raw, min=0.0, max=r_max_cap)
+
+                logits = buf_logits[:c_len]
+                if use_bipolar:
+                    x_raw = r_tilde * c_sharp + lam_c * f_diff
+                    x_pos = torch.clamp_min(x_raw, 0.0)
+                    x_neg = torch.clamp_min(-x_raw, 0.0)
+                    log_z = torch.log1p(x_pos) - hole_w * torch.log1p(x_neg)
+                    del x_pos, x_neg
+                    z = None
+                    z_mask = None
+                    logits.copy_(log_z).mul_(k_val)
+                elif is_convex:
+                    x_raw = None
+                    z = None
+                    z_mask = None
+                    log_z = r_tilde * c_sharp + lam_c * f_diff
+                    logits.copy_(log_z).mul_(k_val)
+                else:
+                    x_raw = None
+                    log_z = None
+                    z = buf_z[:c_len]
+                    z.copy_(c_sharp).mul_(r_tilde).addcmul_(f_diff, lam_c, value=1.0).add_(1.0)
+                    z_mask = z > 1e-4
+                    z.clamp_min_(1e-4)
+                    torch.log(z, out=logits)
+                    logits.mul_(k_val)
+
+                if log_prior_f is not None:
+                    logits.add_(log_prior_f)
+
+                max_logits = torch.amax(logits[:, :v_active], dim=-1, keepdim=True)
+                logits.sub_(max_logits)
+                target_logits = logits.gather(1, yc_safe)
+                logits.exp_()
+                if v_active < v_vocab:
+                    logits[:, v_active:].zero_()
+                sum_exp = logits.sum(dim=-1, keepdim=True)
+                total_loss.add_(((torch.log(sum_exp) - target_logits) * valid_f).sum())
+
+                if any_grad:
+                    logits.div_(sum_exp)
+                    logits.scatter_add_(1, yc_safe, neg_one[:c_len])
+                    if v_active < v_vocab:
+                        logits[:, v_active:].zero_()
+                    g_c = logits.mul_(row_scale)
+
+                    if need_dprior and dprior is not None:
+                        dprior.add_(g_c.sum(dim=0))
+
+                    if use_bipolar:
+                        if need_dk and dk is not None:
+                            assert log_z is not None
+                            dk_log_term = (g_c * log_z).sum()
+                        else:
+                            dk_log_term = None
+                        del log_z
+                        assert x_raw is not None
+                        slope_factor = torch.where(
+                            x_raw >= 0.0,
+                            torch.ones_like(x_raw),
+                            torch.full_like(x_raw, hole_w),
+                        ) / (1.0 + torch.abs(x_raw))
+                        q_c = g_c.mul_(k_val).mul_(slope_factor)
+                        del x_raw, slope_factor
+                        dr_tilde = c_sharp.mul_(q_c).sum(dim=-1, keepdim=True)
+                    elif is_convex:
+                        if need_dk and dk is not None:
+                            assert log_z is not None
+                            dk_log_term = (g_c * log_z).sum()
+                        else:
+                            dk_log_term = None
+                        del log_z
+                        q_c = g_c.mul_(k_val)
+                        dr_tilde = c_sharp.mul_(q_c).sum(dim=-1, keepdim=True)
+                    else:
+                        assert z is not None and z_mask is not None
+                        c_sharp.div_(z).mul_(k_val).mul_(z_mask).mul_(g_c)
+                        dr_tilde = c_sharp.sum(dim=-1, keepdim=True)
+                        if need_dk and dk is not None:
+                            torch.log(z, out=c_sharp)
+                            c_sharp.mul_(g_c)
+                            dk_log_term = c_sharp.sum()
+                        else:
+                            dk_log_term = None
+                        q_c = g_c.mul_(k_val).div_(z).mul_(z_mask)
+                        del z_mask
+
+                    if need_dk and dk is not None and dk_log_term is not None:
+                        dk.add_(
+                            dk_log_term
+                            - (dr_tilde * (beta_c / (k_val * k_val)) * r_mask).sum()
+                        )
+
+                    if need_dbeta and dbeta is not None:
+                        dbeta_c = dr_tilde * (1.0 / k_val) * r_mask
+                        if is_per_token_beta:
+                            dbeta[start:end] = dbeta_c
+                        else:
+                            dbeta.add_(dbeta_c.sum())
+
+                    if need_dlam and dlam is not None:
+                        dlam_c = f_diff.mul_(q_c).sum(dim=-1, keepdim=True)
+                        if is_per_token_lam:
+                            dlam[start:end] = dlam_c
+                        else:
+                            dlam.add_(dlam_c.sum())
+
+                    if need_dpsi_s or need_dm_s:
+                        c_sharp.copy_(q_c).mul_(r_tilde)
+                        if g_abs > 0.0 and c_hat_pos is not None:
+                            u_act = c_sharp[:, :v_active]
+                            u_mean = u_act.mean(dim=-1, keepdim=True)
+                            g_hat = u_act + (2.0 * g_abs) * c_hat_pos * (u_act - u_mean)
+                            u_act.copy_(g_hat - g_hat.mean(dim=-1, keepdim=True))
+                            if v_active < v_vocab:
+                                c_sharp[:, v_active:].zero_()
+                        w_slice.copy_(c_sharp)
+                        if need_dpsi_s and dpsi_s is not None:
+                            torch.mm(w_slice, m_s_work, out=dpsi_s[start:end])
+                        if need_dm_s and dm_s is not None:
+                            dm_s.addmm_(w_slice.t(), psi_s_c)
+
+                    if need_dpsi_d or need_dm_d:
+                        if quad_w > 0.0 and c_pos is not None:
+                            c_pos.mul_(2.0 * quad_w).add_(1.0).mul_(lam_c).mul_(q_c)
+                            w_slice.copy_(c_pos)
+                        else:
+                            f_diff.copy_(q_c).mul_(lam_c)
+                            w_slice.copy_(f_diff)
+                        if need_dpsi_d and dpsi_d is not None:
+                            torch.mm(w_slice, m_d_work, out=dpsi_d[start:end])
+                        if need_dm_d and dm_d is not None:
+                            dm_d.addmm_(w_slice.t(), psi_d_c)
+                else:
+                    del z_mask, x_raw, log_z
 
         ctx.save_for_backward(
             dpsi_s.to(psi_sharp.dtype).view(orig_psi_s_shape)
@@ -975,6 +1240,8 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -996,6 +1263,9 @@ def direct_chunked_two_beam_kboson_ce(
     bipolar_hole_weight: float = 0.0,
     *,
     quadratic_diffuse_fidelity: float | None = None,
+    traceless_gamma: float = 0.0,
+    convex_traceless: bool = False,
+    gemm_precision: str = "bf16",
 ) -> torch.Tensor:
     """Compute single-pass chunked Two-Beam k-Boson mixed-state POVM cross-entropy with analytical gradients."""
     ref_dtype = torch.float64 if psi_sharp.dtype == torch.float64 else torch.float32
@@ -1020,6 +1290,7 @@ def direct_chunked_two_beam_kboson_ce(
         if quadratic_diffuse_fidelity is not None
         else quad_diffuse_weight
     )
+    eff_trace_g = -abs(float(traceless_gamma)) if convex_traceless else float(traceless_gamma)
     return _DirectChunkedTwoBeamKBosonCEFn.apply(
         psi_sharp,
         psi_diff,
@@ -1035,6 +1306,8 @@ def direct_chunked_two_beam_kboson_ce(
         valid_vocab_size,
         eff_quad,
         float(bipolar_hole_weight),
+        eff_trace_g,
+        str(gemm_precision),
     )
 
 
@@ -1051,11 +1324,29 @@ def compute_two_beam_kboson_logits(
     bipolar_hole_weight: float = 0.0,
     *,
     quadratic_diffuse_fidelity: float | None = None,
+    traceless_gamma: float = 0.0,
+    convex_traceless: bool = False,
+    valid_vocab_size: int | None = None,
 ) -> torch.Tensor:
     """Compute unchunked Two-Beam k-Boson log-probabilities (up to additive normalization constant)."""
     acc_dtype = torch.float64 if psi_sharp.dtype == torch.float64 else torch.float32
     c_sharp = F.linear(psi_sharp.to(acc_dtype), m_sharp.to(acc_dtype))
     c_diff = F.linear(psi_diff.to(acc_dtype), m_diff.to(acc_dtype))
+    trace_g = -abs(float(traceless_gamma)) if convex_traceless else float(traceless_gamma)
+    g_abs = abs(trace_g)
+    is_convex = trace_g < 0.0
+    if g_abs > 0.0:
+        v_tot = c_sharp.size(-1)
+        v_act = min(v_tot, int(valid_vocab_size)) if (valid_vocab_size is not None and int(valid_vocab_size) > 0) else v_tot
+        c_act = c_sharp[..., :v_act]
+        c_hat = c_act - c_act.mean(dim=-1, keepdim=True)
+        c_hat_pos = torch.clamp_min(c_hat, 0.0)
+        c_hat_sq = c_hat_pos * c_hat_pos
+        c_act_out = c_hat + g_abs * (c_hat_sq - c_hat_sq.mean(dim=-1, keepdim=True))
+        if v_act < v_tot:
+            c_sharp = torch.cat([c_act_out, torch.zeros_like(c_sharp[..., v_act:])], dim=-1)
+        else:
+            c_sharp = c_act_out
     eff_quad = float(
         quadratic_diffuse_fidelity
         if quadratic_diffuse_fidelity is not None
@@ -1093,6 +1384,9 @@ def compute_two_beam_kboson_logits(
             torch.clamp_min(-x_raw, 0.0)
         )
         logits = k_f * log_z
+    elif is_convex:
+        r_tilde = torch.clamp(beta_f / k_f, min=0.0, max=4.0)
+        logits = k_f * (r_tilde * c_sharp + lam_f * f_diff)
     else:
         r_tilde = torch.clamp(beta_f / k_f, min=0.0, max=0.95)
         z = torch.clamp(1.0 + r_tilde * c_sharp + lam_f * f_diff, min=1e-4)

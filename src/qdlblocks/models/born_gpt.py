@@ -126,6 +126,10 @@ class QuantumBornGPT(nn.Module):
         quadratic_diffuse_fidelity: float = 0.0,
         use_bipolar_kboson: bool = False,
         bipolar_hole_weight: float = 0.0,
+        kraus_spectral_floor: float = 0.0,
+        use_mach_zehnder_beamsplitter: bool = False,
+        use_wavelet_cholesky_branch: bool = False,
+        use_wavelet_cholesky_basis: bool = False,
         logit_softcap: float = 15.0,
         use_activation_checkpointing: bool = False,
         mtp_horizons: int = 1,
@@ -232,6 +236,10 @@ class QuantumBornGPT(nn.Module):
             if float(bipolar_hole_weight) > 0.0
             else (0.85 if self.use_bipolar_kboson else 0.0)
         )
+        self.kraus_spectral_floor = float(kraus_spectral_floor)
+        self.use_mach_zehnder_beamsplitter = bool(use_mach_zehnder_beamsplitter)
+        self.use_wavelet_cholesky_branch = bool(use_wavelet_cholesky_branch)
+        self.use_wavelet_cholesky_basis = bool(use_wavelet_cholesky_basis)
         self.logit_softcap = float(logit_softcap)
         self.use_activation_checkpointing = bool(use_activation_checkpointing)
         if self.use_hierarchical_16qubit and embed_dim == 2 * self.qubit_registers * self.qubit_amplitudes:
@@ -305,6 +313,8 @@ class QuantumBornGPT(nn.Module):
                 quadratic_diffuse_fidelity=self.quadratic_diffuse_fidelity,
                 use_bipolar_kboson=self.use_bipolar_kboson,
                 bipolar_hole_weight=self.bipolar_hole_weight,
+                kraus_spectral_floor=self.kraus_spectral_floor,
+                use_wavelet_cholesky_basis=self.use_wavelet_cholesky_basis,
                 eps=eps,
             )
         else:
@@ -412,6 +422,8 @@ class QuantumBornGPT(nn.Module):
                     qk_head_dim=self.qk_head_dim,
                     use_stereographic_lift=self.use_stereographic_lift,
                     use_cosine_phase_beam_gate=self.use_cosine_phase_beam_gate,
+                    use_mach_zehnder_beamsplitter=self.use_mach_zehnder_beamsplitter,
+                    use_wavelet_cholesky_branch=self.use_wavelet_cholesky_branch,
                     eps=eps,
                 )
                 for layer_idx in range(num_layers)
@@ -471,7 +483,7 @@ class QuantumBornGPT(nn.Module):
             self.register_parameter("unet_lambdas", None)
 
         # 4. Output POVM Measurement Readout
-        if readout_mode == "asymmetric":
+        if readout_mode == "asymmetric" and not self.use_wavelet_cholesky_basis:
             self.povm_readout: ProjectivePOVMHead | None = ProjectivePOVMHead(
                 vocab_size=vocab_size,
                 embed_dim=embed_dim,
@@ -481,6 +493,13 @@ class QuantumBornGPT(nn.Module):
             )
             self.povm_head = self.povm_readout.povm_head
             self.povm_head.effects = self.povm_head  # type: ignore[attr-defined]
+            self.readout_rot = None
+            self.register_parameter("povm_head_seed_delta", None)
+            self.register_parameter("tied_inv_temp", None)
+            self._dual_inv_temp = 1.0 / povm_temperature
+        elif readout_mode == "asymmetric" and self.use_wavelet_cholesky_basis:
+            self.povm_readout = None
+            self.register_parameter("povm_head", None)
             self.readout_rot = None
             self.register_parameter("povm_head_seed_delta", None)
             self.register_parameter("tied_inv_temp", None)
