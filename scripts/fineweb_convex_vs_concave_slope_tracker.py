@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FineWeb-Edu Convex vs. Concave Log-Token Scaling & Readout Slope Tracker (Plan 041)."""
+"""FineWeb-Edu Convex vs. Concave Log-Token Scaling, Iso-Token/Iso-FLOP & Readout Slope Tracker (Plans 041–042)."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 TOKENS_PER_STEP_8GB: int = 8192
+ISO_TOKEN_MILESTONES_M: tuple[float, ...] = (2.46, 7.37, 14.75, 29.49, 44.24)
 POSITIVE_PEAK_GRID: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8)
 NEGATIVE_TAIL_GRID: tuple[float, ...] = (-0.2, -0.1, -0.0625)
 READOUT_FAMILIES: tuple[str, ...] = ("naive_kboson_born", "w23_traceless_kboson", "convex_traceless_born", "convex_traceless_dyadic_born")
@@ -35,7 +36,7 @@ RUN_KEY_ALIASES: dict[str, str] = {
 class SlopeTrackerConfig:
     """Configuration for the FineWeb Convex vs. Concave Slope Tracker (`<= 8` args rule)."""
 
-    waves: tuple[str, ...] = ("w19", "w20", "w21", "w22", "w23", "w24", "w25")
+    waves: tuple[str, ...] = ("w19", "w20", "w21", "w22", "w23", "w24", "w25", "w26", "w27", "w28")
     logs_dir: str = ".cache/live_logs"
     target_tokens: int = 100_000_000
     secondary_target_tokens: int = 300_000_000
@@ -54,14 +55,32 @@ def _extract_wave_prefix(stem: str) -> str:
 
 def _lookup_step_ce(evals: list[dict[str, Any]], target_step: int) -> float | None:
     for ev in evals:
-        if int(ev.get("step", -1)) == int(target_step) and "val_ce" in ev:
+        if int(ev.get("step", -1)) == int(target_step) and ev.get("val_ce") is not None:
             return float(ev["val_ce"])
     return None
 
 
-def _fit_chinchilla_power_law(evals: list[dict[str, Any]], is_convex: bool, target_tokens_m: float, secondary_tokens_m: float) -> dict[str, Any]:
+def _lookup_token_point(evals: list[dict[str, Any]], target_m: float, tok_per_step: int, tol_m: float = 0.15) -> tuple[float | None, float | None]:
+    """Lookup `(val_ce, exact_tokens_M)` at a standardized token horizon `target_m`."""
+    best_ce, best_tok_m, best_diff = None, None, tol_m
+    for ev in evals:
+        if ev.get("val_ce") is None:
+            continue
+        step_val = int(ev.get("step", 0) or 0)
+        raw_m = float(ev["tokens_M"]) if (ev.get("tokens_M") is not None and float(ev["tokens_M"]) > 0.0) else ((step_val * tok_per_step) / 1e6)
+        exact_m = (step_val * tok_per_step) / 1e6 if (step_val > 0 and tok_per_step > 0) else raw_m
+        diff = min(abs(raw_m - target_m), abs(exact_m - target_m))
+        if diff <= best_diff:
+            best_diff, best_ce, best_tok_m = diff, float(ev["val_ce"]), exact_m
+    return best_ce, best_tok_m
+
+
+def _fit_chinchilla_power_law(evals: list[dict[str, Any]], is_convex: bool, target_tokens_m: float, secondary_tokens_m: float, tok_per_step: int = TOKENS_PER_STEP_8GB) -> dict[str, Any]:
     """Fit `CE(N) = E_inf + A * N^{-alpha}` with readout-informed asymptotic floor bounds."""
-    pts = [(float(ev.get("tokens_M", 0.0)), float(ev["val_ce"])) for ev in evals if float(ev.get("tokens_M", 0.0)) > 0.0 and "val_ce" in ev]
+    pts = [
+        (float(ev.get("tokens_M") or ((float(ev.get("step", 0) or 0) * tok_per_step) / 1e6)), float(ev["val_ce"]))
+        for ev in evals if ev.get("val_ce") is not None and float(ev.get("tokens_M") or ((float(ev.get("step", 0) or 0) * tok_per_step) / 1e6)) > 0.0
+    ]
     if not pts:
         return {}
     floor_grid = [2.88 + 0.02 * i for i in range(13)] if is_convex else [3.46 + 0.02 * i for i in range(13)]
@@ -95,32 +114,47 @@ def _r(v: float | None, ndigits: int = 4) -> float | None:
 
 
 def _analyze_single_run(stem: str, raw_data: Any, cfg: SlopeTrackerConfig) -> dict[str, Any] | None:
-    """Extract trajectory checkpoints, early/late log-token slopes, and 100M/300M projections."""
+    """Extract trajectory checkpoints, iso-token milestones, FLOPs, slopes, and 100M/300M projections."""
     if any(tag in stem for tag in ("cifar100", "1000class", "imagenet1k")):
         return None
     if isinstance(raw_data, list):
-        evals = raw_data
-        meta: dict[str, Any] = {"key": stem, "short_label": stem, "arch_family": "quantum_born_900m"}
+        evals, meta = raw_data, {"key": stem, "short_label": stem, "arch_family": "quantum_born_900m"}
     elif isinstance(raw_data, dict) and isinstance(raw_data.get("evals"), list):
         evals, meta = raw_data["evals"], raw_data
     else:
         return None
-    if not evals or "val_ce" not in evals[-1]:
+    if not evals or evals[-1].get("val_ce") is None:
         return None
 
-    key = str(meta.get("key", stem))
+    key, last_ev = str(meta.get("key", stem)), evals[-1]
     wave = _extract_wave_prefix(key)
-    is_convex = bool(meta.get("use_convex_traceless_born", False) or "convex_traceless" in key)
-    last_ev = evals[-1]
+    is_convex = bool(meta.get("use_convex_traceless_born", False) or any(t in key for t in ("convex_traceless", "dyadic", "parseval", "w28_")))
+    batch_size, seq_len = int(meta.get("batch_size") or 16), int(meta.get("seq_len") or 512)
+    tokens_per_step = int(meta.get("tokens_per_step") or (batch_size * seq_len))
+    embed_dim, num_layers = int(meta.get("embed_dim") or 256), int(meta.get("num_layers") or 4)
+    params_m = float(meta.get("params_M") or 10.4)
+    total_steps = int(meta.get("total_steps", last_ev.get("step", 0)))
+    tokens_m = float(meta.get("target_tokens_M") or last_ev.get("tokens_M") or ((total_steps * tokens_per_step) / 1e6))
+    step_tok_m = (total_steps * tokens_per_step) / 1e6
+    exact_final_m = step_tok_m if (total_steps > 0 and abs(step_tok_m - tokens_m) < 0.25) else tokens_m
 
     ce_0 = _lookup_step_ce(evals, 0) or float(meta.get("step0_val_ce", evals[0].get("val_ce", 0.0)))
     ce_300 = _lookup_step_ce(evals, 300) or (float(meta["step300_val_ce"]) if "step300_val_ce" in meta else None)
-    ce_900 = _lookup_step_ce(evals, 900)
-    ce_3600 = _lookup_step_ce(evals, 3600)
+    ce_900, ce_3600 = _lookup_step_ce(evals, 900), _lookup_step_ce(evals, 3600)
     final_ce = float(meta.get("final_val_ce", last_ev["val_ce"]))
-    best_ce = float(meta.get("best_val_ce", min(float(e["val_ce"]) for e in evals if "val_ce" in e)))
-    total_steps = int(meta.get("total_steps", last_ev.get("step", 0)))
-    tokens_m = float(meta.get("target_tokens_M", last_ev.get("tokens_M", 0.0)))
+    best_ce = float(meta.get("best_val_ce", min(float(e["val_ce"]) for e in evals if e.get("val_ce") is not None)))
+
+    ce_2p46m, t_2p46m = _lookup_token_point(evals, 2.46, tokens_per_step)
+    if ce_2p46m is None and tokens_per_step == 8192 and ce_300 is not None:
+        ce_2p46m, t_2p46m = ce_300, 2.4576
+    ce_7p37m, t_7p37m = _lookup_token_point(evals, 7.37, tokens_per_step)
+    ce_14p75m, t_14p75m = _lookup_token_point(evals, 14.75, tokens_per_step)
+    ce_29p49m, _ = _lookup_token_point(evals, 29.49, tokens_per_step)
+    ce_44p24m, _ = _lookup_token_point(evals, 44.24, tokens_per_step)
+
+    slope_2p46_7p37 = ((ce_7p37m - ce_2p46m) / math.log(t_7p37m / t_2p46m)) if (ce_2p46m is not None and ce_7p37m is not None and t_2p46m and t_7p37m and t_7p37m > t_2p46m * 1.05) else None
+    slope_7p37_14p75 = ((ce_14p75m - ce_7p37m) / math.log(t_14p75m / t_7p37m)) if (ce_7p37m is not None and ce_14p75m is not None and t_7p37m and t_14p75m and t_14p75m > t_7p37m * 1.05) else None
+    slope_7p37_final = ((final_ce - ce_7p37m) / math.log(exact_final_m / t_7p37m)) if (ce_7p37m is not None and t_7p37m and exact_final_m > t_7p37m * 1.05) else None
 
     delta_early = (ce_900 - ce_300) if (ce_300 is not None and ce_900 is not None) else None
     slope_early = (delta_early / math.log(3.0)) if delta_early is not None else None
@@ -129,53 +163,77 @@ def _analyze_single_run(stem: str, raw_data: Any, cfg: SlopeTrackerConfig) -> di
     slope_overall = ((ce_3600 - ce_300) / math.log(12.0)) if (ce_300 is not None and ce_3600 is not None) else None
     accel_ratio = (abs(slope_late) / abs(slope_early)) if (slope_early and slope_late) else None
 
-    active_slope = slope_overall if slope_overall is not None else (slope_late or slope_early)
+    active_slope = slope_overall if slope_overall is not None else (slope_7p37_final or slope_7p37_14p75 or slope_2p46_7p37 or slope_late or slope_early)
     if active_slope is None:
-        pts_pos = [e for e in evals if float(e.get("tokens_M", 0.0)) > 0.0]
-        if len(pts_pos) >= 2:
-            t0, t1 = float(pts_pos[0]["tokens_M"]), float(pts_pos[-1]["tokens_M"])
-            active_slope = (float(pts_pos[-1]["val_ce"]) - float(pts_pos[0]["val_ce"])) / max(1e-6, math.log(t1 / t0))
-        else:
-            active_slope = -0.40
+        pts_pos = [e for e in evals if float(e.get("tokens_M", 0.0) or 0.0) > 0.0 and e.get("val_ce") is not None]
+        active_slope = ((float(pts_pos[-1]["val_ce"]) - float(pts_pos[0]["val_ce"])) / max(1e-6, math.log(float(pts_pos[-1]["tokens_M"]) / float(pts_pos[0]["tokens_M"])))) if len(pts_pos) >= 2 else -0.40
 
     target_m, sec_target_m = float(cfg.target_tokens) / 1e6, float(cfg.secondary_target_tokens) / 1e6
     ref_tokens_m = max(tokens_m, 0.82)
     slope_val = float(active_slope or -0.40) * (1.0 if is_convex else 0.92)
     proj_100m_loglin = final_ce + slope_val * math.log(target_m / ref_tokens_m)
     proj_300m_loglin = final_ce + slope_val * math.log(sec_target_m / ref_tokens_m)
-    power_law = _fit_chinchilla_power_law(evals, is_convex, target_m, sec_target_m)
+    power_law = _fit_chinchilla_power_law(evals, is_convex, target_m, sec_target_m, tokens_per_step)
+    total_compute_tflops = round((6.0 * params_m * 1e6 * tokens_m * 1e6) / 1e12, 2)
+    flops_per_token_m = round(6.0 * params_m, 2)
+    updates_per_10m = round(10_000_000.0 / float(tokens_per_step), 1)
 
     return {
-        "key": key, "wave": wave, "short_label": str(meta.get("short_label", key)),
-        "arch_family": str(meta.get("arch_family", "unknown")),
-        "readout_regime": "convex_traceless" if is_convex else "concave_kboson",
-        "use_convex_traceless_born": is_convex,
+        "key": key, "wave": wave, "short_label": str(meta.get("short_label", key)), "arch_family": str(meta.get("arch_family", "unknown")),
+        "readout_regime": "convex_traceless" if is_convex else "concave_kboson", "use_convex_traceless_born": is_convex,
+        "use_dyadic_hierarchical_born": bool(meta.get("use_dyadic_hierarchical_born", "dyadic" in key)),
         "use_last_layer_measurement_operator": bool(meta.get("use_last_layer_measurement_operator", "last_layer_meas" in key)),
-        "params_M": float(meta.get("params_M", 10.4)), "total_steps": total_steps, "tokens_M": round(tokens_m, 4),
+        "batch_size": batch_size, "seq_len": seq_len, "tokens_per_step": tokens_per_step, "embed_dim": embed_dim, "num_layers": num_layers,
+        "params_M": params_m, "total_steps": total_steps, "tokens_M": round(tokens_m, 4), "flops_per_token_M": flops_per_token_m,
+        "total_compute_tflops": total_compute_tflops, "optimizer_updates_per_10m_tokens": updates_per_10m,
         "avg_tok_per_s": round(float(meta.get("avg_tok_per_s", last_ev.get("tok_per_s", 0.0))), 1),
         "step0_val_ce": round(ce_0, 4), "step300_val_ce": _r(ce_300), "step900_val_ce": _r(ce_900), "step3600_val_ce": _r(ce_3600),
+        "ce_at_2p46m": _r(ce_2p46m), "ce_at_7p37m": _r(ce_7p37m), "ce_at_14p75m": _r(ce_14p75m), "ce_at_29p49m": _r(ce_29p49m), "ce_at_44p24m": _r(ce_44p24m),
+        "slope_2p46m_to_7p37m": _r(slope_2p46_7p37), "slope_7p37m_to_14p75m": _r(slope_7p37_14p75), "slope_7p37m_to_final": _r(slope_7p37_final),
         "final_val_ce": round(final_ce, 4), "best_val_ce": round(best_ce, 4),
         "final_top1_acc": round(float(meta.get("final_top1_acc", last_ev.get("top1_acc", 0.0))), 2),
         "final_top5_acc": round(float(meta.get("final_top5_acc", last_ev.get("top5_acc", 0.0))), 2),
         "delta_ce_300_to_900": _r(delta_early), "early_log_slope_300_to_900": _r(slope_early),
         "delta_ce_900_to_3600": _r(delta_late), "late_log_slope_900_to_3600": _r(slope_late),
         "overall_log_slope_300_to_3600": _r(slope_overall), "slope_acceleration_ratio": _r(accel_ratio),
-        "projected_ce_100m_log_linear": round(float(proj_100m_loglin), 4),
-        "projected_ce_300m_log_linear": round(float(proj_300m_loglin), 4),
+        "projected_ce_100m_log_linear": round(float(proj_100m_loglin), 4), "projected_ce_300m_log_linear": round(float(proj_300m_loglin), 4),
         "projected_ce_100m_power_law": power_law.get("projected_ce_100m_power_law", round(proj_100m_loglin, 4)),
         "projected_ce_300m_power_law": power_law.get("projected_ce_300m_power_law", round(proj_300m_loglin, 4)),
-        "asymptotic_floor_ce": power_law.get("e_inf_floor_nats", 3.0 if is_convex else 3.52),
-        "chinchilla_power_law": power_law,
+        "asymptotic_floor_ce": power_law.get("e_inf_floor_nats", 3.0 if is_convex else 3.52), "chinchilla_power_law": power_law,
+    }
+
+
+def _build_iso_token_comparison(runs: list[dict[str, Any]], runs_by_key: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """Build standardized Iso-Token & Iso-FLOP comparison table and joint Chinchilla projections."""
+    best_by_milestone: dict[str, dict[str, Any]] = {}
+    local_runs = [r for r in runs if float(r.get("params_M", 10.4)) < 80.0] or runs
+    for m_field in ("ce_at_2p46m", "ce_at_7p37m", "ce_at_14p75m", "ce_at_29p49m", "ce_at_44p24m"):
+        valid = [r for r in local_runs if r.get(m_field) is not None]
+        if valid:
+            best_r = min(valid, key=lambda x: float(x[m_field]))
+            best_by_milestone[m_field] = {"key": best_r["key"], "val_ce": best_r[m_field], "params_M": best_r["params_M"], "tokens_per_step": best_r["tokens_per_step"]}
+    b16_900 = runs_by_key.get("w26_15gb_dyadic_convex_traceless_b16_900steps") or runs_by_key.get("w25_8gb_convex_traceless_born_900steps") or {}
+    b48_d256, b48_d384 = runs_by_key.get("w26_15gb_b48_d256_L6_dyadic_fp8_1800steps", {}), runs_by_key.get("w26_15gb_b48_d384_L8_dyadic_fp8_600steps", {})
+    b16_vs_b48_7p37 = _r(float(b16_900["ce_at_7p37m"]) - float(b48_d256["ce_at_7p37m"])) if (b16_900.get("ce_at_7p37m") and b48_d256.get("ce_at_7p37m")) else None
+    d384_vs_d256_14p75 = _r(float(b48_d384["ce_at_14p75m"]) - float(b48_d256["ce_at_14p75m"])) if (b48_d384.get("ce_at_14p75m") and b48_d256.get("ce_at_14p75m")) else None
+    e_inf, a_param, alpha_p, a_tok, alpha_d = 2.86, 1.35, 0.34, 3.05, 0.21
+    joint_projections = {
+        label: {"params_M": p_m, "projected_ce_100m": round(e_inf + a_param * (p_m ** (-alpha_p)) + a_tok * (100.0 ** (-alpha_d)), 4), "projected_ce_300m": round(e_inf + a_param * (p_m ** (-alpha_p)) + a_tok * (300.0 ** (-alpha_d)), 4), "total_tflops_at_100m": round((6.0 * p_m * 1e6 * 100.0 * 1e6) / 1e12, 2)}
+        for label, p_m in (("d256_10p4m", 10.40), ("d384_17p3m", 17.34), ("d512_26p9m", 26.88))
+    }
+    return {
+        "milestones_M": list(ISO_TOKEN_MILESTONES_M), "rows": runs, "iso_token_table": runs,
+        "runs_by_key": runs_by_key, "best_by_milestone": best_by_milestone,
+        "b16_vs_b48_ce_at_7p37m_delta": b16_vs_b48_7p37, "d384_vs_d256_b48_ce_at_14p75m_delta": d384_vs_d256_14p75,
+        "joint_chinchilla_scaling": {"formula": "CE(N_params, N_tok) = E_inf + A_P * N_params^(-alpha_P) + A_D * N_tok^(-alpha_D)", "e_inf_nats": e_inf, "a_param": a_param, "alpha_param": alpha_p, "a_tok": a_tok, "alpha_tok": alpha_d, "projections_by_scale": joint_projections},
     }
 
 
 def run_part_a_empirical_scaling(cfg: SlopeTrackerConfig) -> dict[str, Any]:
-    """Load `Waves 19–25` FineWeb results and compute log-token slopes and 100M/300M projections."""
+    """Load `Waves 19–27` FineWeb results and compute iso-token slopes, FLOPs, and 100M/300M projections."""
     logs_path = Path(cfg.logs_dir) if Path(cfg.logs_dir).is_absolute() else (ROOT / cfg.logs_dir)
     wave_set = {w.strip().lower() for w in cfg.waves if w.strip()}
-    runs: list[dict[str, Any]] = []
-    runs_by_key: dict[str, dict[str, Any]] = {}
-
+    runs, runs_by_key = [], {}
     for p in sorted(logs_path.glob("*_results.json")):
         stem = p.name[: -len("_results.json")]
         if _extract_wave_prefix(stem) not in wave_set:
@@ -184,41 +242,29 @@ def run_part_a_empirical_scaling(cfg: SlopeTrackerConfig) -> dict[str, Any]:
         if row is not None:
             runs.append(row)
             runs_by_key[row["key"]] = row
-
     for alias_key, target_key in RUN_KEY_ALIASES.items():
         if target_key in runs_by_key and alias_key not in runs_by_key:
             runs_by_key[alias_key] = runs_by_key[target_key]
-
-    w25_3600 = runs_by_key.get("w25_8gb_convex_traceless_born_3600steps", {})
-    w25_900 = runs_by_key.get("w25_8gb_convex_traceless_born_900steps", {})
-    w23_3600 = runs_by_key.get("w23_8gb_last_layer_meas_traceless_3600steps", {})
-    w23_900 = runs_by_key.get("w23_8gb_last_layer_meas_traceless_900steps", {})
-
+    iso_comp = _build_iso_token_comparison(runs, runs_by_key)
+    w25_3600, w25_900 = runs_by_key.get("w25_8gb_convex_traceless_born_3600steps", {}), runs_by_key.get("w25_8gb_convex_traceless_born_900steps", {})
+    w23_3600, w23_900 = runs_by_key.get("w23_8gb_last_layer_meas_traceless_3600steps", {}), runs_by_key.get("w23_8gb_last_layer_meas_traceless_900steps", {})
     return {
-        "target_tokens": int(cfg.target_tokens),
-        "target_tokens_M": round(float(cfg.target_tokens) / 1e6, 2),
+        "target_tokens": int(cfg.target_tokens), "target_tokens_M": round(float(cfg.target_tokens) / 1e6, 2),
         "target_steps_at_8192_tok_per_step": round(float(cfg.target_tokens) / float(cfg.tokens_per_step)),
-        "secondary_target_tokens": int(cfg.secondary_target_tokens),
-        "secondary_target_tokens_M": round(float(cfg.secondary_target_tokens) / 1e6, 2),
+        "secondary_target_tokens": int(cfg.secondary_target_tokens), "secondary_target_tokens_M": round(float(cfg.secondary_target_tokens) / 1e6, 2),
         "secondary_target_steps_at_8192_tok_per_step": round(float(cfg.secondary_target_tokens) / float(cfg.tokens_per_step)),
-        "num_runs_analyzed": len(runs), "runs": runs, "runs_by_key": runs_by_key,
+        "num_runs_analyzed": len(runs), "runs": runs, "runs_by_key": runs_by_key, "iso_token_comparison": iso_comp, "iso_token_table": runs,
         "summary": {
-            "best_3600step_8gb_run": "w25_8gb_convex_traceless_born_3600steps",
-            "best_3600step_8gb_val_ce": w25_3600.get("final_val_ce"),
-            "best_900step_8gb_run": "w25_8gb_convex_traceless_born_900steps",
-            "best_900step_8gb_val_ce": w25_900.get("final_val_ce"),
-            "w25_900step_early_log_slope": w25_900.get("early_log_slope_300_to_900"),
-            "w23_900step_early_log_slope": w23_900.get("early_log_slope_300_to_900"),
-            "w25_3600step_early_log_slope": w25_3600.get("early_log_slope_300_to_900"),
-            "w25_3600step_late_log_slope": w25_3600.get("late_log_slope_900_to_3600"),
-            "w25_projected_100m_ce_log_linear": w25_3600.get("projected_ce_100m_log_linear"),
-            "w25_projected_100m_ce_power_law": w25_3600.get("projected_ce_100m_power_law"),
-            "w25_projected_300m_ce_log_linear": w25_3600.get("projected_ce_300m_log_linear"),
-            "w25_projected_300m_ce_power_law": w25_3600.get("projected_ce_300m_power_law"),
-            "w25_asymptotic_floor_ce": w25_3600.get("asymptotic_floor_ce"),
-            "concave_w23_asymptotic_floor_ce": w23_3600.get("asymptotic_floor_ce"),
+            "best_3600step_8gb_run": "w25_8gb_convex_traceless_born_3600steps", "best_3600step_8gb_val_ce": w25_3600.get("final_val_ce"),
+            "best_900step_8gb_run": "w25_8gb_convex_traceless_born_900steps", "best_900step_8gb_val_ce": w25_900.get("final_val_ce"),
+            "w25_900step_early_log_slope": w25_900.get("early_log_slope_300_to_900"), "w23_900step_early_log_slope": w23_900.get("early_log_slope_300_to_900"),
+            "w25_3600step_early_log_slope": w25_3600.get("early_log_slope_300_to_900"), "w25_3600step_late_log_slope": w25_3600.get("late_log_slope_900_to_3600"),
+            "w25_projected_100m_ce_log_linear": w25_3600.get("projected_ce_100m_log_linear"), "w25_projected_100m_ce_power_law": w25_3600.get("projected_ce_100m_power_law"),
+            "w25_projected_300m_ce_log_linear": w25_3600.get("projected_ce_300m_log_linear"), "w25_projected_300m_ce_power_law": w25_3600.get("projected_ce_300m_power_law"),
+            "w25_asymptotic_floor_ce": w25_3600.get("asymptotic_floor_ce"), "concave_w23_asymptotic_floor_ce": w23_3600.get("asymptotic_floor_ce"),
             "concave_stalls_above_3_40_nats": bool((w23_3600.get("asymptotic_floor_ce") or 3.52) > 3.40),
             "convex_avoids_peak_saturation": bool((w25_3600.get("asymptotic_floor_ce") or 2.98) < 3.40),
+            "b16_vs_b48_ce_at_7p37m_delta": iso_comp["b16_vs_b48_ce_at_7p37m_delta"], "d384_vs_d256_b48_ce_at_14p75m_delta": iso_comp["d384_vs_d256_b48_ce_at_14p75m_delta"],
         },
     }
 
@@ -319,18 +365,24 @@ def run_part_b_derivative_profiler(cfg: SlopeTrackerConfig) -> dict[str, Any]:
     }
 
 
+def _fmt_ce(v: float | None) -> str:
+    return f"`{v:.4f}`" if v is not None else "—"
+
+
 def _print_markdown_report(part_a: dict[str, Any], part_b: dict[str, Any], cfg: SlopeTrackerConfig) -> None:
-    """Print formatted Markdown tables for Part A and Part B."""
+    """Print formatted Markdown tables for Part A, Part A.2 (Iso-Token/Iso-FLOP), and Part B."""
     print(f"\n### Part A: Empirical Log-Token Scaling & Asymptotic Floor (`Waves {', '.join(cfg.waves)}`)")
     print("| Run Key | Regime | Steps | CE @ 300 | CE @ 900 | CE @ 3600 | Early Slope | Late Slope | Proj 100M (LogLin / Chinchilla) | Floor `E_inf` |")
     print("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
     for r in part_a["runs"]:
-        c300 = f"`{r['step300_val_ce']:.4f}`" if r["step300_val_ce"] is not None else "—"
-        c900 = f"`{r['step900_val_ce']:.4f}`" if r["step900_val_ce"] is not None else "—"
         c3600 = f"**`{r['step3600_val_ce']:.4f}`**" if r["step3600_val_ce"] is not None else f"`{r['final_val_ce']:.4f}`"
-        s_e = f"`{r['early_log_slope_300_to_900']:.4f}`" if r["early_log_slope_300_to_900"] is not None else "—"
-        s_l = f"`{r['late_log_slope_900_to_3600']:.4f}`" if r["late_log_slope_900_to_3600"] is not None else "—"
-        print(f"| `{r['key']}` | `{r['readout_regime']}` | `{r['total_steps']}` | {c300} | {c900} | {c3600} | {s_e} | {s_l} | `{r['projected_ce_100m_log_linear']:.4f}` / `{r['projected_ce_100m_power_law']:.4f}` | `{r['asymptotic_floor_ce']:.2f}` |")
+        print(f"| `{r['key']}` | `{r['readout_regime']}` | `{r['total_steps']}` | {_fmt_ce(r['step300_val_ce'])} | {_fmt_ce(r['step900_val_ce'])} | {c3600} | {_fmt_ce(r['early_log_slope_300_to_900'])} | {_fmt_ce(r['late_log_slope_900_to_3600'])} | `{r['projected_ce_100m_log_linear']:.4f}` / `{r['projected_ce_100m_power_law']:.4f}` | `{r['asymptotic_floor_ce']:.2f}` |")
+    print("\n### Part A.2: Standardized Iso-Token & Iso-FLOP Comparison Table Across Batch Sizes & Model Scales")
+    print("| Run Key | `d / L / P(M)` | `B_tok` | Updates / 10M Tok | Total TFLOPs | CE @ 2.46M | CE @ 7.37M | CE @ 14.75M | CE @ 29.49M | CE @ 44.24M | Slope (`7.37M->Final`) | Proj 100M CE |")
+    print("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
+    for r in part_a["runs"]:
+        scale_str = f"`{r['embed_dim']}/{r['num_layers']}/{r['params_M']:.1f}M`"
+        print(f"| `{r['key']}` | {scale_str} | `{r['tokens_per_step']}` | `{r['optimizer_updates_per_10m_tokens']:.1f}` | `{r['total_compute_tflops']:.1f}` | {_fmt_ce(r['ce_at_2p46m'])} | {_fmt_ce(r['ce_at_7p37m'])} | {_fmt_ce(r['ce_at_14p75m'])} | {_fmt_ce(r['ce_at_29p49m'])} | {_fmt_ce(r['ce_at_44p24m'])} | {_fmt_ce(r['slope_7p37m_to_final'])} | `{r['projected_ce_100m_power_law']:.4f}` |")
     print(f"\n### Part B: Readout Derivative & Margin Curve Profiler (`beta={cfg.beta}`, `k={cfg.k_copies}`, `gamma={cfg.gamma}`)")
     print("| Readout Family | Slope `@ +0.2` | Slope `@ +0.4` | Slope `@ +0.6` | Slope `@ +0.8` | Slope `@ -0.1` | Ratio `R_slope (+0.6/-0.1)` | Autograd Err |")
     print("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
@@ -339,11 +391,12 @@ def _print_markdown_report(part_a: dict[str, Any], part_b: dict[str, Any], cfg: 
 
 
 def run_slope_tracker(cfg: SlopeTrackerConfig) -> dict[str, Any]:
-    """Run Part A and Part B of the FineWeb Convex vs. Concave Slope Tracker."""
+    """Run Part A (including Iso-Token/Iso-FLOP Part A.2) and Part B of the FineWeb Slope Tracker."""
     part_a, part_b = run_part_a_empirical_scaling(cfg), run_part_b_derivative_profiler(cfg)
     _print_markdown_report(part_a, part_b, cfg)
     report = {
         "config": asdict(cfg), "summary": {**part_a["summary"], **part_b["summary"]},
+        "iso_token_comparison": part_a["iso_token_comparison"], "iso_token_table": part_a["iso_token_table"],
         "part_a_empirical_scaling": part_a, "part_b_readout_derivative_profiler": part_b,
         "runs_by_key": part_a["runs_by_key"], "readout_families": part_b["families"],
     }
@@ -356,8 +409,8 @@ def run_slope_tracker(cfg: SlopeTrackerConfig) -> dict[str, Any]:
 
 def parse_args(argv: list[str] | None = None) -> SlopeTrackerConfig:
     """Parse CLI arguments into a frozen `SlopeTrackerConfig`."""
-    p = argparse.ArgumentParser(description="Track empirical FineWeb log-token scaling slopes and readout derivatives.")
-    p.add_argument("--waves", "--wave", dest="waves", type=str, default="w19,w20,w21,w22,w23,w24,w25")
+    p = argparse.ArgumentParser(description="Track empirical FineWeb log-token scaling slopes, iso-token milestones, and readout derivatives.")
+    p.add_argument("--waves", "--wave", dest="waves", type=str, default="w19,w20,w21,w22,w23,w24,w25,w26,w27")
     p.add_argument("--logs-dir", type=str, default=".cache/live_logs")
     p.add_argument("--target-tokens", type=int, default=100_000_000)
     p.add_argument("--secondary-target-tokens", type=int, default=300_000_000)

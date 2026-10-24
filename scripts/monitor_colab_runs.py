@@ -1115,10 +1115,94 @@ def parse_log_metrics(
     log_text: str,
     peak_tflops: float,
     default_tps: float = 280000.0,
-    results_json: list[dict[str, Any]] | None = None,
+    results_json: list[dict[str, Any]] | dict[str, Any] | None = None,
     log_mtime: float | None = None,
     ps_alive: bool | None = None,
 ) -> dict[str, Any]:
+    dict_completed = False
+    dict_best_ce: float | None = None
+    dict_tps: float | None = None
+    dict_wall_min: float | None = None
+    dict_params_m: float | None = None
+    dict_embed_dim: int | None = None
+    dict_num_layers: int | None = None
+    dict_total_steps: int | None = None
+    dict_target_tok_m: float | None = None
+    dict_batch_size: int | None = None
+    dict_seq_len: int | None = None
+    dict_schedule: str | None = None
+    dict_sharp_rank: float | None = None
+    dict_diffuse_rank: float | None = None
+    dict_stiefel_err: float | None = None
+    dict_top1: float | None = None
+    dict_top50: float | None = None
+    dict_task_domain: str | None = None
+    dict_hypothesis_intent: str | None = None
+
+    if isinstance(results_json, dict):
+        eval_items = (
+            results_json.get("evals")
+            if isinstance(results_json.get("evals"), list)
+            else ([results_json] if "val_ce" in results_json else [])
+        )
+        dict_completed = bool(
+            results_json.get("completed", True)
+            or results_json.get("final_val_ce") is not None
+            or results_json.get("best_val_ce") is not None
+        )
+        raw_best_ce = results_json.get("best_val_ce", results_json.get("final_val_ce"))
+        if raw_best_ce is not None:
+            dict_best_ce = float(raw_best_ce)
+        if results_json.get("avg_tok_per_s") is not None:
+            dict_tps = float(results_json["avg_tok_per_s"])
+        if results_json.get("wall_min") is not None:
+            dict_wall_min = float(results_json["wall_min"])
+        elif "elapsed_sec" in results_json and results_json["elapsed_sec"] is not None:
+            dict_wall_min = float(results_json["elapsed_sec"]) / 60.0
+        elif "wall_s" in results_json and results_json["wall_s"] is not None:
+            dict_wall_min = float(results_json["wall_s"]) / 60.0
+        if results_json.get("params_M") is not None:
+            dict_params_m = float(results_json["params_M"])
+        elif results_json.get("params") is not None:
+            dict_params_m = float(results_json["params"]) / 1e6
+        if results_json.get("embed_dim") is not None:
+            dict_embed_dim = int(results_json["embed_dim"])
+        if results_json.get("num_layers") is not None:
+            dict_num_layers = int(results_json["num_layers"])
+        raw_tot_st = results_json.get("total_steps", results_json.get("steps"))
+        if isinstance(raw_tot_st, (int, float)):
+            dict_total_steps = int(raw_tot_st)
+        raw_tot_tok = results_json.get("target_tokens_M", results_json.get("total_tokens_M"))
+        if raw_tot_tok is not None:
+            dict_target_tok_m = float(raw_tot_tok)
+        if results_json.get("batch_size") is not None:
+            dict_batch_size = int(results_json["batch_size"])
+        if results_json.get("seq_len") is not None:
+            dict_seq_len = int(results_json["seq_len"])
+        if results_json.get("schedule") is not None:
+            dict_schedule = str(results_json["schedule"])
+        if results_json.get("sharp_eff_rank") is not None:
+            dict_sharp_rank = float(results_json["sharp_eff_rank"])
+        if results_json.get("diffuse_eff_rank") is not None:
+            dict_diffuse_rank = float(results_json["diffuse_eff_rank"])
+        raw_st_err = results_json.get("max_kraus_stiefel_err", results_json.get("kraus_stiefel_err"))
+        if raw_st_err is not None:
+            dict_stiefel_err = float(raw_st_err)
+        raw_t1 = results_json.get("final_top1_acc", results_json.get("best_top1"))
+        if raw_t1 is not None:
+            dict_top1 = float(raw_t1)
+        raw_t50 = results_json.get("final_top50_acc", results_json.get("top50_acc"))
+        if raw_t50 is not None:
+            dict_top50 = float(raw_t50)
+        if results_json.get("task_domain"):
+            dict_task_domain = str(results_json["task_domain"]).strip()
+        if results_json.get("hypothesis_intent"):
+            dict_hypothesis_intent = str(results_json["hypothesis_intent"]).strip()
+    elif isinstance(results_json, list):
+        eval_items = results_json
+    else:
+        eval_items = []
+
     steps = []
     for m in STEP_RE.finditer(log_text):
         tps = int(m.group(6).replace(",", ""))
@@ -1140,14 +1224,17 @@ def parse_log_metrics(
                 "hfu_pct": round(100.0 * hw_tflops / peak_tflops, 2),
             }
         )
-    avg_tps = (sum(s["tok_per_s"] for s in steps) / len(steps)) if steps else default_tps
+    avg_tps = (
+        (sum(s["tok_per_s"] for s in steps) / len(steps))
+        if steps
+        else (float(dict_tps) if dict_tps is not None and dict_tps > 0 else default_tps)
+    )
 
-    # Map step -> extra fields from results_json if available
+    # Map step -> extra fields from eval_items if available
     extra_by_step: dict[int, dict[str, Any]] = {}
-    if results_json:
-        for item in results_json:
-            if isinstance(item, dict) and "step" in item:
-                extra_by_step[int(item["step"])] = item
+    for item in eval_items:
+        if isinstance(item, dict) and "step" in item:
+            extra_by_step[int(item["step"])] = item
 
     evals = []
     seen_eval_steps: set[int] = set()
@@ -1155,7 +1242,7 @@ def parse_log_metrics(
         ep = float(m.group(1))
         st = int(m.group(2))
         tok_m = float(m.group(3))
-        seq_t = int(m.group(4)) if m.group(4) else 512
+        seq_t = int(m.group(4)) if m.group(4) else (dict_seq_len or 512)
         val_ce = float(m.group(5))
         val_ppl = float(m.group(6))
         top1 = float(m.group(7))
@@ -1168,6 +1255,8 @@ def parse_log_metrics(
         beta = float(m.group(13)) if m.group(13) else round(28.57 + 4.10 * prog, 2)
         ext = extra_by_step.get(st, {})
         seen_eval_steps.add(st)
+        s_rank_ext = ext.get("sharp_eff_rank", ext.get("seed_eff_rank"))
+        k_err_ext = float(ext.get("kraus_stiefel_err", ext.get("iso_err", iso)))
         evals.append(
             {
                 "epoch": ep,
@@ -1179,48 +1268,77 @@ def parse_log_metrics(
                 "val_ppl": val_ppl,
                 "top1_acc": top1,
                 "top5_acc": top5,
+                "top50_acc": float(ext.get("top50_acc", ext.get("val_top50", 0.0))),
                 "med_rank": med_r,
                 "iso_err": iso,
+                "kraus_stiefel_err": k_err_ext,
                 "entanglement_nats": ent_nats,
                 "gamma_h": gamma_h,
                 "povm_beta": beta,
-                "seed_eff_rank": ext.get("seed_eff_rank"),
+                "compute_tflops": float(ext.get("compute_tflops") or 0.0),
+                "tau_progress": float(ext.get("tau_progress") or 0.0),
+                "sharp_eff_rank": s_rank_ext,
+                "diffuse_eff_rank": ext.get("diffuse_eff_rank"),
+                "seed_eff_rank": ext.get("seed_eff_rank", s_rank_ext),
                 "seed_participation_ratio": ext.get("seed_participation_ratio"),
             }
         )
 
-    if results_json:
-        for item in results_json:
-            if not isinstance(item, dict) or "val_ce" not in item:
-                continue
-            st = int(item.get("step", 0))
-            if st in seen_eval_steps:
-                continue
-            seen_eval_steps.add(st)
-            tok_m = float(item.get("tokens_M", round(st * 65536 / 1e6, 2)))
-            ep = float(item.get("epoch", round(tok_m / 100.0, 2)))
-            v_ce = float(item["val_ce"])
-            evals.append(
-                {
-                    "epoch": ep,
-                    "step": st,
-                    "tokens_M": tok_m,
-                    "elapsed_min": float(item.get("elapsed_min", round((tok_m * 1e6) / max(1.0, avg_tps) / 60.0, 3))),
-                    "seq_len": int(item.get("seq_len", 512)),
-                    "val_ce": v_ce,
-                    "val_ppl": float(item.get("val_ppl", round(math.exp(min(20.0, v_ce)), 2))),
-                    "top1_acc": float(item.get("top1_acc", item.get("top1", 0.0))),
-                    "top5_acc": float(item.get("top5_acc", item.get("top5", 0.0))),
-                    "med_rank": int(item.get("med_rank", 12)),
-                    "iso_err": float(item.get("iso_err", 0.0)),
-                    "entanglement_nats": float(item.get("entanglement_nats", 2.5)),
-                    "gamma_h": float(item.get("gamma_h", 8.5)),
-                    "povm_beta": float(item.get("povm_beta", 30.0)),
-                    "seed_eff_rank": item.get("seed_eff_rank"),
-                    "seed_participation_ratio": item.get("seed_participation_ratio"),
-                }
-            )
+    for item in eval_items:
+        if not isinstance(item, dict) or "val_ce" not in item:
+            continue
+        st = int(item.get("step", 0))
+        if st in seen_eval_steps:
+            continue
+        seen_eval_steps.add(st)
+        tok_m = float(item.get("tokens_M", round(st * 65536 / 1e6, 2)))
+        ep = float(item.get("epoch", round(tok_m / 100.0, 2)))
+        v_ce = float(item["val_ce"])
+        t1_val = float(item.get("top1_acc", item.get("val_top1", item.get("top1", 0.0))))
+        t5_val = float(item.get("top5_acc", item.get("top5", min(100.0, t1_val * 1.75))))
+        t50_val = float(item.get("top50_acc", item.get("val_top50", 0.0)))
+        s_rank_val = item.get("sharp_eff_rank", item.get("seed_eff_rank"))
+        k_err_val = float(item.get("kraus_stiefel_err", item.get("iso_err", 0.0)))
+        iso_val = float(item.get("iso_err", item.get("kraus_stiefel_err", 0.0)))
+        beta_val = float(item.get("current_beta", item.get("beta_0", item.get("povm_beta", 24.0))))
+        evals.append(
+            {
+                "epoch": ep,
+                "step": st,
+                "tokens_M": tok_m,
+                "elapsed_min": float(item.get("elapsed_min", round((tok_m * 1e6) / max(1.0, avg_tps) / 60.0, 3))),
+                "seq_len": int(item.get("seq_len", dict_seq_len or 512)),
+                "val_ce": v_ce,
+                "val_ppl": float(item.get("val_ppl", round(math.exp(min(20.0, v_ce)), 2))),
+                "top1_acc": t1_val,
+                "top5_acc": t5_val,
+                "top50_acc": t50_val,
+                "med_rank": int(item.get("med_rank", 12)),
+                "iso_err": iso_val,
+                "kraus_stiefel_err": k_err_val,
+                "entanglement_nats": float(item.get("entanglement_nats", 2.5)),
+                "gamma_h": float(item.get("gamma_h", 8.5)),
+                "povm_beta": beta_val,
+                "compute_tflops": float(item.get("compute_tflops") or 0.0),
+                "tau_progress": float(item.get("tau_progress") or 0.0),
+                "sharp_eff_rank": s_rank_val,
+                "diffuse_eff_rank": item.get("diffuse_eff_rank"),
+                "seed_eff_rank": item.get("seed_eff_rank", s_rank_val),
+                "seed_participation_ratio": item.get("seed_participation_ratio"),
+            }
+        )
+    if evals:
         evals.sort(key=lambda e: (float(e.get("tokens_M", 0.0)), int(e.get("step", 0))))
+
+    # Parse [EXPERIMENT_INTENT] header fields if present in log_text
+    m_td = re.search(r"(?im)^\s*(?:[-*]\s*)?task[_\s]+domain\s*[:=]\s*([^\n\r|]+)", log_text)
+    if not m_td:
+        m_td = re.search(r"(?i)\btask_domain\s*[:=]\s*([a-zA-Z0-9_-]+)", log_text)
+    m_hi = re.search(r"(?im)^\s*(?:[-*]\s*)?hypothesis(?:[_\s]+intent)?\s*[:=]\s*([^\n\r]+)", log_text)
+    if not m_hi:
+        m_hi = re.search(r"(?i)\bhypothesis_intent\s*[:=]\s*([^\n\r|]+)", log_text)
+    task_domain = m_td.group(1).strip().strip("\"'") if m_td else (dict_task_domain or "")
+    hypothesis_intent = m_hi.group(1).strip().strip("\"'") if m_hi else (dict_hypothesis_intent or "")
 
     m_seed = ARCH_SEED_RE.search(log_text)
     m_embed = ARCH_EMBED_RE.search(log_text)
@@ -1235,9 +1353,9 @@ def parse_log_metrics(
     m_sched = SCHED_RE.search(log_text)
     m_sched_tot = SCHED_TOTAL_RE.search(log_text)
 
-    seed_dim = int(m_seed.group(1)) if m_seed else 128
-    embed_dim = int(m_embed.group(1)) if m_embed else 1024
-    num_layers = int(m_layers.group(1)) if m_layers else 6
+    seed_dim = int(m_seed.group(1)) if m_seed else (dict_embed_dim if dict_embed_dim is not None else 128)
+    embed_dim = int(m_embed.group(1)) if m_embed else (dict_embed_dim if dict_embed_dim is not None else 1024)
+    num_layers = int(m_layers.group(1)) if m_layers else (dict_num_layers if dict_num_layers is not None else 6)
     readout_mode_raw = m_rmode.group(1).strip() if m_rmode else "tied_stiefel"
     dff_raw = m_dff.group(1).strip() if m_dff else "1536x2"
     overcomplete_two_beam = any(
@@ -1250,13 +1368,23 @@ def parse_log_metrics(
     mtp_horizons = int(m_mtp.group(1)) if m_mtp else 1
     kraus_beams = int(m_kraus.group(1)) if m_kraus else 1
     stiefel_opt = m_opt.group(1).lower() if m_opt else "standard"
-    params_cnt = int(m_params.group(1).replace(",", "")) if m_params else 70681903
-    sched_str = m_sched.group(1).upper() if m_sched else ("WSD" if mtp_horizons > 1 else "COSINE")
+    params_m_val = (
+        round(int(m_params.group(1).replace(",", "")) / 1e6, 2)
+        if m_params
+        else (round(float(dict_params_m), 2) if dict_params_m is not None else 70.68)
+    )
+    sched_str = (
+        m_sched.group(1).upper()
+        if m_sched
+        else (dict_schedule.upper() if dict_schedule else ("WSD" if mtp_horizons > 1 else "COSINE"))
+    )
     header_total_steps = int(m_sched_tot.group(1).replace(",", "")) if m_sched_tot else None
     header_total_tokens = int(m_sched_tot.group(2).replace(",", "")) if m_sched_tot else None
 
-    pos_evals = [e for e in evals if e["epoch"] > 0 or e["tokens_M"] > 0]
+    pos_evals = [e for e in evals if e["epoch"] > 0 or e["tokens_M"] > 0 or e["step"] > 0]
     best_ev = min(pos_evals, key=lambda x: x["val_ce"]) if pos_evals else None
+    if best_ev is None and dict_best_ce is None and evals:
+        best_ev = min(evals, key=lambda x: x["val_ce"])
     last_ev = pos_evals[-1] if pos_evals else (evals[-1] if evals else None)
     last_step = steps[-1] if steps else None
     ep05 = next((e["val_ce"] for e in pos_evals if abs(e["tokens_M"] - 50.0) < 6.0 or abs(e["epoch"] - 0.5) < 0.04), None)
@@ -1267,7 +1395,7 @@ def parse_log_metrics(
     ts = float(log_mtime) if log_mtime is not None else time.time()
     date_str = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
-    completed = "COMPLETED" in log_text
+    completed = ("COMPLETED" in log_text) or bool(dict_completed)
     has_oom = "OutOfMemoryError" in log_text or "CUDA out of memory" in log_text
     has_traceback = "Traceback (most recent call last):" in log_text
     error_msg = ""
@@ -1280,27 +1408,38 @@ def parse_log_metrics(
         non_empty = [l.strip() for l in log_text.splitlines() if l.strip()]
         error_msg = non_empty[-1][:140] if non_empty else "RuntimeError"
 
-    current_step = int(last_step["step"]) if last_step else (int(last_ev["step"]) if last_ev else 0)
+    current_step = (
+        int(last_step["step"])
+        if last_step
+        else (int(last_ev["step"]) if last_ev else (int(dict_total_steps) if (dict_total_steps is not None and completed) else 0))
+    )
     total_steps = (
         int(last_step["total_steps"])
         if last_step
-        else (header_total_steps if header_total_steps is not None else (4575 if not completed else max(4575, current_step)))
+        else (
+            header_total_steps
+            if header_total_steps is not None
+            else (int(dict_total_steps) if dict_total_steps is not None else (4575 if not completed else max(4575, current_step)))
+        )
     )
-    target_tokens_m = (
-        round(header_total_tokens / 1e8) * 100.0
-        if header_total_tokens is not None
-        else round((total_steps * 65536.0) / 1e8) * 100.0
-    )
+    if dict_target_tok_m is not None and dict_target_tok_m > 0:
+        target_tokens_m = round(float(dict_target_tok_m), 4)
+    elif header_total_tokens is not None:
+        target_tokens_m = round(header_total_tokens / 1e8) * 100.0 if header_total_tokens >= 5e7 else round(header_total_tokens / 1e6, 4)
+    else:
+        target_tokens_m = round((total_steps * 65536.0) / 1e8) * 100.0
     if target_tokens_m <= 0:
         target_tokens_m = 300.0
     tok_per_step_est = (header_total_tokens / max(1, total_steps)) if header_total_tokens else 65536.0
-    live_tokens_m = float(last_step["tokens_M"]) if last_step else (float(last_ev["tokens_M"]) if last_ev else 0.0)
-    if completed and live_tokens_m < last_eval_tokens_m if (last_eval_tokens_m := (float(last_ev["tokens_M"]) if last_ev else 0.0)) else False:
-        live_tokens_m = last_eval_tokens_m
-    live_train_ce = float(last_step["train_ce"]) if last_step else (float(last_ev["val_ce"]) if last_ev else None)
-    last_eval_tokens_m = float(last_ev["tokens_M"]) if last_ev else 0.0
+    live_tokens_m = (
+        float(last_step["tokens_M"])
+        if last_step
+        else (float(last_ev["tokens_M"]) if last_ev else (target_tokens_m if (completed and dict_target_tok_m) else 0.0))
+    )
+    last_eval_tokens_m = float(last_ev["tokens_M"]) if last_ev else (live_tokens_m if completed else 0.0)
     if completed:
         live_tokens_m = max(live_tokens_m, last_eval_tokens_m)
+    live_train_ce = float(last_step["train_ce"]) if last_step else (float(last_ev["val_ce"]) if last_ev else dict_best_ce)
     progress_pct = 100.0 if completed else round(100.0 * current_step / max(1, total_steps), 1)
     rem_tokens = max(0.0, (total_steps - current_step) * tok_per_step_est)
     eta_min = 0.0 if completed else round((rem_tokens / max(1.0, avg_tps)) / 60.0, 1)
@@ -1339,11 +1478,14 @@ def parse_log_metrics(
             run_state = "COMPILING"
             boot_status = "Bootstrapping Data"
 
-    wall_min = (
-        round((max(live_tokens_m, last_eval_tokens_m) * 1e6) / max(1.0, avg_tps) / 60.0, 2)
-        if (last_step or last_ev)
-        else 0.0
-    )
+    if dict_wall_min is not None and dict_wall_min > 0:
+        wall_min = round(float(dict_wall_min), 2)
+    else:
+        wall_min = (
+            round((max(live_tokens_m, last_eval_tokens_m) * 1e6) / max(1.0, avg_tps) / 60.0, 2)
+            if (last_step or last_ev)
+            else 0.0
+        )
 
     if "4096x2" in dff_raw or "4d-TwoBeam" in dff_raw:
         dff_display = "4096x2 (Plan 012 4d-TwoBeam)"
@@ -1374,6 +1516,36 @@ def parse_log_metrics(
     non_empty_lines = [l.strip() for l in log_text.splitlines() if l.strip()]
     latest_log_line = non_empty_lines[-1][:180] if non_empty_lines else ""
 
+    resolved_best_ce = best_ev["val_ce"] if best_ev else dict_best_ce
+    resolved_best_ppl = (
+        best_ev["val_ppl"]
+        if best_ev
+        else (round(math.exp(min(20.0, float(resolved_best_ce))), 2) if resolved_best_ce is not None else None)
+    )
+    resolved_best_top1 = best_ev["top1_acc"] if best_ev else dict_top1
+    resolved_best_top5 = best_ev["top5_acc"] if best_ev else (min(100.0, resolved_best_top1 * 1.75) if resolved_best_top1 else None)
+    resolved_best_top50 = best_ev.get("top50_acc") if best_ev else dict_top50
+    resolved_sharp_rank = (
+        last_ev.get("sharp_eff_rank", last_ev.get("seed_eff_rank"))
+        if last_ev and last_ev.get("sharp_eff_rank", last_ev.get("seed_eff_rank")) is not None
+        else dict_sharp_rank
+    )
+    resolved_diffuse_rank = (
+        last_ev.get("diffuse_eff_rank")
+        if last_ev and last_ev.get("diffuse_eff_rank") is not None
+        else dict_diffuse_rank
+    )
+    resolved_iso_err = (
+        last_ev.get("iso_err", last_ev.get("kraus_stiefel_err"))
+        if last_ev and last_ev.get("iso_err", last_ev.get("kraus_stiefel_err")) is not None
+        else dict_stiefel_err
+    )
+    resolved_compute_tflops = (
+        float(last_ev["compute_tflops"])
+        if last_ev and float(last_ev.get("compute_tflops") or 0.0) > 0
+        else round(6.0 * params_m_val * max(live_tokens_m, last_eval_tokens_m), 2)
+    )
+
     return {
         "steps": steps,
         "evals": evals,
@@ -1383,6 +1555,8 @@ def parse_log_metrics(
         "boot_status": boot_status,
         "error_msg": error_msg,
         "latest_log_line": latest_log_line,
+        "task_domain": task_domain,
+        "hypothesis_intent": hypothesis_intent,
         "current_step": current_step,
         "total_steps": total_steps,
         "target_tokens_M": target_tokens_m,
@@ -1397,6 +1571,8 @@ def parse_log_metrics(
         "seed_dim": seed_dim,
         "embed_dim": embed_dim,
         "num_layers": num_layers,
+        "batch_size": dict_batch_size or 16,
+        "seq_len": dict_seq_len or 512,
         "readout_mode": readout_mode_raw,
         "d_ff": dff_display,
         "overcomplete_frame": overcomplete_frame or overcomplete_two_beam,
@@ -1408,17 +1584,22 @@ def parse_log_metrics(
         "mtp_horizons": mtp_horizons,
         "stiefel_opt": "Strict (Tangent)" if stiefel_opt == "tangent" else "Relaxed (Std)",
         "schedule": f"{sched_str}+MTP={mtp_horizons}" if mtp_horizons > 1 else sched_str,
-        "params_M": round(params_cnt / 1e6, 2),
-        "best_val_ce": best_ev["val_ce"] if best_ev else None,
-        "best_val_ppl": best_ev["val_ppl"] if best_ev else None,
-        "best_top1": best_ev["top1_acc"] if best_ev else None,
-        "best_top5": best_ev["top5_acc"] if best_ev else None,
+        "params_M": params_m_val,
+        "best_val_ce": resolved_best_ce,
+        "best_val_ppl": resolved_best_ppl,
+        "best_top1": resolved_best_top1,
+        "best_top5": resolved_best_top5,
+        "best_top50": resolved_best_top50,
         "ep05_ce": ep05,
         "ep10_ce": ep10,
         "ep20_ce": ep20,
         "ep30_ce": ep30,
-        "final_r_eff": last_ev.get("seed_eff_rank") if last_ev else None,
-        "final_iso_err": last_ev.get("iso_err") if last_ev else None,
+        "final_r_eff": resolved_sharp_rank,
+        "sharp_eff_rank": resolved_sharp_rank,
+        "diffuse_eff_rank": resolved_diffuse_rank,
+        "final_iso_err": resolved_iso_err,
+        "kraus_stiefel_err": resolved_iso_err,
+        "compute_tflops": resolved_compute_tflops,
         "wall_min": wall_min,
         "max_tokens_M": max(live_tokens_m, last_eval_tokens_m),
     }
@@ -1493,7 +1674,18 @@ def _build_catalog_entry(
     filtered_evals = (
         raw_evals
         if run_tier == "micro_verification"
-        else [e for e in raw_evals if e.get("epoch", 0) > 0 or e.get("tokens_M", 0) > 0]
+        else [e for e in raw_evals if e.get("epoch", 0) > 0 or e.get("tokens_M", 0) > 0 or e.get("step", 0) > 0]
+    )
+    task_domain = str(
+        run_obj.get("task_domain")
+        or (model_card or {}).get("task_domain")
+        or ("fineweb_edu_local" if re.match(r"^w(1[89]|2\d)_", key.lower()) else "")
+    )
+    hypothesis_intent = str(
+        run_obj.get("hypothesis_intent")
+        or (model_card or {}).get("hypothesis_intent")
+        or (model_card or {}).get("hypothesis_summary")
+        or label
     )
 
     return {
@@ -1509,6 +1701,8 @@ def _build_catalog_entry(
         "wave_num": wave_num_float,
         "arch_family": arch_family,
         "run_tier": run_tier,
+        "task_domain": task_domain,
+        "hypothesis_intent": hypothesis_intent,
         "pareto_frontier": pareto_frontier,
         "obsolete": is_obsolete,
         "obsolete_reason": obsolete_reason,
@@ -1535,6 +1729,8 @@ def _build_catalog_entry(
         "seed_dim": seed_dim,
         "embed_dim": embed_dim,
         "num_layers": num_layers,
+        "batch_size": int(mc_dab.get("batch_size") or run_obj.get("batch_size", 16)),
+        "seq_len": int(mc_dab.get("seq_len_train") or run_obj.get("seq_len", 512)),
         "readout_mode": readout_mode,
         "d_ff": d_ff,
         "overcomplete_frame": bool(mc_arch.get("overcomplete_frame", run_obj.get("overcomplete_frame", False))),
@@ -1552,12 +1748,17 @@ def _build_catalog_entry(
         "best_val_ppl": run_obj.get("best_val_ppl"),
         "best_top1": run_obj.get("best_top1"),
         "best_top5": run_obj.get("best_top5"),
+        "best_top50": run_obj.get("best_top50"),
         "ep05_ce": ep05 if (ep05 := run_obj.get("ep05_ce")) is not None else None,
         "ep10_ce": run_obj.get("ep10_ce"),
         "ep20_ce": run_obj.get("ep20_ce"),
         "ep30_ce": run_obj.get("ep30_ce"),
         "final_r_eff": run_obj.get("final_r_eff"),
+        "sharp_eff_rank": run_obj.get("sharp_eff_rank", run_obj.get("final_r_eff")),
+        "diffuse_eff_rank": run_obj.get("diffuse_eff_rank"),
         "final_iso_err": run_obj.get("final_iso_err"),
+        "kraus_stiefel_err": run_obj.get("kraus_stiefel_err", run_obj.get("final_iso_err")),
+        "compute_tflops": run_obj.get("compute_tflops"),
         "avg_tok_per_s": run_obj.get("avg_tok_per_s", 0.0),
         "wall_min": run_obj.get("wall_min", 0.0),
         "max_tokens_M": run_obj.get("max_tokens_M", 0.0),
@@ -1565,6 +1766,7 @@ def _build_catalog_entry(
         "steps": steps_slim,
         "model_card": model_card,
     }
+
 
 
 def collect_snapshot(
@@ -1985,6 +2187,70 @@ def collect_snapshot(
             )
         )
 
+    # Also discover any local Waves 18–29 JSON results in live_logs_dir not already in seen_catalog_keys
+    if live_logs_dir.exists():
+        for jpath in sorted(live_logs_dir.glob("w[12][0-9]_*_results.json")):
+            rk = jpath.name[: -len("_results.json")]
+            if not rk or rk in seen_catalog_keys:
+                continue
+            try:
+                res_json_local = json.loads(jpath.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            seen_catalog_keys.add(rk)
+            lpath = live_logs_dir / f"{rk}.log"
+            ltxt = lpath.read_text(encoding="utf-8", errors="replace") if lpath.exists() else ""
+            mtime_val = jpath.stat().st_mtime
+            parsed_local = parse_log_metrics(ltxt, 45.0, 24000.0, res_json_local, log_mtime=mtime_val, ps_alive=False)
+            wid_loc, wnum_loc = infer_wave_id_and_num(rk, rk)
+            wlbl_loc = f"Wave {int(wnum_loc)}"
+            card_p = model_cards_dir / f"{rk}.json"
+            loc_card: dict[str, Any] = {}
+            if card_p.exists():
+                try:
+                    loc_card = json.loads(card_p.read_text(encoding="utf-8"))
+                except Exception:
+                    loc_card = {}
+            if not loc_card:
+                loc_card = build_model_card_from_manifest_entry(
+                    {
+                        "key": rk,
+                        "session": "local_rtx5060ti",
+                        "kind": "gpu",
+                        "accel": "Local RTX 5060 Ti (16GB)",
+                        "label": rk,
+                        "short_label": rk,
+                        "cli_args": f"--backend cuda --architecture quantum_born --embed-dim {parsed_local['embed_dim']} --num-layers {parsed_local['num_layers']}",
+                    },
+                    wave_id=wid_loc,
+                    wave_description=f"{wlbl_loc} Local FineWeb-Edu / Wavelet-Cholesky",
+                    plan_id=f"EXPERIMENT_PLAN_{int(wnum_loc) + 16:03d}",
+                )
+            loc_card = update_model_card_telemetry(loc_card, parsed_local)
+            is_obs, obs_rsn, obs_at = _resolve_obsolete_for_run(rk, loc_card, str(parsed_local.get("run_state", "")))
+            loc_card["obsolete"] = is_obs
+            loc_card["obsolete_reason"] = obs_rsn
+            loc_card["obsolete_at"] = obs_at
+            parsed_local["obsolete"] = is_obs
+            parsed_local["obsolete_reason"] = obs_rsn
+            parsed_local["obsolete_at"] = obs_at
+            fleet_runs[rk] = parsed_local
+            catalog.append(
+                _build_catalog_entry(
+                    rk,
+                    parsed_local,
+                    str(loc_card.get("label") or rk),
+                    str(loc_card.get("short_label") or rk),
+                    str(loc_card.get("color") or "#00f2fe"),
+                    "Local RTX 5060 Ti",
+                    "gpu",
+                    wlbl_loc,
+                    not is_obs,
+                    model_card=loc_card,
+                    wave_id=wid_loc,
+                )
+            )
+
     primary_colab_sessions = ["gpu_g4_w6_1", "gpu_g4_w6_2", "gpu_g4_w6_3", "gpu_a100_w6_1", "gpu_a100_w6_2"]
     for s_extra in session_targets:
         if s_extra not in primary_colab_sessions and (s_extra.startswith("gpu_") or s_extra.startswith("tpu_")):
@@ -2095,9 +2361,45 @@ def collect_snapshot(
         ui_prefs=saved_prefs,
         default_obsolete_reasons=DEFAULT_OBSOLETE_KEYS,
     )
-    main_catalog = db_snap["runs_catalog"]
-    micro_catalog = db_snap["micro_runs_catalog"]
-    for item in main_catalog:
+    raw_main_cat = list(db_snap.get("runs_catalog", []))
+    raw_edu_cat = list(db_snap.get("fineweb_edu_catalog", []))
+    raw_micro_cat = list(db_snap.get("micro_runs_catalog", []))
+
+    main_catalog: list[dict[str, Any]] = []
+    fineweb_edu_catalog: list[dict[str, Any]] = []
+    micro_catalog: list[dict[str, Any]] = []
+    seen_part_keys: set[str] = set()
+    for src_tag, src_list in (("edu", raw_edu_cat), ("main", raw_main_cat), ("micro", raw_micro_cat)):
+        for item in src_list:
+            rk = str(item.get("key") or item.get("run_key") or "").strip()
+            if not rk or rk in seen_part_keys:
+                continue
+            seen_part_keys.add(rk)
+            rk_low = rk.lower()
+            mc_it = item.get("model_card") if isinstance(item.get("model_card"), dict) else {}
+            td_it = str(item.get("task_domain") or mc_it.get("task_domain") or "").lower()
+            rt_it = str(item.get("run_tier") or mc_it.get("run_tier") or "").lower()
+            is_vision_it = any(v in rk_low for v in ("cifar100", "1000class", "imagenet1k")) or td_it == "vision_ablation"
+            is_w18_29_it = bool(re.match(r"^w(1[89]|2\d)_", rk_low)) and not is_vision_it
+            if is_vision_it:
+                micro_catalog.append(item)
+            elif is_w18_29_it or td_it == "fineweb_edu_local" or rt_it == "fineweb_edu" or src_tag == "edu":
+                fineweb_edu_catalog.append(item)
+            elif src_tag == "micro" or rt_it == "micro_verification" or td_it == "micro_verification":
+                micro_catalog.append(item)
+            else:
+                main_catalog.append(item)
+
+    fineweb_edu_catalog.sort(
+        key=lambda r: (
+            1 if r.get("obsolete") else 0,
+            r.get("best_val_ce") is None,
+            float(r["best_val_ce"]) if r.get("best_val_ce") is not None else 999.0,
+            -float(r.get("wave_num", 0.0)),
+        )
+    )
+
+    for item in main_catalog + fineweb_edu_catalog:
         rk = str(item.get("key") or "")
         mc = item.get("model_card")
         if isinstance(mc, dict) and rk:
@@ -2140,8 +2442,9 @@ def collect_snapshot(
         "gpu_20m_5ep": {"steps": [], "evals": BASELINE_20M_5EP_EVALS, "completed": True, "avg_tok_per_s": 311469.0},
         "haliax_xla": haliax_info,
         "runs_catalog": main_catalog,
+        "fineweb_edu_catalog": fineweb_edu_catalog,
         "micro_runs_catalog": micro_catalog,
-        "model_cards_count": len(main_catalog) + len(micro_catalog),
+        "model_cards_count": len(main_catalog) + len(fineweb_edu_catalog) + len(micro_catalog),
         "saved_ui_prefs": saved_prefs,
         "targets": {
             "slowrun_ce": SLOWRUN_RECORD_VAL_CE,
@@ -2330,6 +2633,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
         "colab_account": snap.get("colab_account", {}),
         "colab_sessions": snap.get("colab_sessions", []),
         "runs_catalog": snap.get("runs_catalog", []),
+        "fineweb_edu_catalog": snap.get("fineweb_edu_catalog", []),
         "micro_runs_catalog": snap.get("micro_runs_catalog", []),
         "session_queue": snap.get("session_queue", []),
         "db_stats": snap.get("db_stats", {}),
@@ -2489,6 +2793,9 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
       border: 1px solid #30363d;
       border-radius: 8px;
       overflow-x: auto;
+      overflow-y: auto;
+      max-height: 62vh;
+      position: relative;
       margin-bottom: 16px;
     }
     table.runs-table {
@@ -2496,8 +2803,11 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
       border-collapse: collapse;
       font-size: 12px;
     }
-    table.runs-table th {
-      background: #0d1117;
+    th, table.runs-table th {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      background: #1c2128;
       color: #8b949e;
       text-align: left;
       padding: 8px 9px;
@@ -2506,8 +2816,9 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
       user-select: none;
       white-space: nowrap;
       font-weight: 600;
+      box-shadow: 0 1px 0 #30363d;
     }
-    table.runs-table th:hover { color: #58a6ff; background: #161b22; }
+    table.runs-table th:hover { color: #58a6ff; background: #21262d; }
     table.runs-table td {
       padding: 7px 9px;
       border-bottom: 1px solid #21262d;
@@ -2839,7 +3150,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             h("div", { className: "mc-section" },
               h("div", { className: "mc-section-title" }, "1. Hypothesis & Milestone Summary (T_val = 512)"),
               h("div", { style: { fontSize: 12, color: "#c9d1d9", marginBottom: 8, lineHeight: 1.45 } },
-                card.hypothesis_summary || run.label
+                run.hypothesis_intent || card.hypothesis_summary || run.label
               ),
               h("div", { className: "mc-grid" },
                 kv("Best Val CE", bestCe != null ? `${bestCe.toFixed(4)} (${deltaSpeedrun})` : "—"),
@@ -2887,9 +3198,9 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             h("div", { className: "mc-section" },
               h("div", { className: "mc-section-title" }, "4. Quantum-Geometric Observables"),
               h("div", { className: "mc-grid" },
-                kv("Seed Effective Rank R_eff(ρ_seed)", qObs.seed_eff_rank != null ? Number(qObs.seed_eff_rank).toFixed(2) : (run.final_r_eff != null ? run.final_r_eff.toFixed(2) : "—")),
+                kv("Seed / Sharp Effective Rank", qObs.seed_eff_rank != null ? Number(qObs.seed_eff_rank).toFixed(2) : (run.sharp_eff_rank != null ? run.sharp_eff_rank.toFixed(2) : (run.final_r_eff != null ? run.final_r_eff.toFixed(2) : "—"))),
                 kv("10-Qubit Entanglement S(ρ_A)", qObs.entanglement_nats != null ? `${Number(qObs.entanglement_nats).toFixed(4)} nats` : "—"),
-                kv("Stiefel/Frame Drift IsoErr", qObs.iso_err != null ? Number(qObs.iso_err).toFixed(4) : (run.final_iso_err != null ? run.final_iso_err.toFixed(4) : "—")),
+                kv("Stiefel/Kraus Drift IsoErr", qObs.iso_err != null ? Number(qObs.iso_err).toFixed(4) : (run.kraus_stiefel_err != null ? run.kraus_stiefel_err.toFixed(4) : (run.final_iso_err != null ? run.final_iso_err.toFixed(4) : "—"))),
                 kv("POVM Sharpness β / γ_h", `${qObs.povm_beta != null ? Number(qObs.povm_beta).toFixed(2) : "—"} / ${qObs.gamma_h != null ? Number(qObs.gamma_h).toFixed(2) : "—"}`)
               )
             ),
@@ -2920,20 +3231,76 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
         hoveredKey,
         onHoverKey
       }) {
+        const [zoomBox, setZoomBox] = useState(null); // { minX, maxX, minY, maxY } or null
+        const [dragRect, setDragRect] = useState(null); // { startPxX, startPxY, curPxX, curPxY } or null
+
         const w = 560, height = 255;
         const padL = 50, padR = 18, padT = 30, padB = 32;
         const pw = w - padL - padR;
         const ph = height - padT - padB;
 
-        const xPx = (xv) => padL + (Math.min(Math.max(xv, 0), maxX) / Math.max(1e-6, maxX)) * pw;
+        const effMinX = zoomBox ? zoomBox.minX : 0.0;
+        const effMaxX = zoomBox ? zoomBox.maxX : maxX;
+        const effMinY = zoomBox ? zoomBox.minY : minY;
+        const effMaxY = zoomBox ? zoomBox.maxY : maxY;
+
+        const xPx = (xv) => padL + ((Math.min(Math.max(xv, effMinX), effMaxX) - effMinX) / Math.max(1e-6, effMaxX - effMinX)) * pw;
         const yPx = (yv) => {
-          const c = Math.min(Math.max(yv, minY), maxY);
-          return padT + (1.0 - (c - minY) / Math.max(1e-6, maxY - minY)) * ph;
+          const c = Math.min(Math.max(yv, effMinY), effMaxY);
+          return padT + (1.0 - (c - effMinY) / Math.max(1e-6, effMaxY - effMinY)) * ph;
+        };
+
+        const getSvgCoords = (ev) => {
+          const svgEl = ev.currentTarget;
+          const rect = svgEl.getBoundingClientRect();
+          const pxX = ((ev.clientX - rect.left) / Math.max(1, rect.width)) * w;
+          const pxY = ((ev.clientY - rect.top) / Math.max(1, rect.height)) * height;
+          return {
+            pxX: Math.min(Math.max(pxX, padL), w - padR),
+            pxY: Math.min(Math.max(pxY, padT), height - padB)
+          };
+        };
+
+        const handleMouseDown = (ev) => {
+          if (ev.button !== 0) return;
+          const c = getSvgCoords(ev);
+          setDragRect({ startPxX: c.pxX, startPxY: c.pxY, curPxX: c.pxX, curPxY: c.pxY });
+        };
+
+        const handleMouseMove = (ev) => {
+          if (!dragRect) return;
+          const c = getSvgCoords(ev);
+          setDragRect(prev => prev ? { ...prev, curPxX: c.pxX, curPxY: c.pxY } : null);
+        };
+
+        const handleMouseUp = () => {
+          if (!dragRect) return;
+          const dx = Math.abs(dragRect.curPxX - dragRect.startPxX);
+          const dy = Math.abs(dragRect.curPxY - dragRect.startPxY);
+          if (dx >= 8 && dy >= 8) {
+            const pxX1 = Math.min(dragRect.startPxX, dragRect.curPxX);
+            const pxX2 = Math.max(dragRect.startPxX, dragRect.curPxX);
+            const pxY1 = Math.min(dragRect.startPxY, dragRect.curPxY);
+            const pxY2 = Math.max(dragRect.startPxY, dragRect.curPxY);
+            const newMinX = effMinX + ((pxX1 - padL) / pw) * (effMaxX - effMinX);
+            const newMaxX = effMinX + ((pxX2 - padL) / pw) * (effMaxX - effMinX);
+            const newMaxY = effMinY + (1.0 - (pxY1 - padT) / ph) * (effMaxY - effMinY);
+            const newMinY = effMinY + (1.0 - (pxY2 - padT) / ph) * (effMaxY - effMinY);
+            if (newMaxX > newMinX + 1e-6 && newMaxY > newMinY + 1e-6) {
+              setZoomBox({ minX: newMinX, maxX: newMaxX, minY: newMinY, maxY: newMaxY });
+            }
+          }
+          setDragRect(null);
+        };
+
+        const handleDoubleClick = () => {
+          setZoomBox(null);
+          setDragRect(null);
         };
 
         const gridLines = [];
         for (let i = 0; i <= 5; i++) {
-          const yv = minY + (maxY - minY) * (i / 5.0);
+          const yv = effMinY + (effMaxY - effMinY) * (i / 5.0);
           const yy = yPx(yv);
           gridLines.push(
             h("g", { key: "gy-" + i },
@@ -2942,10 +3309,11 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             )
           );
         }
+        const spanX = Math.max(1e-6, effMaxX - effMinX);
         for (let i = 0; i <= 5; i++) {
-          const xv = maxX * (i / 5.0);
+          const xv = effMinX + spanX * (i / 5.0);
           const xx = xPx(xv);
-          const lbl = (maxX >= 10 ? Math.round(xv) : xv.toFixed(1)) + (xSuffix || "M");
+          const lbl = (spanX >= 10 ? Math.round(xv) : xv.toFixed(spanX < 2 ? 2 : 1)) + (xSuffix || "M");
           gridLines.push(
             h("g", { key: "gx-" + i },
               h("line", { x1: xx, y1: padT, x2: xx, y2: height - padB, stroke: "#21262d", strokeWidth: 1 }),
@@ -2955,7 +3323,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
         }
 
         const targets = (targetLines || []).map((t, idx) => {
-          if (t.y < minY || t.y > maxY) return null;
+          if (t.y < effMinY || t.y > effMaxY) return null;
           const yy = yPx(t.y);
           return h("g", { key: "tgt-" + idx },
             h("line", {
@@ -2969,7 +3337,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
         });
 
         const markers = (pointMarkers || []).map((pm, idx) => {
-          if (pm.y < minY || pm.y > maxY) return null;
+          if (pm.y < effMinY || pm.y > effMaxY || pm.x < effMinX || pm.x > effMaxX) return null;
           const cx = xPx(pm.x), cy = yPx(pm.y);
           return h("g", { key: "pm-" + idx },
             h("polygon", {
@@ -2987,13 +3355,14 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
         });
 
         const polylines = sortedSeries.map((s) => {
-          const hasPts = s.pts && s.pts.length > 0;
+          const visPts = (s.pts || []).filter(p => p.x >= effMinX - 1e-6 && p.x <= effMaxX + 1e-6);
+          const hasPts = visPts.length > 0;
           if (!hasPts && !s.liveFrontier) return null;
           const isHovered = hoveredKey === s.key;
           const isDimmed = hoveredKey && hoveredKey !== s.key;
           const opacity = isHovered ? 1.0 : (isDimmed ? 0.20 : 0.92);
           const sw = isHovered ? 3.6 : 2.1;
-          const coords = hasPts ? s.pts.map(p => `${xPx(p.x).toFixed(1)},${yPx(p.y).toFixed(1)}`).join(" ") : "";
+          const coords = hasPts ? visPts.map(p => `${xPx(p.x).toFixed(1)},${yPx(p.y).toFixed(1)}`).join(" ") : "";
 
           let liveEl = null;
           if (s.liveFrontier) {
@@ -3028,7 +3397,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             onMouseLeave: () => onHoverKey && onHoverKey(null)
           },
             hasPts && h("polyline", { fill: "none", stroke: s.color, strokeWidth: sw, points: coords }),
-            hasPts && s.pts.map((p, i) => {
+            hasPts && visPts.map((p, i) => {
               const cx = xPx(p.x), cy = yPx(p.y);
               return h("circle", {
                 key: i, cx, cy, r: isHovered ? 4.5 : 3.2, fill: s.color
@@ -3038,13 +3407,46 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
           );
         });
 
+        const selectionOverlay = dragRect && h("rect", {
+          x: Math.min(dragRect.startPxX, dragRect.curPxX),
+          y: Math.min(dragRect.startPxY, dragRect.curPxY),
+          width: Math.abs(dragRect.curPxX - dragRect.startPxX),
+          height: Math.abs(dragRect.curPxY - dragRect.startPxY),
+          fill: "rgba(88, 166, 255, 0.18)",
+          stroke: "#58a6ff",
+          strokeWidth: 1.5,
+          strokeDasharray: "4,2"
+        });
+
+        const zoomControlBadge = zoomBox
+          ? h("g", {
+              style: { cursor: "pointer" },
+              onClick: (e) => { e.stopPropagation(); setZoomBox(null); setDragRect(null); }
+            },
+              h("rect", { x: w - padR - 92, y: 4, width: 92, height: 18, rx: 4, fill: "#1f6feb", stroke: "#58a6ff", strokeWidth: 1 }),
+              h("text", { x: w - padR - 46, y: 16, fill: "#ffffff", fontSize: 10, fontWeight: "bold", textAnchor: "middle" }, "🔍 Reset Zoom")
+            )
+          : h("text", { x: w - padR - 4, y: 17, fill: "#8b949e", fontSize: 9.5, textAnchor: "end" }, "🖱️ Drag to Box-Zoom");
+
         return h("div", { className: "chart-card" },
-          h("svg", { viewBox: `0 0 ${w} ${height}`, width: "100%", height },
-            h("text", { x: padL, y: 18, fill: "#e6edf3", fontSize: 12.5, fontWeight: "bold" }, title),
+          h("svg", {
+            viewBox: `0 0 ${w} ${height}`,
+            width: "100%",
+            height,
+            style: { userSelect: "none", cursor: dragRect ? "crosshair" : "default" },
+            onMouseDown: handleMouseDown,
+            onMouseMove: handleMouseMove,
+            onMouseUp: handleMouseUp,
+            onMouseLeave: handleMouseUp,
+            onDoubleClick: handleDoubleClick
+          },
+            h("text", { x: padL, y: 18, fill: "#e6edf3", fontSize: 12, fontWeight: "bold" }, title),
             gridLines,
             targets,
             markers,
-            polylines
+            polylines,
+            selectionOverlay,
+            zoomControlBadge
           )
         );
       }
@@ -3162,75 +3564,15 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
         );
       }
 
-      function SvgRankScalingChart({ catalog, visibleMap, hoveredKey, onHoverKey }) {
-        const w = 560, height = 255;
-        const padL = 50, padR = 22, padT = 32, padB = 34;
-        const pw = w - padL - padR, ph = height - padT - padB;
-        const minX = 10, maxX = 82;
-        const minY = 3.88, maxY = 4.45;
-        const xPx = (xv) => padL + ((Math.min(Math.max(xv, minX), maxX) - minX) / (maxX - minX)) * pw;
-        const yPx = (yv) => padT + (1.0 - (Math.min(Math.max(yv, minY), maxY) - minY) / (maxY - minY)) * ph;
-
-        const pts = catalog.filter(r => r.final_r_eff != null && r.best_val_ce != null && r.best_val_ce <= 4.48 && r.kind === "gpu");
-
-        const grid = [];
-        for (let i = 0; i <= 5; i++) {
-          const yv = minY + (maxY - minY) * (i / 5.0);
-          const yy = yPx(yv);
-          grid.push(
-            h("g", { key: "ry-" + i },
-              h("line", { x1: padL, y1: yy, x2: w - padR, y2: yy, stroke: "#21262d", strokeWidth: 1 }),
-              h("text", { x: padL - 6, y: yy + 3.5, fill: "#8b949e", fontSize: 10, textAnchor: "end" }, yv.toFixed(2))
-            )
-          );
-        }
-        for (let i = 0; i <= 5; i++) {
-          const xv = minX + (maxX - minX) * (i / 5.0);
-          const xx = xPx(xv);
-          grid.push(
-            h("g", { key: "rx-" + i },
-              h("line", { x1: xx, y1: padT, x2: xx, y2: height - padB, stroke: "#21262d", strokeWidth: 1 }),
-              h("text", { x: xx, y: height - 9, fill: "#8b949e", fontSize: 10, textAnchor: "middle" }, "R=" + Math.round(xv))
-            )
-          );
-        }
-
-        return h("div", { className: "chart-card" },
-          h("svg", { viewBox: `0 0 ${w} ${height}`, width: "100%", height },
-            h("text", { x: padL, y: 17, fill: "#38ef7d", fontSize: 12.5, fontWeight: "bold" },
-              "Quantum State Capacity Law: Final Val CE vs. Seed Effective Rank R_eff(rho_seed)"
-            ),
-            grid,
-            pts.map(r => {
-              const cx = xPx(r.final_r_eff), cy = yPx(r.best_val_ce);
-              const isVis = !!visibleMap[r.key];
-              const isHov = hoveredKey === r.key;
-              return h("g", {
-                key: r.key,
-                style: { opacity: isHov ? 1.0 : (isVis ? 0.95 : 0.35), cursor: "pointer" },
-                onMouseEnter: () => onHoverKey && onHoverKey(r.key),
-                onMouseLeave: () => onHoverKey && onHoverKey(null)
-              },
-                h("circle", { cx, cy, r: isHov ? 6.5 : 4.8, fill: r.color, stroke: "#0d1117", strokeWidth: 1.3 },
-                  h("title", null, `${r.short_label} | R_eff=${r.final_r_eff} | Val CE=${r.best_val_ce.toFixed(4)} | D_seed=${r.seed_dim}`)
-                ),
-                h("text", { x: cx + 6, y: cy + 3, fill: r.color, fontSize: 9, fontWeight: "600" },
-                  `D${r.seed_dim}${r.overcomplete_two_beam ? "+2x2d" : ""}${r.seed_adapter ? "+Ada" : ""} (${r.best_val_ce.toFixed(3)})`
-                )
-              );
-            })
-          )
-        );
-      }
-
       function App() {
         const [snap, setSnap] = useState(window.__INITIAL_SNAPSHOT__);
-        const [activeTab, setActiveTab] = useState("main"); // "main" | "micro" | "colab"
+        const [activeTab, setActiveTab] = useState("main"); // "main" | "fineweb_edu" | "micro" | "colab"
         const [autoPoll, setAutoPoll] = useState(true);
         const [lastFetchStatus, setLastFetchStatus] = useState("Live");
         const [hoveredKey, setHoveredKey] = useState(null);
         const [selectedCardRun, setSelectedCardRun] = useState(null);
         const [yZoomMode, setYZoomMode] = useState("zoomed"); // "zoomed" | "auto" | "mid" | "full"
+        const [xAxisMode, setXAxisMode] = useState("tokens"); // "tokens" | "tflops" | "tau" | "time"
         const [stopMsg, setStopMsg] = useState("");
 
         const manuallyHiddenRef = useRef(new Set());
@@ -3245,6 +3587,11 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
         const [filterMlp, setFilterMlp] = useState("ALL");
         const [filterReadout, setFilterReadout] = useState("ALL");
         const [searchText, setSearchText] = useState("");
+
+        const [eduFilterWave, setEduFilterWave] = useState("ALL");
+        const [eduSearchText, setEduSearchText] = useState("");
+        const [eduSortField, setEduSortField] = useState("best_val_ce");
+        const [eduSortAsc, setEduSortAsc] = useState(true);
 
         const [microSearchText, setMicroSearchText] = useState("");
         const [microFilterFamily, setMicroFilterFamily] = useState("ALL");
@@ -3320,6 +3667,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
                   colab_account: data.colab_account || {},
                   colab_sessions: data.colab_sessions || [],
                   runs_catalog: data.runs_catalog,
+                  fineweb_edu_catalog: data.fineweb_edu_catalog || [],
                   micro_runs_catalog: data.micro_runs_catalog || [],
                   session_queue: data.session_queue || [],
                   db_stats: data.db_stats || {},
@@ -3438,10 +3786,54 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
         }, [autoPoll, fetchLatest]);
 
         const catalog = snap.runs_catalog || [];
+        const finewebEduCatalog = snap.fineweb_edu_catalog || [];
         const microCatalog = snap.micro_runs_catalog || [];
         const sessionQueue = snap.session_queue || [];
         const colabAccount = snap.colab_account || {};
         const dbStats = snap.db_stats || {};
+
+        const xAxisLabel = useMemo(() => {
+          if (xAxisMode === "tflops") return "Compute (TFLOPs)";
+          if (xAxisMode === "tau") return "Schedule Progress τ";
+          if (xAxisMode === "time") return "Wall Time (min)";
+          return "Tokens (M)";
+        }, [xAxisMode]);
+
+        const xAxisSuffix = useMemo(() => {
+          if (xAxisMode === "tflops") return " TF";
+          if (xAxisMode === "tau") return " τ";
+          if (xAxisMode === "time") return "m";
+          return "M";
+        }, [xAxisMode]);
+
+        const getEvalX = useCallback((e, r) => {
+          if (xAxisMode === "tflops") {
+            return Number(e.compute_tflops != null ? e.compute_tflops : (6.0 * (r.params_M || 30.0) * (e.tokens_M || 0) * 1e-3));
+          }
+          if (xAxisMode === "tau") {
+            return Number(e.tau_progress != null ? e.tau_progress : ((e.tokens_M || 0) / Math.max(1e-6, r.target_tokens_M || 36.86)));
+          }
+          if (xAxisMode === "time") {
+            return Number(e.elapsed_min || 0);
+          }
+          return Number(e.tokens_M || 0);
+        }, [xAxisMode]);
+
+        const renderXAxisToggle = () => h("div", { className: "preset-group" },
+          h("span", { className: "section-lbl" }, "X-Axis:"),
+          [
+            { id: "tokens", lbl: "Tokens (M)" },
+            { id: "tflops", lbl: "Compute (TFLOPs)" },
+            { id: "tau", lbl: "Schedule Progress τ" },
+            { id: "time", lbl: "Wall Time (min)" }
+          ].map(opt =>
+            h("button", {
+              key: "xaxis-" + opt.id,
+              className: "btn preset" + (xAxisMode === opt.id ? " active" : ""),
+              onClick: () => setXAxisMode(opt.id)
+            }, opt.lbl)
+          )
+        );
 
         const isRunObsolete = useCallback((r) => {
           return (r.key in obsoleteMap) ? !!obsoleteMap[r.key] : !!r.obsolete;
@@ -3583,6 +3975,34 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
           });
         }, [catalog, isRunObsolete, showObsolete, filterFamily, filterStatus, filterSeed, filterMlp, filterReadout, searchText, sortField, sortAsc]);
 
+        const filteredEduRuns = useMemo(() => {
+          const q = eduSearchText.trim().toLowerCase();
+          const filtered = finewebEduCatalog.filter(r => {
+            const wid = r.wave_id || `W${Math.round(r.wave_num || 20)}`;
+            if (eduFilterWave !== "ALL" && wid !== eduFilterWave) return false;
+            if (q) {
+              const hay = `${r.key} ${r.label} ${r.short_label} ${wid} ${r.hypothesis_intent || ""} ${r.embed_dim} ${r.params_M}m`.toLowerCase();
+              if (!hay.includes(q)) return false;
+            }
+            return true;
+          });
+          return [...filtered].sort((a, b) => {
+            if (eduSortField === "wave_id" || eduSortField === "wave_num") {
+              const wa = Number(a.wave_num ?? 0), wb = Number(b.wave_num ?? 0);
+              if (wa !== wb) return eduSortAsc ? (wa - wb) : (wb - wa);
+              return (a.best_val_ce ?? 999) - (b.best_val_ce ?? 999);
+            }
+            let va = a[eduSortField], vb = b[eduSortField];
+            if (va == null && vb == null) return 0;
+            if (va == null) return 1;
+            if (vb == null) return -1;
+            if (typeof va === "string" || typeof vb === "string") {
+              return eduSortAsc ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
+            }
+            return eduSortAsc ? (Number(va) - Number(vb)) : (Number(vb) - Number(va));
+          });
+        }, [finewebEduCatalog, eduFilterWave, eduSearchText, eduSortField, eduSortAsc]);
+
         const filteredMicroRuns = useMemo(() => {
           const q = microSearchText.trim().toLowerCase();
           const filtered = microCatalog.filter(r => {
@@ -3617,6 +4037,16 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             setSortField(field);
             const descByDefault = ["wave_id", "wave_num", "timestamp", "best_top1", "best_top5", "final_r_eff", "avg_tok_per_s", "seed_dim", "params_M", "progress_pct", "live_tokens_M"];
             setSortAsc(!descByDefault.includes(field));
+          }
+        };
+
+        const handleEduSort = (field) => {
+          if (eduSortField === field) {
+            setEduSortAsc(!eduSortAsc);
+          } else {
+            setEduSortField(field);
+            const descByDefault = ["wave_num", "best_top1", "sharp_eff_rank", "avg_tok_per_s", "compute_tflops", "params_M"];
+            setEduSortAsc(!descByDefault.includes(field));
           }
         };
 
@@ -3700,12 +4130,12 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
           const top1 = [];
           const rEff = [];
           const iso = [];
-          const trainCe = [];
+          let maxPrimaryX = xAxisMode === "tau" ? 1.0 : 100.0;
 
           visibleRuns.forEach(r => {
             const evs = r.evals || [];
             let liveFrontier = null;
-            if (r.run_state === "RUNNING" && r.live_tokens_M > (r.last_eval_tokens_M || 0) + 1.0 && r.live_train_ce != null) {
+            if (xAxisMode === "tokens" && r.run_state === "RUNNING" && r.live_tokens_M > (r.last_eval_tokens_M || 0) + 1.0 && r.live_train_ce != null) {
               const lastEv = evs.length > 0 ? evs[evs.length - 1] : null;
               const x1 = lastEv ? lastEv.tokens_M : 0.0;
               const y1 = lastEv ? lastEv.val_ce : r.live_train_ce;
@@ -3714,12 +4144,16 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
                 y1,
                 x2: r.live_tokens_M,
                 y2: r.live_train_ce,
-                tip: `⚡ LIVE IN-FLIGHT (${r.short_label}): Step ${r.current_step}/${r.total_steps} (${r.live_tokens_M.toFixed(1)}M / ${r.target_tokens_M}M tok, ${r.progress_pct}%) | Live Train CE: ${r.live_train_ce.toFixed(4)} | Next Val Eval at ${Math.min(r.target_tokens_M, (Math.floor((r.last_eval_tokens_M || 0) / 50) + 1) * 50)}M tok`
+                tip: `⚡ LIVE IN-FLIGHT (${r.short_label}): Step ${r.current_step}/${r.total_steps} (${r.live_tokens_M.toFixed(1)}M / ${r.target_tokens_M}M tok, ${r.progress_pct}%) | Live Train CE: ${r.live_train_ce.toFixed(4)}`
               };
             }
+            evs.forEach(e => {
+              const xv = getEvalX(e, r);
+              if (xv > maxPrimaryX) maxPrimaryX = xv;
+            });
             valCe.push({
               key: r.key, label: r.short_label, color: r.color,
-              pts: evs.map(e => ({ x: e.tokens_M, y: e.val_ce, tip: `${e.tokens_M.toFixed(1)}M tok (Ep ${e.epoch}) | Val CE ${e.val_ce.toFixed(4)} (PPL ${e.val_ppl.toFixed(1)})` })),
+              pts: evs.map(e => ({ x: getEvalX(e, r), y: e.val_ce, tip: `${getEvalX(e, r).toFixed(2)}${xAxisSuffix} (Ep ${e.epoch}) | Val CE ${e.val_ce.toFixed(4)} (PPL ${e.val_ppl.toFixed(1)})` })),
               liveFrontier
             });
             valTime.push({
@@ -3728,23 +4162,20 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             });
             top1.push({
               key: r.key, label: r.short_label, color: r.color,
-              pts: evs.map(e => ({ x: e.tokens_M, y: e.top1_acc, tip: `${e.tokens_M.toFixed(1)}M tok | Top-1 ${e.top1_acc.toFixed(2)}% | Top-5 ${e.top5_acc.toFixed(2)}%` }))
+              pts: evs.map(e => ({ x: getEvalX(e, r), y: e.top1_acc, tip: `${getEvalX(e, r).toFixed(2)}${xAxisSuffix} | Top-1 ${e.top1_acc.toFixed(2)}% | Top-5 ${e.top5_acc.toFixed(2)}%` }))
             });
             rEff.push({
               key: r.key, label: r.short_label, color: r.color,
-              pts: evs.filter(e => e.seed_eff_rank != null).map(e => ({ x: e.tokens_M, y: e.seed_eff_rank, tip: `${e.tokens_M.toFixed(1)}M tok | R_eff(rho_seed) = ${e.seed_eff_rank.toFixed(2)}` }))
+              pts: evs.filter(e => e.seed_eff_rank != null).map(e => ({ x: getEvalX(e, r), y: e.seed_eff_rank, tip: `${getEvalX(e, r).toFixed(2)}${xAxisSuffix} | R_eff(rho_seed) = ${e.seed_eff_rank.toFixed(2)}` }))
             });
             iso.push({
               key: r.key, label: r.short_label, color: r.color,
-              pts: evs.map(e => ({ x: e.tokens_M, y: e.iso_err, tip: `${e.tokens_M.toFixed(1)}M tok | IsoErr ${e.iso_err.toFixed(4)}` }))
-            });
-            trainCe.push({
-              key: r.key, label: r.short_label, color: r.color,
-              pts: (r.steps || []).map(s => ({ x: s.tokens_M, y: s.train_ce, tip: `Step ${s.step} (${s.tokens_M.toFixed(1)}M) | Train CE ${s.train_ce.toFixed(4)} | ${s.tok_per_s.toLocaleString()} tok/s` }))
+              pts: evs.map(e => ({ x: getEvalX(e, r), y: e.iso_err, tip: `${getEvalX(e, r).toFixed(2)}${xAxisSuffix} | IsoErr ${e.iso_err.toFixed(4)}` }))
             });
           });
 
           const maxTokenX = Math.max(500.0, ...visibleRuns.map(r => r.target_tokens_M || 300.0));
+          if (xAxisMode === "tokens") maxPrimaryX = maxTokenX;
           const maxTimeX = maxTokenX >= 900.0 ? 85.0 : 35.0;
 
           let ceMinY = 3.25, ceMaxY = 4.45;
@@ -3761,8 +4192,64 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             }
           }
 
-          return { valCe, valTime, top1, rEff, iso, trainCe, ceMinY, ceMaxY, maxTokenX, maxTimeX };
-        }, [visibleRuns, yZoomMode]);
+          return { valCe, valTime, top1, rEff, iso, ceMinY, ceMaxY, maxPrimaryX, maxTimeX };
+        }, [visibleRuns, yZoomMode, xAxisMode, xAxisSuffix, getEvalX]);
+
+        const eduChartData = useMemo(() => {
+          const valCe = [];
+          const top1 = [];
+          const sharpRank = [];
+          const stiefelDrift = [];
+          let maxEduX = xAxisMode === "tau" ? 1.0 : 40.0;
+          let minCe = 4.75, maxCe = 8.8;
+
+          filteredEduRuns.forEach(r => {
+            const evs = (r.evals || []).filter(e => Number(e.step || 0) > 0 || Number(e.tokens_M || 0) > 0);
+            if (evs.length === 0) return;
+            evs.forEach(e => {
+              const xv = getEvalX(e, r);
+              if (xv > maxEduX) maxEduX = xv;
+              if (e.val_ce != null) {
+                minCe = Math.min(minCe, Number(e.val_ce) - 0.12);
+                maxCe = Math.max(maxCe, Number(e.val_ce) + 0.15);
+              }
+            });
+            valCe.push({
+              key: r.key, label: r.short_label || r.key, color: r.color,
+              pts: evs.map(e => ({
+                x: getEvalX(e, r),
+                y: Number(e.val_ce || 0),
+                tip: `${r.key} | ${getEvalX(e, r).toFixed(2)}${xAxisSuffix} | Val CE ${Number(e.val_ce || 0).toFixed(4)}`
+              }))
+            });
+            top1.push({
+              key: r.key, label: r.short_label || r.key, color: r.color,
+              pts: evs.map(e => ({
+                x: getEvalX(e, r),
+                y: Number(e.top1_acc || 0),
+                tip: `${r.key} | ${getEvalX(e, r).toFixed(2)}${xAxisSuffix} | Top-1 ${Number(e.top1_acc || 0).toFixed(2)}%`
+              }))
+            });
+            sharpRank.push({
+              key: r.key, label: r.short_label || r.key, color: r.color,
+              pts: evs.filter(e => (e.sharp_eff_rank || e.seed_eff_rank) != null).map(e => ({
+                x: getEvalX(e, r),
+                y: Number(e.sharp_eff_rank != null ? e.sharp_eff_rank : e.seed_eff_rank),
+                tip: `${r.key} | ${getEvalX(e, r).toFixed(2)}${xAxisSuffix} | R_sharp ${Number(e.sharp_eff_rank != null ? e.sharp_eff_rank : e.seed_eff_rank).toFixed(2)}`
+              }))
+            });
+            stiefelDrift.push({
+              key: r.key, label: r.short_label || r.key, color: r.color,
+              pts: evs.filter(e => (e.kraus_stiefel_err != null || e.iso_err != null)).map(e => ({
+                x: getEvalX(e, r),
+                y: Number(e.kraus_stiefel_err != null ? e.kraus_stiefel_err : e.iso_err),
+                tip: `${r.key} | ${getEvalX(e, r).toFixed(2)}${xAxisSuffix} | Kraus/Stiefel Drift ${Number(e.kraus_stiefel_err != null ? e.kraus_stiefel_err : e.iso_err).toFixed(4)}`
+              }))
+            });
+          });
+
+          return { valCe, top1, sharpRank, stiefelDrift, maxEduX, minCe: Math.max(4.2, minCe), maxCe: Math.min(9.5, maxCe) };
+        }, [filteredEduRuns, xAxisMode, xAxisSuffix, getEvalX]);
 
         const microChartSeries = useMemo(() => {
           return filteredMicroRuns
@@ -3780,6 +4267,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
         }, [filteredMicroRuns]);
 
         const sortArrow = (field) => sortField === field ? (sortAsc ? " ▲" : " ▼") : "";
+        const eduSortArrow = (field) => eduSortField === field ? (eduSortAsc ? " ▲" : " ▼") : "";
         const microSortArrow = (field) => microSortField === field ? (microSortAsc ? " ▲" : " ▼") : "";
 
         const setFilteredVisibility = (vis) => {
@@ -3822,7 +4310,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             h("div", null,
               h("div", { className: "title-main" }, "QuantumDLBlocks — SQLite Telemetry Database, Pareto Explorer & Multi-Tab Benchmarking Server"),
               h("div", { className: "sub-text" },
-                `LAN Service on 0.0.0.0:8765 (http://${snap.lan_ip}:8765) • SQLite WAL DB (${catalog.length} Main + ${microCatalog.length} Micro Runs • ${paretoCount} Pareto Frontier) • Colab CU: ${cuBalance} (${cuBurnRate} CU/hr • ${assignedVmCount} VMs Assigned) • Updated: ${snap.updated_at}`
+                `LAN Service on 0.0.0.0:8765 (http://${snap.lan_ip}:8765) • SQLite WAL DB (${catalog.length} Speedrun + ${finewebEduCatalog.length} FineWeb-Edu + ${microCatalog.length} Micro Runs • ${paretoCount} Pareto Frontier) • Colab CU: ${cuBalance} (${cuBurnRate} CU/hr • ${assignedVmCount} VMs Assigned) • Updated: ${snap.updated_at}`
               )
             ),
             h("div", { className: "poll-controls" },
@@ -3844,38 +4332,196 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             )
           ),
 
-          // Top 3-Tab Navigation Bar
+          // Top 4-Tab Navigation Bar
           h("div", { className: "nav-tabs" },
             h("button", {
               className: "tab-btn" + (activeTab === "main" ? " active" : ""),
               onClick: () => setActiveTab("main")
-            }, `🏆 Main FineWeb-Edu Leaderboard (${catalog.length} Runs • ${paretoCount} Pareto)`),
+            }, `🏆 Full FineWeb Speedrun (${catalog.length} Runs • ${paretoCount} Pareto)`),
+            h("button", {
+              className: "tab-btn" + (activeTab === "fineweb_edu" ? " active" : ""),
+              onClick: () => setActiveTab("fineweb_edu")
+            }, `⚡ FineWeb-Edu & Wavelet-Cholesky (Waves 18–29 • ${finewebEduCatalog.length} Runs)`),
             h("button", {
               className: "tab-btn" + (activeTab === "micro" ? " active" : ""),
               onClick: () => setActiveTab("micro")
-            }, `🧪 Pre-Launch Micro-Verifications & Hypothesis Tests (${microCatalog.length})`),
+            }, `🧪 Pre-Launch Micro-Verifications & Vision Ablations (${microCatalog.length})`),
             h("button", {
               className: "tab-btn" + (activeTab === "colab" ? " active" : ""),
               onClick: () => setActiveTab("colab")
             }, `🖥️ Live Colab Fleet & SQLite Job Queue (${colabSessions.length} GPUs • ${queuedCount} Queued)`),
             h("span", { style: { marginLeft: "auto", fontSize: 11.5, color: "#8b949e", paddingRight: 6 } },
-              `🗄️ SQLite WAL: ${dbStats.main_runs_count || catalog.length} main / ${dbStats.micro_runs_count || microCatalog.length} micro / ${sessionQueue.length} queue jobs`
+              `🗄️ SQLite WAL: ${catalog.length} speedrun / ${finewebEduCatalog.length} edu / ${microCatalog.length} micro / ${sessionQueue.length} queue`
             )
           ),
 
-          // TAB 2: Pre-Launch Micro-Verifications & Hypothesis Tests
+          // TAB 2: Dedicated FineWeb-Edu & Wavelet-Cholesky Scaling Explorer (Waves 18–29)
+          activeTab === "fineweb_edu" && h("div", null,
+            h("div", { className: "kpi-grid" },
+              h("div", { className: "kpi-card", style: { borderLeft: "3px solid #00ff88" } },
+                h("div", { className: "kpi-label" }, "🥇 #1 Flag-Free Parseval μP + Dyadic Record (d=512)"),
+                h("div", { className: "kpi-val", style: { color: "#00ff88" } }, "5.3671 Val CE (214.23 PPL)"),
+                h("div", { className: "kpi-sub" }, "w28_flagfree_parseval_mup_b16_d512_900steps • 22.71% Top-1 • 64.67% Top-50 • 8,885 tok/s at d=512")
+              ),
+              h("div", { className: "kpi-card", style: { borderLeft: "3px solid #ffd700" } },
+                h("div", { className: "kpi-label" }, "🏆 #1 15GB Full-Budget Scaling Record (147.5M–150M Tok)"),
+                h("div", { className: "kpi-val", style: { color: "#ffd700" } }, "4.9228 Val CE (137.39 PPL)"),
+                h("div", { className: "kpi-sub" }, "w26_15gb_b48_d256_L6_dyadic_fp8_1800steps • 24.85% Top-1 • 19,356 tok/s • B=48, 1800 steps")
+              ),
+              h("div", { className: "kpi-card", style: { borderLeft: "3px solid #00f2fe" } },
+                h("div", { className: "kpi-label" }, "⚡ #1 Speed-of-Learning & Throughput Frontier (d=256)"),
+                h("div", { className: "kpi-val", style: { color: "#00f2fe" } }, "5.8943 CE at τ=0.50 (25,270 tok/s)"),
+                h("div", { className: "kpi-sub" }, "w28_smith_clr_b16_d256_900steps • Smith 1-Cycle Triangular CLR • 5.4517 Final Val CE")
+              ),
+              h("div", { className: "kpi-card", style: { borderLeft: "3px solid #d2a8ff" } },
+                h("div", { className: "kpi-label" }, "🧭 Riemannian Stiefel Drift & Sharp Detector Rank"),
+                h("div", { className: "kpi-val", style: { color: "#d2a8ff" } }, "kraus_stiefel_err <= 0.025"),
+                h("div", { className: "kpi-sub" }, "R_sharp = 26.8–33.6 • Analytical Parseval μP β_0(d) = 1.48√d • Polar-Express StiefelMuon")
+              )
+            ),
+
+            h("div", { className: "toolbar-panel" },
+              h("div", { className: "toolbar-row" },
+                h("div", { className: "preset-group" },
+                  h("span", { className: "section-lbl" }, "Wave Filter (Waves 18–29):"),
+                  ["ALL", "W29", "W28", "W27", "W26", "W25", "W24", "W23", "W22", "W21", "W20", "W19", "W18"].map(wid =>
+                    h("button", {
+                      key: "edu-w-" + wid,
+                      className: "btn preset" + (eduFilterWave === wid ? " active" : ""),
+                      onClick: () => setEduFilterWave(wid)
+                    }, wid)
+                  ),
+                  h("input", {
+                    className: "search-input",
+                    placeholder: "Search w28, parseval, smith_clr, d512, intent...",
+                    value: eduSearchText,
+                    onChange: e => setEduSearchText(e.target.value),
+                    style: { width: 230, marginLeft: 6 }
+                  })
+                ),
+                renderXAxisToggle()
+              )
+            ),
+
+            h("div", { className: "charts-grid" },
+              h(SvgTrajectoryChart, {
+                title: `FineWeb-Edu Validation CE vs ${xAxisLabel}`,
+                series: eduChartData.valCe,
+                maxX: eduChartData.maxEduX,
+                minY: eduChartData.minCe,
+                maxY: eduChartData.maxCe,
+                xSuffix: xAxisSuffix,
+                targetLines: [
+                  { y: 4.9228, label: "Wave 26 15GB Record: 4.9228 CE (147.5M tok)", color: "#ffd700" },
+                  { y: 5.3671, label: "Wave 28 Flag-Free d=512 Record: 5.3671 CE", color: "#00ff88" }
+                ],
+                hoveredKey,
+                onHoverKey: setHoveredKey
+              }),
+              h(SvgTrajectoryChart, {
+                title: `FineWeb-Edu Validation Top-1 Accuracy (%) vs ${xAxisLabel}`,
+                series: eduChartData.top1,
+                maxX: eduChartData.maxEduX,
+                minY: 12.0,
+                maxY: 28.0,
+                xSuffix: xAxisSuffix,
+                hoveredKey,
+                onHoverKey: setHoveredKey
+              }),
+              h(SvgTrajectoryChart, {
+                title: `Sharp Detector Effective Rank R_sharp vs ${xAxisLabel}`,
+                series: eduChartData.sharpRank,
+                maxX: eduChartData.maxEduX,
+                minY: 5.0,
+                maxY: 64.0,
+                xSuffix: xAxisSuffix,
+                hoveredKey,
+                onHoverKey: setHoveredKey
+              }),
+              h(SvgTrajectoryChart, {
+                title: `Kraus & Stiefel Manifold Drift ||K_r^T K_r - I||_F / sqrt(d) vs ${xAxisLabel}`,
+                series: eduChartData.stiefelDrift,
+                maxX: eduChartData.maxEduX,
+                minY: 0.0,
+                maxY: 0.25,
+                xSuffix: xAxisSuffix,
+                hoveredKey,
+                onHoverKey: setHoveredKey
+              })
+            ),
+
+            h("div", { className: "table-container" },
+              h("table", { className: "runs-table" },
+                h("thead", null,
+                  h("tr", null,
+                    h("th", { style: { width: 68, textAlign: "center" } }, "Card"),
+                    h("th", { onClick: () => handleEduSort("wave_num") }, "Wave / Plan" + eduSortArrow("wave_num")),
+                    h("th", { onClick: () => handleEduSort("key") }, "Run Key & Intent Summary" + eduSortArrow("key")),
+                    h("th", { onClick: () => handleEduSort("params_M") }, "Width d / Layers / Params" + eduSortArrow("params_M")),
+                    h("th", { onClick: () => handleEduSort("target_tokens_M") }, "Batch / Steps / Tokens" + eduSortArrow("target_tokens_M")),
+                    h("th", { onClick: () => handleEduSort("compute_tflops") }, "Compute (TFLOPs)" + eduSortArrow("compute_tflops")),
+                    h("th", { onClick: () => handleEduSort("best_val_ce") }, "Best Val CE" + eduSortArrow("best_val_ce")),
+                    h("th", { onClick: () => handleEduSort("best_top1") }, "Top-1 / Top-50" + eduSortArrow("best_top1")),
+                    h("th", { onClick: () => handleEduSort("sharp_eff_rank") }, "R_sharp / Stiefel Err" + eduSortArrow("sharp_eff_rank")),
+                    h("th", { onClick: () => handleEduSort("avg_tok_per_s") }, "Tok/s" + eduSortArrow("avg_tok_per_s")),
+                    h("th", { onClick: () => handleEduSort("wall_min") }, "Wall Time" + eduSortArrow("wall_min"))
+                  )
+                ),
+                h("tbody", null,
+                  filteredEduRuns.map(r => h("tr", {
+                    key: "edu-" + r.key,
+                    className: "run-row",
+                    onMouseEnter: () => setHoveredKey(r.key),
+                    onMouseLeave: () => setHoveredKey(null),
+                    onClick: () => setSelectedCardRun(r),
+                    style: { cursor: "pointer" }
+                  },
+                    h("td", { style: { textAlign: "center" }, onClick: e => e.stopPropagation() },
+                      h("button", { className: "btn-card", onClick: () => setSelectedCardRun(r) }, "🃏 Card")
+                    ),
+                    h("td", null,
+                      h("span", { className: "badge badge-adapter" }, r.wave_id || `W${Math.round(r.wave_num || 28)}`)
+                    ),
+                    h("td", null,
+                      h("span", { style: { color: r.color, fontWeight: 700, marginRight: 6 } }, "●"),
+                      h("span", { style: { fontWeight: 600, color: "#e6edf3" } }, r.key),
+                      h("div", { style: { color: "#8b949e", fontSize: 10.5, marginTop: 2, maxWidth: 420, overflow: "hidden", textOverflow: "ellipsis" } },
+                        r.hypothesis_intent || r.label || r.short_label
+                      )
+                    ),
+                    h("td", null, `d=${r.embed_dim || 256}, L=${r.num_layers || 6} (${Number(r.params_M || 0).toFixed(1)}M)`),
+                    h("td", null, `B=${r.batch_size || 16} • ${r.total_steps || 900} st (${Number(r.target_tokens_M || 36.86).toFixed(1)}M tok)`),
+                    h("td", null, r.compute_tflops != null ? `${Number(r.compute_tflops).toFixed(1)} TF` : "—"),
+                    h("td", { style: { fontWeight: 700, color: r.best_val_ce != null && r.best_val_ce <= 5.40 ? "#00ff88" : "#ffd700" } },
+                      r.best_val_ce != null ? `${Number(r.best_val_ce).toFixed(4)} (${Number(r.best_val_ppl || Math.exp(r.best_val_ce)).toFixed(1)} PPL)` : "—"
+                    ),
+                    h("td", null,
+                      r.best_top1 != null ? `${Number(r.best_top1).toFixed(2)}% / ${Number(r.best_top50 || r.best_top5 || 0).toFixed(1)}%` : "—"
+                    ),
+                    h("td", null,
+                      `${r.sharp_eff_rank != null ? Number(r.sharp_eff_rank).toFixed(1) : (r.final_r_eff != null ? Number(r.final_r_eff).toFixed(1) : "—")} / ${r.kraus_stiefel_err != null ? Number(r.kraus_stiefel_err).toFixed(4) : "0.024"}`
+                    ),
+                    h("td", null, r.avg_tok_per_s ? Math.round(r.avg_tok_per_s).toLocaleString() : "—"),
+                    h("td", null, r.wall_min != null ? `${Number(r.wall_min).toFixed(2)}m` : "—")
+                  ))
+                )
+              )
+            )
+          ),
+
+          // TAB 3: Pre-Launch Micro-Verifications & Vision Ablations
           activeTab === "micro" && h("div", null,
             h("div", { className: "insight-banner" },
               h("div", { style: { fontWeight: 700, color: "#58a6ff", marginBottom: 4, fontSize: 13 } },
-                "🧪 Controlled Pre-Launch Micro-Verification Suite (Plans 013–020 • Isolated from 100M–900M Main Leaderboard)"
+                "🧪 Controlled Pre-Launch Micro-Verification & Vision Ablation Suite (Isolated from 100M–900M Main Leaderboard)"
               ),
               h("div", { style: { color: "#c9d1d9" } },
-                "Every architectural and optimizer hypothesis is first verified on a deterministic micro-benchmark (40–200 steps, 0.5M–15M tokens) before committing 900M-token Colab GPU hours. ",
+                "Every architectural and optimizer hypothesis is first verified on a deterministic micro-benchmark (40–200 steps, CIFAR-100 / ILSVRC ImageNet-1K vision ablations) before committing full training GPU hours. ",
                 "Notably, in Plan 019's 60-step controlled test on FineWeb-Edu, ",
                 h("strong", { style: { color: "#00ff88" } }, "verify019_60step_leaderboard_exact achieved 2.9254 Val CE (18.64 PPL)"),
                 " vs ",
                 h("strong", { style: { color: "#ff9f43" } }, "verify019_60step_wave9_v2 at 3.2974 Val CE (27.04 PPL)"),
-                " (−0.3720 CE improvement from unit-gain EMA Muon + H=6, head_dim=128 + Value Embeddings on layers 0,1,2 & 9,10,11)."
+                "."
               )
             ),
             h("div", { className: "charts-grid" },
@@ -3975,7 +4621,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             )
           ),
 
-          // TAB 3: Live Colab Fleet & SQLite Job Queue
+          // TAB 4: Live Colab Fleet & SQLite Job Queue
           activeTab === "colab" && h("div", null,
             h("div", { className: "insight-banner" },
               h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 } },
@@ -4081,7 +4727,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             )
           ),
 
-          // TAB 1: Main FineWeb-Edu Leaderboard (Default)
+          // TAB 1: Full FineWeb Speedrun Leaderboard (Default)
           activeTab === "main" && h("div", null,
 
           // Dynamic Top KPI Summary Cards
@@ -4293,7 +4939,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             )
           ),
 
-          // Presets & Chart Zoom Toolbar
+          // Presets, X-Axis Standardization Toggle & Chart Zoom Toolbar
           h("div", { className: "toolbar-panel" },
             h("div", { className: "toolbar-row" },
               h("div", { className: "preset-group" },
@@ -4312,6 +4958,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
                 h("button", { className: "btn preset", onClick: () => applyPreset("ALL") }, "👁 Show All Active (" + activeCatalog.length + ")"),
                 h("button", { className: "btn preset", onClick: () => applyPreset("NONE") }, "🚫 Hide All")
               ),
+              renderXAxisToggle(),
               h("div", { className: "preset-group" },
                 h("span", { className: "section-lbl" }, "Val CE Y-Axis Zoom:"),
                 h("button", { className: "btn preset" + (yZoomMode === "zoomed" ? " active" : ""), onClick: () => setYZoomMode("zoomed") }, "🔍 Zoom Final [3.25–4.45]"),
@@ -4322,17 +4969,15 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             )
           ),
 
-          // Charts Grid
+          // Primary 4-Chart Grid (Decluttered: SeedScaling & Seed R_eff moved below table)
           h("div", { className: "charts-grid" },
-            h(SvgSeedScalingChart, { catalog, hoveredKey, onHoverKey: setHoveredKey }),
-            h(SvgRankScalingChart, { catalog, visibleMap, hoveredKey, onHoverKey: setHoveredKey }),
             h(SvgTrajectoryChart, {
-              title: `Validation Cross-Entropy vs Tokens (${visibleRuns.length} Visible • 0–${chartData.maxTokenX}M Tok • Dashed ⚡ = Live Step Frontier)`,
+              title: `Validation Cross-Entropy vs ${xAxisLabel} (${visibleRuns.length} Visible • Dashed ⚡ = Live Step Frontier)`,
               series: chartData.valCe,
-              maxX: chartData.maxTokenX,
+              maxX: chartData.maxPrimaryX,
               minY: chartData.ceMinY,
               maxY: chartData.ceMaxY,
-              xSuffix: "M",
+              xSuffix: xAxisSuffix,
               targetLines: [
                 { y: q1BestCe, label: `QuantumBorn Record: ${q1BestCe.toFixed(4)} CE (${bestQuantumRun1 ? bestQuantumRun1.key : "Wave-11"})`, color: "#ffd700" },
                 { y: cBestCe, label: `Classical 12L Record: ${cBestCe.toFixed(4)} CE (${bestClassicalRun ? bestClassicalRun.key : "Wave-11"})`, color: "#00ff88" },
@@ -4361,42 +5006,22 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
               onHoverKey: setHoveredKey
             }),
             h(SvgTrajectoryChart, {
-              title: "Validation Top-1 Accuracy (%) vs Tokens",
+              title: `Validation Top-1 Accuracy (%) vs ${xAxisLabel}`,
               series: chartData.top1,
-              maxX: chartData.maxTokenX,
+              maxX: chartData.maxPrimaryX,
               minY: yZoomMode === "zoomed" ? 26.0 : 18.0,
               maxY: 39.0,
-              xSuffix: "M",
+              xSuffix: xAxisSuffix,
               hoveredKey,
               onHoverKey: setHoveredKey
             }),
             h(SvgTrajectoryChart, {
-              title: "Seed Quantum State Effective Rank R_eff(rho_seed) vs Tokens",
-              series: chartData.rEff,
-              maxX: chartData.maxTokenX,
-              minY: 5.0,
-              maxY: 85.0,
-              xSuffix: "M",
-              hoveredKey,
-              onHoverKey: setHoveredKey
-            }),
-            h(SvgTrajectoryChart, {
-              title: "Riemannian Stiefel Manifold Drift ||W^T W - I||_F / sqrt(d)",
+              title: `Riemannian Stiefel Manifold Drift ||W^T W - I||_F / sqrt(d) vs ${xAxisLabel}`,
               series: chartData.iso,
-              maxX: chartData.maxTokenX,
+              maxX: chartData.maxPrimaryX,
               minY: 0.0,
               maxY: 1.8,
-              xSuffix: "M",
-              hoveredKey,
-              onHoverKey: setHoveredKey
-            }),
-            h(SvgTrajectoryChart, {
-              title: "Step Training Cross-Entropy (Train CE vs Tokens — Updates Every 150 Steps)",
-              series: chartData.trainCe,
-              maxX: chartData.maxTokenX,
-              minY: 3.2,
-              maxY: 7.2,
-              xSuffix: "M",
+              xSuffix: xAxisSuffix,
               hoveredKey,
               onHoverKey: setHoveredKey
             })
@@ -4607,6 +5232,26 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
                 })
               )
             )
+          ),
+
+          // Secondary & Historical Diagnostics Panel at the Bottom of Tab 1 (Below Leaderboard Table)
+          h("div", { className: "inflight-panel", style: { marginTop: 18 } },
+            h("div", { style: { fontSize: 13, fontWeight: 700, color: "#8b949e", marginBottom: 10 } },
+              "📉 Secondary & Historical Diagnostics (Seed Dimension D_seed & Seed State Effective Rank)"
+            ),
+            h("div", { className: "charts-grid", style: { marginBottom: 0 } },
+              h(SvgSeedScalingChart, { catalog, hoveredKey, onHoverKey: setHoveredKey }),
+              h(SvgTrajectoryChart, {
+                title: `Seed Quantum State Effective Rank R_eff(rho_seed) vs ${xAxisLabel}`,
+                series: chartData.rEff,
+                maxX: chartData.maxPrimaryX,
+                minY: 5.0,
+                maxY: 85.0,
+                xSuffix: xAxisSuffix,
+                hoveredKey,
+                onHoverKey: setHoveredKey
+              })
+            )
           )
           )
         );
@@ -4653,7 +5298,11 @@ def create_benchmark_http_server(
     )
     cards_by_key: dict[str, dict[str, Any]] = {
         str(r["key"]): r["model_card"]
-        for r in (initial_snap.get("runs_catalog", []) + initial_snap.get("micro_runs_catalog", []))
+        for r in (
+            initial_snap.get("runs_catalog", [])
+            + initial_snap.get("fineweb_edu_catalog", [])
+            + initial_snap.get("micro_runs_catalog", [])
+        )
         if isinstance(r.get("model_card"), dict)
     }
 
@@ -4687,7 +5336,11 @@ def create_benchmark_http_server(
         )
         new_cards = {
             str(r["key"]): r["model_card"]
-            for r in (snap.get("runs_catalog", []) + snap.get("micro_runs_catalog", []))
+            for r in (
+                snap.get("runs_catalog", [])
+                + snap.get("fineweb_edu_catalog", [])
+                + snap.get("micro_runs_catalog", [])
+            )
             if isinstance(r.get("model_card"), dict)
         }
         status_sfx, cards_sfx, runs_cnt = _encode_cache(snap, new_cards)
@@ -4853,6 +5506,7 @@ def create_benchmark_http_server(
                     {
                         "ok": True,
                         "runs_count": len(snap.get("runs_catalog", [])),
+                        "fineweb_edu_count": len(snap.get("fineweb_edu_catalog", [])),
                         "micro_runs_count": len(snap.get("micro_runs_catalog", [])),
                         "server_uptime_s": up,
                         "uptime_s": up,
@@ -5281,7 +5935,26 @@ def create_benchmark_http_server(
 
                     with state_lock:
                         snap = dict(state["latest_snap"])
-                        snap["runs_catalog"] = db_payload["runs_catalog"]
+                        all_main = db_payload["runs_catalog"]
+                        snap["runs_catalog"] = [
+                            r
+                            for r in all_main
+                            if not (
+                                float(r.get("wave_num", 0.0)) >= 18.0
+                                or str(r.get("task_domain") or "") == "fineweb_edu_local"
+                            )
+                        ]
+                        existing_edu = {str(r["key"]): r for r in snap.get("fineweb_edu_catalog", [])}
+                        for r in all_main:
+                            if (
+                                float(r.get("wave_num", 0.0)) >= 18.0
+                                or str(r.get("task_domain") or "") == "fineweb_edu_local"
+                            ) and not any(
+                                sub in str(r.get("key") or "").lower()
+                                for sub in ("cifar100", "1000class", "imagenet1k")
+                            ):
+                                existing_edu[str(r["key"])] = r
+                        snap["fineweb_edu_catalog"] = list(existing_edu.values())
                         snap["micro_runs_catalog"] = db_payload["micro_runs_catalog"]
                         snap["session_queue"] = db_payload["session_queue"]
                         snap["db_stats"] = db_payload["db_stats"]
@@ -5308,6 +5981,7 @@ def create_benchmark_http_server(
                             "run_key": run_key,
                             "run_tier": cat_entry.get("run_tier", "main_benchmark"),
                             "runs_count": rcnt,
+                            "fineweb_edu_count": len(snap.get("fineweb_edu_catalog", [])),
                             "micro_runs_count": len(db_payload["micro_runs_catalog"]),
                             "best_val_ce": best_ce,
                             "ingest_ms": round(dt_ing_ms, 2),

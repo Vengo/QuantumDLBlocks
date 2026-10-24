@@ -1,4 +1,4 @@
-"""Unit tests for `scripts/fineweb_convex_vs_concave_slope_tracker.py` (Plan 041)."""
+"""Unit tests for `scripts/fineweb_convex_vs_concave_slope_tracker.py` (Plans 041–042)."""
 
 from __future__ import annotations
 
@@ -23,18 +23,18 @@ from scripts.fineweb_convex_vs_concave_slope_tracker import (
 
 
 def test_parse_args_and_cli_execution(tmp_path: Path) -> None:
-    """Verify CLI flag parsing and end-to-end JSON generation."""
+    """Verify CLI flag parsing and end-to-end JSON generation across Waves 19–27."""
     out_json = tmp_path / "slope_tracker_test.json"
     argv = [
         "--waves",
-        "w19,w20,w21,w22,w23,w24,w25",
+        "w19,w20,w21,w22,w23,w24,w25,w26,w27",
         "--target-tokens",
         "100000000",
         "--json-out",
         str(out_json),
     ]
     cfg = parse_args(argv)
-    assert cfg.waves == ("w19", "w20", "w21", "w22", "w23", "w24", "w25")
+    assert cfg.waves == ("w19", "w20", "w21", "w22", "w23", "w24", "w25", "w26", "w27")
     assert cfg.target_tokens == 100_000_000
 
     rc = main(argv)
@@ -42,6 +42,8 @@ def test_parse_args_and_cli_execution(tmp_path: Path) -> None:
     assert out_json.exists()
 
     payload = json.loads(out_json.read_text(encoding="utf-8"))
+    assert "iso_token_comparison" in payload
+    assert "iso_token_table" in payload
     assert "part_a_empirical_scaling" in payload
     assert "part_b_readout_derivative_profiler" in payload
     assert "runs_by_key" in payload
@@ -94,6 +96,51 @@ def test_part_a_empirical_scaling_and_asymptotic_floors() -> None:
     assert w25_3600["projected_ce_300m_power_law"] < w25_3600["projected_ce_100m_power_law"]
 
 
+def test_iso_token_and_iso_flop_standardization_across_batch_sizes_and_scales() -> None:
+    """Verify standardized token milestones (`ce_at_*`), FLOPs, update density, and iso-token slopes."""
+    report = run_slope_tracker(SlopeTrackerConfig(json_out=""))
+    iso_comp = report["iso_token_comparison"]
+    assert iso_comp["milestones_M"] == [2.46, 7.37, 14.75, 29.49, 44.24]
+    assert len(iso_comp["rows"]) >= 10
+    assert "joint_chinchilla_scaling" in iso_comp
+    assert "best_by_milestone" in iso_comp
+
+    runs = report["runs_by_key"]
+    w25_3600 = runs["w25_8gb_convex_traceless_born_3600steps"]
+    w26_b16_900 = runs["w26_15gb_dyadic_convex_traceless_b16_900steps"]
+    w26_b48_d256 = runs["w26_15gb_b48_d256_L6_dyadic_fp8_1800steps"]
+    w26_b48_d384 = runs["w26_15gb_b48_d384_L8_dyadic_fp8_600steps"]
+
+    # B=16 (8,192 tok/step) standardized token milestones & FLOPs
+    assert w25_3600["tokens_per_step"] == 8192
+    assert w25_3600["optimizer_updates_per_10m_tokens"] == 1220.7
+    assert w25_3600["flops_per_token_M"] == 62.4
+    assert w25_3600["total_compute_tflops"] == round((6.0 * 10.4 * 1e6 * 29.49 * 1e6) / 1e12, 2)
+    assert w25_3600["ce_at_2p46m"] == 6.1478
+    assert w25_3600["ce_at_7p37m"] == 5.5970
+    assert w25_3600["ce_at_14p75m"] == 5.3782
+    assert w25_3600["ce_at_29p49m"] == 5.0162
+    assert abs(w25_3600["slope_2p46m_to_7p37m"] - w25_3600["early_log_slope_300_to_900"]) < 1e-4
+    assert abs(w25_3600["slope_7p37m_to_final"] - w25_3600["late_log_slope_900_to_3600"]) < 1e-4
+
+    # B=48 (24,576 tok/step) standardized token milestones & FLOPs
+    assert w26_b48_d256["batch_size"] == 48
+    assert w26_b48_d256["tokens_per_step"] == 24576
+    assert w26_b48_d256["optimizer_updates_per_10m_tokens"] == 406.9
+    assert w26_b48_d256["total_compute_tflops"] == round((6.0 * 10.4 * 1e6 * 44.24 * 1e6) / 1e12, 2)
+    assert w26_b48_d256["ce_at_2p46m"] == 6.2001
+    assert w26_b48_d256["ce_at_7p37m"] == 5.5536
+    assert w26_b48_d256["ce_at_14p75m"] == 5.2203
+    assert w26_b48_d256["ce_at_29p49m"] == 5.0368
+    assert w26_b48_d256["ce_at_44p24m"] == 4.8199
+
+    # Model width scaling (d=384 vs d=256 at B=48) and batch-size step density (B=16 vs B=48 at 7.37M)
+    assert w26_b48_d384["embed_dim"] == 384
+    assert w26_b48_d384["ce_at_14p75m"] < w26_b48_d256["ce_at_14p75m"]
+    assert w26_b48_d384["slope_7p37m_to_14p75m"] < w26_b48_d256["slope_7p37m_to_14p75m"]
+    assert w26_b16_900["ce_at_7p37m"] < w26_b48_d256["ce_at_7p37m"]
+
+
 def test_part_b_readout_derivative_and_slope_ratio_hierarchy() -> None:
     """Verify exact analytical vs. autograd derivatives and peak-to-tail slope ratio hierarchy."""
     report = run_slope_tracker(SlopeTrackerConfig(json_out=""))
@@ -126,5 +173,6 @@ if __name__ == "__main__":
 
     test_parse_args_and_cli_execution(Path(tempfile.mkdtemp()))
     test_part_a_empirical_scaling_and_asymptotic_floors()
+    test_iso_token_and_iso_flop_standardization_across_batch_sizes_and_scales()
     test_part_b_readout_derivative_and_slope_ratio_hierarchy()
     print("ALL test_fineweb_slope_tracker.py TESTS PASSED")

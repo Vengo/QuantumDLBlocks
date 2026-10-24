@@ -5,15 +5,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 REPORT_PATH = ROOT / ".cache" / "hypothesis_experiments_041.json"
 
 
-@pytest.mark.skipif(not REPORT_PATH.exists(), reason="Plan 041 report not yet generated")
 def test_hypothesis_041_overall_and_individual_gates() -> None:
     """Verify `H1`, `H2`, and `H3` pass in `.cache/hypothesis_experiments_041.json`."""
+    assert REPORT_PATH.exists(), "Plan 041 report (.cache/hypothesis_experiments_041.json) must exist"
     report = json.loads(REPORT_PATH.read_text(encoding="utf-8"))
     assert report["overall_pass"] is True
 

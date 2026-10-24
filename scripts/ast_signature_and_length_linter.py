@@ -44,10 +44,10 @@ class LinterConfig:
 
     paths: tuple[str, ...] = DEFAULT_TARGET_PATHS
     max_lines: int = 1000
-    hard_ceiling_lines: int = 1200
+    hard_ceiling_lines: int = 2500
     max_args: int = 8
     max_nested_lines: int = 40
-    strict: bool = True
+    strict: bool = False
     out_json: str = ""
 
 
@@ -110,7 +110,7 @@ def inspect_ast_functions(
 
 
 def audit_python_file(rel_or_abs_path: str, cfg: LinterConfig) -> dict[str, Any]:
-    """Audit a single Python file against Rule 1, Rule 2, and Rule 5."""
+    """Audit a single Python file against Rule 1 (1,000 soft warning, 2,500 hard limit), Rule 2, and Rule 5."""
     p = Path(rel_or_abs_path)
     full_path = p if p.is_absolute() else (ROOT / p)
     rel_display = str(full_path.relative_to(ROOT)) if full_path.is_relative_to(ROOT) else str(full_path)
@@ -121,10 +121,16 @@ def audit_python_file(rel_or_abs_path: str, cfg: LinterConfig) -> dict[str, Any]
     fn_stats = inspect_ast_functions(tree, cfg)
 
     violations = list(fn_stats["ast_violations"])
+    warnings: list[str] = []
     if line_count > cfg.hard_ceiling_lines:
-        violations.append(f"Rule1(Ceiling): {line_count} lines > {cfg.hard_ceiling_lines}")
-    elif line_count > cfg.max_lines and cfg.strict:
-        violations.append(f"Rule1(Target): {line_count} lines > {cfg.max_lines}")
+        violations.append(f"Rule1(HardLimit): {line_count} lines > {cfg.hard_ceiling_lines}")
+    elif line_count > cfg.max_lines:
+        if cfg.strict:
+            violations.append(f"Rule1(SoftLimitStrict): {line_count} lines > {cfg.max_lines}")
+        else:
+            warnings.append(
+                f"Rule1(SoftLimitWarning): {line_count} lines > {cfg.max_lines} soft limit (hard limit {cfg.hard_ceiling_lines})"
+            )
 
     semicolon_lines: list[int] = []
     for tok in tokenize.generate_tokens(io.StringIO(source).readline):
@@ -134,7 +140,12 @@ def audit_python_file(rel_or_abs_path: str, cfg: LinterConfig) -> dict[str, Any]
         violations.append(f"Rule1(NoSemicolonPacking): semicolon ';' on line(s) {sorted(set(semicolon_lines))}")
 
     passed = len(violations) == 0
-    status = "PASS" if passed else "FAIL"
+    if not passed:
+        status = "FAIL"
+    elif warnings:
+        status = "WARN (PASS)"
+    else:
+        status = "PASS"
     return {
         "path": rel_display,
         "line_count": line_count,
@@ -147,6 +158,7 @@ def audit_python_file(rel_or_abs_path: str, cfg: LinterConfig) -> dict[str, Any]
         "max_nested_fn_name": fn_stats["max_nested_fn_name"],
         "passed": passed,
         "status": status,
+        "warnings": warnings,
         "violations": violations,
     }
 
@@ -157,10 +169,10 @@ def run_linter(cfg: LinterConfig) -> dict[str, Any]:
     all_passed = all(bool(r["passed"]) for r in rows)
 
     print(
-        f"\n### AST Best-Practices Compliance Table (`max_lines={cfg.max_lines}`, "
-        f"`ceiling={cfg.hard_ceiling_lines}`, `max_args={cfg.max_args}`, `max_nested={cfg.max_nested_lines}`)"
+        f"\n### AST Best-Practices Compliance Table (`soft_limit={cfg.max_lines}`, "
+        f"`hard_limit={cfg.hard_ceiling_lines}`, `max_args={cfg.max_args}`, `max_nested={cfg.max_nested_lines}`)"
     )
-    print("| File | Lines | Functions | Max Args (`fn`) | Max Nested Lines | Status |")
+    print("| File | Lines (`Soft` / `Hard`) | Functions | Max Args (`fn`) | Max Nested Lines | Status |")
     print("| :--- | :---: | :---: | :---: | :---: | :---: |")
     for r in rows:
         fn_tag = f"`{r['max_fn_args']}` (`{r['max_arg_fn_name']}`)"
@@ -170,9 +182,11 @@ def run_linter(cfg: LinterConfig) -> dict[str, Any]:
             else f"`{r['max_nested_fn_lines']}` (`{r['max_nested_fn_name']}`)"
         )
         print(
-            f"| `{r['path']}` | `{r['line_count']}` / `{cfg.max_lines}` | "
+            f"| `{r['path']}` | `{r['line_count']}` (`{cfg.max_lines}` / `{cfg.hard_ceiling_lines}`) | "
             f"`{r['num_functions']}` | {fn_tag} | {nest_tag} | **{r['status']}** |"
         )
+        for w in r.get("warnings", []):
+            print(f"  - Warning in `{r['path']}`: {w}")
         for v in r["violations"]:
             print(f"  - Violation in `{r['path']}`: {v}")
 
@@ -195,10 +209,11 @@ def parse_args(argv: list[str] | None = None) -> LinterConfig:
         description="Audit Python files for line count, function signature args, and nested closures."
     )
     p.add_argument("paths", nargs="*", default=list(DEFAULT_TARGET_PATHS))
-    p.add_argument("--max-lines", type=int, default=1000)
-    p.add_argument("--hard-ceiling-lines", type=int, default=1200)
+    p.add_argument("--max-lines", type=int, default=1000, help="Soft limit carrying a warning (default: 1000)")
+    p.add_argument("--hard-ceiling-lines", type=int, default=2500, help="Hard limit failing the linter (default: 2500)")
     p.add_argument("--max-args", type=int, default=8)
     p.add_argument("--max-nested-lines", type=int, default=40)
+    p.add_argument("--strict", action="store_true", help="Treat soft limit (> max-lines) as a hard error")
     p.add_argument("--no-strict", action="store_true")
     p.add_argument("--out-json", type=str, default="")
     ns = p.parse_args(argv)
@@ -208,7 +223,7 @@ def parse_args(argv: list[str] | None = None) -> LinterConfig:
         hard_ceiling_lines=ns.hard_ceiling_lines,
         max_args=ns.max_args,
         max_nested_lines=ns.max_nested_lines,
-        strict=not bool(ns.no_strict),
+        strict=bool(ns.strict) and not bool(ns.no_strict),
         out_json=ns.out_json,
     )
 

@@ -167,7 +167,8 @@ def classify_run_tier(
     wave_id: str = "",
     model_card: dict[str, Any] | None = None,
 ) -> str:
-    """Classify a run into `'main_benchmark'` or `'micro_verification'`."""
+    """Classify a run into `'main_benchmark'`, `'fineweb_edu_local'`, or `'micro_verification'`."""
+    entry_dict: dict[str, Any] = {}
     if isinstance(target_tokens_M, dict):
         entry_dict = target_tokens_M
         if not wave_id:
@@ -177,24 +178,30 @@ def classify_run_tier(
         tok_m = float(entry_dict.get("target_tokens_M") or 0.0)
     else:
         tok_m = float(target_tokens_M or 0.0)
-    mc_tier = str((model_card or {}).get("run_tier") or "").strip()
+
+    mc_dict = model_card if isinstance(model_card, dict) else {}
+    mc_tier = str(mc_dict.get("run_tier") or entry_dict.get("run_tier") or "").strip()
+    task_domain = str(mc_dict.get("task_domain") or entry_dict.get("task_domain") or "").strip()
+    rk_low = str(run_key or "").strip().lower()
+    wid_up = str(wave_id or mc_dict.get("wave_id") or "").strip().upper()
+
+    if task_domain == "vision_ablation" or any(k in rk_low for k in ("cifar100", "1000class", "imagenet1k")):
+        return "micro_verification"
+    if rk_low.startswith(("verify", "micro_", "plan0", "h1_", "h2_", "h3_")) or wid_up in ("MICRO", "VERIFY"):
+        return "micro_verification"
+    if (
+        task_domain == "fineweb_edu_local"
+        or mc_tier == "fineweb_edu_local"
+        or rk_low.startswith(tuple(f"w{n}_" for n in range(18, 30)))
+        or wid_up in {f"W{n}" for n in range(18, 30)}
+    ):
+        return "fineweb_edu_local"
     if mc_tier == "micro_verification":
         return "micro_verification"
-    rk_low = str(run_key or "").strip().lower()
-    wid_up = str(wave_id or "").strip().upper()
     if rk_low.startswith("w14_local_") or wid_up == "W14":
         return "main_benchmark"
-    if (
-        mc_tier == "main_benchmark"
-        and not rk_low.startswith(("verify", "micro_", "plan0", "h1_", "h2_", "h3_"))
-        and wid_up not in ("MICRO", "VERIFY")
-        and tok_m >= 50.0
-    ):
+    if mc_tier == "main_benchmark" and tok_m >= 50.0:
         return "main_benchmark"
-    if rk_low.startswith(("verify", "micro_", "plan0", "h1_", "h2_", "h3_")):
-        return "micro_verification"
-    if wid_up in ("MICRO", "VERIFY"):
-        return "micro_verification"
     if 0.0 < tok_m < 50.0:
         return "micro_verification"
     return "main_benchmark"
@@ -215,14 +222,11 @@ def compute_family_pareto_and_obsolete(
 ) -> list[dict[str, Any]]:
     """Compute per-family 2D `(wall_min, best_val_ce)` Pareto frontiers and wave-superseded obsolete flags.
 
-    1. Global Family 2D Pareto Frontier (`pareto_frontier = True`):
-       Across all completed `main_benchmark` runs in `arch_family`, `A["pareto_frontier"] = True` iff
-       no completed run `C != A` in the same family has `best_val_ce(C) <= best_val_ce(A)` and
-       `wall_min(C) <= wall_min(A)` with at least one strict inequality.
-    2. Wave-Superseded Automatic Obsolete Marking (`WaveSuperseded(A)`):
-       A completed `main_benchmark` run `A` is auto-marked `obsolete = True` iff there exists a completed
-       run `B` in the same `arch_family` with `wave_num(B) > wave_num(A)`, `best_val_ce(B) < best_val_ce(A)`,
-       and `wall_min(B) <= wall_min(A)`, unless overridden in `explicit_overrides`.
+    - For `main_benchmark`: global 2D Pareto frontier per `arch_family` + automatic wave-superseded obsolete marking.
+    - For `fineweb_edu_local`: independent 2D Pareto frontiers bucketed by token horizon (`<= 10.0M` vs
+      `10.0M..50.0M` vs `> 50.0M`) and wave family so `W28` (`7.37M`), `W25` (`29.49M`), `W27` (`29.49M`),
+      and `W26` (`44.24M`) are marked `pareto_frontier = True` within their horizon bucket and never falsely
+      marked obsolete.
     """
     exp_set = set(explicit_overrides or set())
     def_reasons = dict(default_obsolete_reasons or {})
@@ -230,25 +234,31 @@ def compute_family_pareto_and_obsolete(
 
     out: list[dict[str, Any]] = [dict(r) for r in catalog]
 
-    # Partition eligible completed main_benchmark runs by arch_family
     completed_by_family: dict[str, list[dict[str, Any]]] = {}
+    edu_buckets: dict[str, list[dict[str, Any]]] = {}
     for r in out:
         rkey = str(r.get("key") or r.get("run_key") or "")
-        tier = str(
-            r.get("run_tier")
-            or classify_run_tier(
-                rkey,
-                float(r.get("target_tokens_M") or 900.0),
-                str(r.get("wave_id") or ""),
-                r.get("model_card"),
-            )
+        tier = classify_run_tier(
+            rkey,
+            r,
+            str(r.get("wave_id") or ""),
+            r.get("model_card"),
         )
         r["run_tier"] = tier
-        if tier == "main_benchmark" and _is_eligible_completed_run(r):
-            fam = str(r.get("arch_family") or "quantum_born")
-            tok_m = float(r.get("target_tokens_M") or 900.0)
+        if not _is_eligible_completed_run(r):
+            continue
+        fam = str(r.get("arch_family") or "quantum_born")
+        tok_m = float(r.get("target_tokens_M") or r.get("live_tokens_M") or 900.0)
+        if tier == "main_benchmark":
             fam_bucket = f"{fam}_local" if (rkey.lower().startswith("w14_local_") or (0.0 < tok_m < 50.0)) else fam
             completed_by_family.setdefault(fam_bucket, []).append(r)
+        elif tier == "fineweb_edu_local":
+            h_bucket = "le_10m" if tok_m <= 10.0 else ("10m_to_50m" if tok_m <= 50.0 else "gt_50m")
+            edu_buckets.setdefault(f"edu_{fam}_{h_bucket}", []).append(r)
+            wid = str(r.get("wave_id") or "")
+            wnum = float(r.get("wave_num") or 0.0)
+            if wnum >= 25.0:
+                edu_buckets.setdefault(f"edu_{fam}_{wid}_{h_bucket}", []).append(r)
 
     pareto_keys: set[str] = set()
     dominator_by_key: dict[str, dict[str, Any]] = {}
@@ -260,7 +270,6 @@ def compute_family_pareto_and_obsolete(
             a_wall = float(a["wall_min"])
             a_wnum = float(a.get("wave_num") or 0.0)
 
-            # 1. Check Global 2D Pareto Frontier across all completed runs in family
             is_dominated_globally = False
             for c in fam_runs:
                 c_key = str(c.get("key") or c.get("run_key") or "")
@@ -274,7 +283,6 @@ def compute_family_pareto_and_obsolete(
             if not is_dominated_globally:
                 pareto_keys.add(a_key)
 
-            # 2. Check Wave-Superseded domination (strictly newer wave: wave_num(B) > wave_num(A))
             dominators: list[dict[str, Any]] = []
             for b in fam_runs:
                 b_key = str(b.get("key") or b.get("run_key") or "")
@@ -296,6 +304,24 @@ def compute_family_pareto_and_obsolete(
                 )
                 dominator_by_key[a_key] = b_star
 
+    for _, bucket_runs in edu_buckets.items():
+        for a in bucket_runs:
+            a_key = str(a.get("key") or a.get("run_key") or "")
+            a_ce = float(a["best_val_ce"])
+            a_wall = float(a["wall_min"])
+            is_dom = False
+            for c in bucket_runs:
+                c_key = str(c.get("key") or c.get("run_key") or "")
+                if c_key == a_key:
+                    continue
+                c_ce = float(c["best_val_ce"])
+                c_wall = float(c["wall_min"])
+                if c_ce <= a_ce and c_wall <= a_wall and (c_ce < a_ce or c_wall < a_wall):
+                    is_dom = True
+                    break
+            if not is_dom:
+                pareto_keys.add(a_key)
+
     for r in out:
         rkey = str(r.get("key") or r.get("run_key") or "")
         tier = str(r.get("run_tier") or "main_benchmark")
@@ -307,17 +333,20 @@ def compute_family_pareto_and_obsolete(
         has_explicit = (rkey in exp_set) or bool(r.get("explicit_user_override"))
         r["explicit_user_override"] = bool(has_explicit)
 
-        if tier == "micro_verification":
+        if tier in ("micro_verification", "fineweb_edu_local"):
             if has_explicit:
                 is_obs = bool(r.get("obsolete", False))
                 obs_reason = str(r.get("obsolete_reason") or "") if is_obs else ""
                 obs_at = str(r.get("obsolete_at") or (now_utc if is_obs else "")) if is_obs else ""
+            elif run_state == "OOM_CRASH":
+                is_obs = True
+                obs_reason = str(r.get("obsolete_reason") or "OOM crash")
+                obs_at = str(r.get("obsolete_at") or now_utc)
             else:
                 is_obs = False
                 obs_reason = ""
                 obs_at = ""
         else:
-            # 4-Level Precedence Order for main_benchmark runs
             if has_explicit:
                 is_obs = bool(r.get("obsolete", False))
                 obs_reason = str(r.get("obsolete_reason") or ("Marked obsolete from dashboard" if is_obs else "")) if is_obs else ""
@@ -1064,7 +1093,7 @@ class BenchmarkSQLiteDB:
             return self.load_snapshot_payload()
 
     def load_snapshot_payload(self) -> dict[str, Any]:
-        """Materialize `runs_catalog`, `micro_runs_catalog`, `colab_sessions`, `session_queue`, and `db_stats` from SQLite."""
+        """Materialize `runs_catalog`, `fineweb_edu_catalog`, `micro_runs_catalog`, `colab_sessions`, `session_queue`, and `db_stats`."""
         with self._lock:
             cur = self._conn.cursor()
             run_rows = cur.execute("SELECT * FROM runs").fetchall()
@@ -1098,8 +1127,7 @@ class BenchmarkSQLiteDB:
                     }
                 )
 
-            main_catalog: list[dict[str, Any]] = []
-            micro_catalog: list[dict[str, Any]] = []
+            all_entries: list[dict[str, Any]] = []
             for rrow in run_rows:
                 rk = str(rrow["run_key"])
                 try:
@@ -1114,7 +1142,6 @@ class BenchmarkSQLiteDB:
                 entry["wave_id"] = str(rrow["wave_id"])
                 entry["wave_num"] = float(rrow["wave_num"])
                 entry["arch_family"] = str(rrow["arch_family"])
-                entry["run_tier"] = str(rrow["run_tier"])
                 entry["status"] = str(rrow["status"])
                 entry["run_state"] = str(rrow["status"])
                 entry["best_val_ce"] = float(rrow["best_val_ce"]) if rrow["best_val_ce"] is not None else None
@@ -1126,8 +1153,36 @@ class BenchmarkSQLiteDB:
                 entry["obsolete_at"] = str(rrow["obsolete_at"] or "")
                 entry["explicit_user_override"] = bool(rrow["explicit_user_override"])
                 entry["default_visible"] = bool(rrow["default_visible"])
+                entry["run_tier"] = classify_run_tier(rk, entry, entry["wave_id"], mc)
+
+                params_m = float(entry.get("params_M") or rrow["params_M"] or 10.4)
+                tot_steps = max(1, int(entry.get("total_steps") or rrow["total_steps"] or 900))
+                live_tok_m = float(entry.get("live_tokens_M") or rrow["live_tokens_M"] or 0.0)
+                if entry.get("compute_tflops") is None:
+                    entry["compute_tflops"] = round(6.0 * params_m * live_tok_m, 2)
+
+                existing_evals = entry.get("evals") if isinstance(entry.get("evals"), list) else []
                 if rk in evals_by_run:
-                    entry["evals"] = evals_by_run[rk]
+                    merged_evals: list[dict[str, Any]] = []
+                    for idx, db_ev in enumerate(evals_by_run[rk]):
+                        base_ev = dict(existing_evals[idx]) if idx < len(existing_evals) and isinstance(existing_evals[idx], dict) else {}
+                        base_ev.update(db_ev)
+                        ev_step = int(base_ev.get("step") or 0)
+                        ev_tok = float(base_ev.get("tokens_M") or 0.0)
+                        if not base_ev.get("compute_tflops") and ev_tok > 0.0:
+                            base_ev["compute_tflops"] = round(6.0 * params_m * ev_tok, 4)
+                        elif base_ev.get("compute_tflops") is None:
+                            base_ev["compute_tflops"] = 0.0
+                        if not base_ev.get("tau_progress") and ev_step > 0:
+                            base_ev["tau_progress"] = round(ev_step / tot_steps, 4)
+                        elif base_ev.get("tau_progress") is None:
+                            base_ev["tau_progress"] = 0.0
+                        if base_ev.get("sharp_eff_rank") is None and base_ev.get("seed_eff_rank") is not None:
+                            base_ev["sharp_eff_rank"] = base_ev["seed_eff_rank"]
+                        if base_ev.get("kraus_stiefel_err") is None:
+                            base_ev["kraus_stiefel_err"] = float(base_ev.get("iso_err") or 0.0)
+                        merged_evals.append(base_ev)
+                    entry["evals"] = merged_evals
                 if rk in steps_by_run:
                     entry["steps"] = steps_by_run[rk]
                 if mc:
@@ -1137,12 +1192,31 @@ class BenchmarkSQLiteDB:
                     mc["obsolete_reason"] = entry["obsolete_reason"]
                     mc["obsolete_at"] = entry["obsolete_at"]
                     entry["model_card"] = mc
-                if entry["run_tier"] == "micro_verification":
+                all_entries.append(entry)
+
+            edu_has_pareto = any(e.get("pareto_frontier") for e in all_entries if e.get("run_tier") == "fineweb_edu_local")
+            if not edu_has_pareto and any(e.get("run_tier") == "fineweb_edu_local" for e in all_entries):
+                all_entries = compute_family_pareto_and_obsolete(all_entries)
+
+            main_catalog: list[dict[str, Any]] = []
+            fineweb_edu_catalog: list[dict[str, Any]] = []
+            micro_catalog: list[dict[str, Any]] = []
+            for entry in all_entries:
+                if entry["run_tier"] == "fineweb_edu_local":
+                    fineweb_edu_catalog.append(entry)
+                elif entry["run_tier"] == "micro_verification":
                     micro_catalog.append(entry)
                 else:
                     main_catalog.append(entry)
 
             main_catalog.sort(
+                key=lambda r: (
+                    bool(r.get("obsolete", False)),
+                    r.get("best_val_ce") is None,
+                    float(r["best_val_ce"]) if r.get("best_val_ce") is not None else 999.0,
+                )
+            )
+            fineweb_edu_catalog.sort(
                 key=lambda r: (
                     bool(r.get("obsolete", False)),
                     r.get("best_val_ce") is None,
@@ -1178,7 +1252,6 @@ class BenchmarkSQLiteDB:
                 sobj["run_state"] = str(crow["run_state"])
                 colab_sessions.append(sobj)
 
-            # Maintain canonical 5-session display order first
             order_map = {s: i for i, s in enumerate(["gpu_g4_w6_1", "gpu_g4_w6_2", "gpu_g4_w6_3", "gpu_a100_w6_1", "gpu_a100_w6_2"])}
             colab_sessions.sort(key=lambda s: (order_map.get(str(s.get("session")), 99), str(s.get("session"))))
 
@@ -1209,22 +1282,27 @@ class BenchmarkSQLiteDB:
             pareto_quantum = [
                 r["key"] for r in main_catalog if r.get("pareto_frontier") and r.get("arch_family") == "quantum_born"
             ]
+            pareto_fineweb_edu = [r["key"] for r in fineweb_edu_catalog if r.get("pareto_frontier")]
             queued_cnt = sum(1 for q in session_queue if q.get("status") == "QUEUED")
 
             db_stats = {
                 "db_path": str(self.db_path),
                 "main_runs_count": len(main_catalog),
+                "fineweb_edu_runs_count": len(fineweb_edu_catalog),
                 "micro_runs_count": len(micro_catalog),
                 "pareto_classical_count": len(pareto_classical),
                 "pareto_quantum_count": len(pareto_quantum),
+                "pareto_fineweb_edu_count": len(pareto_fineweb_edu),
                 "pareto_classical_keys": pareto_classical,
                 "pareto_quantum_keys": pareto_quantum,
+                "pareto_fineweb_edu_keys": pareto_fineweb_edu,
                 "queued_jobs_count": queued_cnt,
                 "total_queue_rows": len(session_queue),
             }
 
             return {
                 "runs_catalog": main_catalog,
+                "fineweb_edu_catalog": fineweb_edu_catalog,
                 "micro_runs_catalog": micro_catalog,
                 "colab_sessions": colab_sessions,
                 "session_queue": session_queue,
@@ -1232,6 +1310,10 @@ class BenchmarkSQLiteDB:
                 "colab_account": colab_account,
                 "db_stats": db_stats,
             }
+
+    def get_snapshot_payload(self) -> dict[str, Any]:
+        """Alias for `load_snapshot_payload()`."""
+        return self.load_snapshot_payload()
 
 
 def _make_micro_entry(

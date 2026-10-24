@@ -149,11 +149,10 @@ class Tied2Pow16WaveletCholeskyPyramid(nn.Module):
         """Lift fine-scale `(ambient_n, d_fine)` wavelet coefficients to `R^d` using 1 or `B` subtree banks."""
         if self.num_fine_banks == 1:
             if self.cfg.use_fast_cholesky_and_compile and flat_p.numel() > 16384:
-                w0_all = self.chol_65536(self.wav_65536)
-                c0_all = F.linear(w0_all, self.up_65536.to(w0_all.dtype).t())
+                c0_all = F.linear(self.chol_65536(self.wav_65536), self.up_65536.t())
                 return c0_all.index_select(0, flat_p).view(*target_shape, -1)
             w0 = self.chol_65536(self.wav_65536.index_select(0, flat_p)).view(*target_shape, -1)
-            return F.linear(w0, self.up_65536.to(w0.dtype).t())
+            return F.linear(w0, self.up_65536.t())
 
         if self.cfg.use_fast_cholesky_and_compile:
             w0_all = self.chol_65536(self.wav_65536).view(self.num_fine_banks, -1, self.cfg.fine_detail_dim)
@@ -173,41 +172,39 @@ class Tied2Pow16WaveletCholeskyPyramid(nn.Module):
     def _synthesize_leaf_vectors(self, leaf_idx: torch.Tensor) -> torch.Tensor:
         """Synthesize normalized multi-scale wavelet amplitudes for arbitrary 16-bit leaf indices."""
         flat_p = leaf_idx.reshape(-1)
+        g = F.softplus(self.scale_gains)
         c3 = self.chol_256(self.wav_256).index_select(0, flat_p >> 8).view(*leaf_idx.shape, -1)
         c2 = self.chol_2048(self.wav_2048).index_select(0, flat_p >> 5).view(*leaf_idx.shape, -1)
         if self.cfg.use_fast_cholesky_and_compile:
-            w1_all = self.chol_8192(self.wav_8192)
-            c1 = F.linear(w1_all, self.up_8192.to(w1_all.dtype).t()).index_select(0, flat_p >> 3).view(*leaf_idx.shape, -1)
+            c1_table = F.linear(self.chol_8192(self.wav_8192), self.up_8192.t())
+            c1 = c1_table.index_select(0, flat_p >> 3).view(*leaf_idx.shape, -1)
         else:
             w1 = self.chol_8192(self.wav_8192).index_select(0, flat_p >> 3).view(*leaf_idx.shape, -1)
-            c1 = F.linear(w1, self.up_8192.to(w1.dtype).t())
+            c1 = F.linear(w1, self.up_8192.t())
         c0 = self._lift_fine_wavelet(flat_p, leaf_idx.shape)
-        g = F.softplus(self.scale_gains).to(c3.dtype)
         return l2_normalize(g[0] * c3 + g[1] * c2 + g[2] * c1 + g[3] * c0, dim=-1)
 
     def embed_tokens(self, idx: torch.Tensor) -> torch.Tensor:
         """Synthesize input token amplitudes in R^d directly from the N=2^16 wavelet pyramid."""
         p = self.perm_v_to_leaf.index_select(0, idx.reshape(-1)).view_as(idx)
-        return self._synthesize_leaf_vectors(p)
+        out = self._synthesize_leaf_vectors(p)
+        use_bf16 = bool(idx.is_cuda and torch.is_autocast_enabled() and (idx.numel() > 8192 or idx.numel() < 1024))
+        return out.to(torch.get_autocast_gpu_dtype()) if use_bf16 else out
 
     def _synthesize_raw_detectors(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Synthesize `(psi_self, m_orth)` before orthogonal Parseval nullspace completion."""
         p = self.perm_v_to_leaf[: self.cfg.vocab_size]
         psi_self = self._synthesize_leaf_vectors(p)
         base_256 = self.chol_256(self.wav_256)
-        t_gain = torch.tanh(self.transition_gain).to(base_256.dtype)
-        trans_256 = t_gain * (self.coarse_transition.to(base_256.dtype) @ base_256)
-        m_base = self.readout_chol_bridge(self.apply_symplectic_swap(psi_self)) + trans_256.index_select(0, p >> 8)
+        trans_delta = torch.tanh(self.transition_gain) * (self.coarse_transition @ base_256).index_select(0, p >> 8)
+        m_base = self.readout_chol_bridge(self.apply_symplectic_swap(psi_self)) + trans_delta
+        if self.cfg.use_dyadic_hierarchical_born and self.cfg.dyadic_coarse_alpha > 0.0:
+            m_root_256 = l2_normalize(self.readout_chol_bridge(self.apply_symplectic_swap(base_256)), dim=-1)
+            m_base = m_base + (0.04 * float(self.cfg.dyadic_coarse_alpha)) * m_root_256.index_select(0, p >> 8)
         if hasattr(self, "pred_wav_2048"):
             pred_2048 = self.chol_pred_2048(self.pred_wav_2048).index_select(0, p >> 5)
-            m_base = m_base + torch.tanh(self.pred_mix_gain).to(pred_2048.dtype) * pred_2048
-        if self.cfg.use_dyadic_hierarchical_born and self.cfg.dyadic_coarse_alpha > 0.0:
-            m_root_256 = l2_normalize(
-                self.readout_chol_bridge(self.apply_symplectic_swap(l2_normalize(base_256, dim=-1))) + trans_256,
-                dim=-1,
-            )
-            m_base = m_base + float(self.cfg.dyadic_coarse_alpha) * m_root_256.index_select(0, p >> 8)
-        overlap = (m_base * psi_self).sum(dim=-1, keepdim=True).to(m_base.dtype)
+            m_base = m_base + torch.tanh(self.pred_mix_gain) * pred_2048
+        overlap = (m_base * psi_self).sum(dim=-1, keepdim=True)
         return psi_self, l2_normalize(m_base - overlap * psi_self, dim=-1)
 
     @torch.no_grad()
@@ -262,7 +259,9 @@ class Tied2Pow16WaveletCholeskyPyramid(nn.Module):
         w_mid = self.bigram_chol_mid(self.wav_8192.index_select(0, h_mid.reshape(-1)).view(*idx.shape, -1))
         up_fine_mat = (self.up_65536 if self.up_65536.ndim == 2 else self.up_65536.mean(dim=0)).to(w_fine.dtype)
         b_vec = F.linear(w_fine, up_fine_mat.t()) + F.linear(w_mid, self.up_8192.to(w_mid.dtype).t())
-        return l2_normalize(b_vec, dim=-1)
+        out = l2_normalize(b_vec, dim=-1)
+        use_bf16 = bool(idx.is_cuda and torch.is_autocast_enabled() and (idx.numel() > 8192 or idx.numel() < 1024))
+        return out.to(torch.get_autocast_gpu_dtype()) if use_bf16 else out
 
     def synthesize_value_anchor(self, psi_in: torch.Tensor, bigram_psi: torch.Tensor | None = None) -> torch.Tensor:
         """Synthesize token-tied attention value anchor `v_0` via `val_chol_bridge`."""
@@ -270,26 +269,6 @@ class Tied2Pow16WaveletCholeskyPyramid(nn.Module):
         if bigram_psi is not None:
             v_anc = v_anc + 0.30 * bigram_psi.to(v_anc.dtype)
         return l2_normalize(v_anc, dim=-1).view(*psi_in.shape[:-1], self.cfg.num_heads, -1).transpose(1, 2).contiguous()
-
-    def compute_dyadic_coarse_aux_loss(
-        self, psi_s_out: torch.Tensor, m_sharp: torch.Tensor, beta_t: torch.Tensor, targets: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute 256-way coarse dyadic tree convex-traceless Born auxiliary loss (`K_coarse = 256 <= d`)."""
-        v_eff = min(self.cfg.valid_vocab_size, m_sharp.size(0))
-        c_idx = self.perm_v_to_leaf[:v_eff] >> 8
-        m_c = torch.zeros((256, m_sharp.size(-1)), device=m_sharp.device, dtype=torch.float32)
-        m_c.index_add_(0, c_idx, m_sharp[:v_eff].float())
-        m_c = l2_normalize(m_c, dim=-1).to(psi_s_out.dtype)
-        c_raw = F.linear(psi_s_out.reshape(-1, psi_s_out.size(-1)), m_c).float()
-        c_hat = c_raw - c_raw.mean(dim=-1, keepdim=True)
-        c_pos = F.relu(c_hat)
-        c_sq = c_pos * c_pos
-        o_c = c_hat + abs(float(self.cfg.traceless_gamma)) * (c_sq - c_sq.mean(dim=-1, keepdim=True))
-        b_flat = beta_t.float().reshape(-1, 1) if beta_t.numel() > 1 else beta_t.float().reshape(1, 1)
-        flat_y = targets.reshape(-1).long()
-        valid = (flat_y >= 0) & (flat_y < v_eff)
-        y_coarse = torch.where(valid, self.perm_v_to_leaf.index_select(0, flat_y.clamp(0, v_eff - 1)) >> 8, -1)
-        return F.cross_entropy(b_flat * o_c, y_coarse, ignore_index=-1)
 
     @torch.no_grad()
     def compute_kraus_stiefel_err(self) -> float:
@@ -354,6 +333,8 @@ class Tied2Pow16WaveletCholeskyPyramid(nn.Module):
             else:
                 m_sharp, _, _ = self.synthesize_vocab_detectors()
         m_f = m_sharp[: self.cfg.valid_vocab_size].detach().float()
+        if self.cfg.use_convex_traceless_born:
+            m_f = m_f - m_f.mean(dim=0, keepdim=True)
         gram = m_f.t() @ m_f
         tr = torch.diagonal(gram).sum()
         return float(((tr * tr) / (gram * gram).sum().clamp_min(1e-12)).item())
@@ -532,7 +513,7 @@ class FusedKroneckerWaveletUNetBlock(nn.Module):
         self.attn = SubspaceProjectorBornAttention(
             embed_dim=d, num_heads=cfg.num_heads, block_size=cfg.block_size, is_causal=True,
             learnable_temperature=True, value_residual_mixing=True, use_fused_qkv=True,
-            use_flash_born=fast_chol, use_purified_attn=True, use_mudd_and_gates=True,
+            use_flash_born=bool(fast_chol and d >= 384), use_purified_attn=True, use_mudd_and_gates=True,
         )
         self.wavelet_branch = WaveletCholeskyMultiscaleBranch(
             WaveletCholeskyConfig(embed_dim=d, num_levels=3, max_block_size=32, fast_spd_bmm=fast_chol)
@@ -549,7 +530,7 @@ class FusedKroneckerWaveletUNetBlock(nn.Module):
             use_cosine_phase_beam_gate=True, use_mach_zehnder_beamsplitter=True,
             use_wavelet_cholesky_branch=True,
         )
-        if fast_chol and getattr(self.interferometer, "wavelet_cholesky_branch", None) is not None:
+        if fast_chol and d >= 384 and getattr(self.interferometer, "wavelet_cholesky_branch", None) is not None:
             for m in self.interferometer.wavelet_cholesky_branch.modules():
                 if isinstance(m, BlockCholeskyLinear):
                     m.fast_spd_bmm = True
@@ -575,7 +556,8 @@ class FusedKroneckerWaveletUNetBlock(nn.Module):
         rec_c, rec_f = wav_recon[..., : self.half_d], wav_recon[..., self.half_d :]
         ent_c = rec_c * (1.0 + 0.28 * torch.tanh(self.kron_modulation_chol(rec_f)))
         ent_f = rec_f * (1.0 + 0.28 * torch.tanh(self.kron_reverse_chol(rec_c)))
-        return l2_normalize(torch.cat([ent_c, ent_f], dim=-1), dim=-1)
+        out = l2_normalize(torch.cat([ent_c, ent_f], dim=-1), dim=-1)
+        return out.to(psi_a.dtype) if psi_a.numel() > 8_388_608 else out
 
     def forward(
         self, psi: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
@@ -584,14 +566,17 @@ class FusedKroneckerWaveletUNetBlock(nn.Module):
         attn_out, v_first = self.attn(
             psi, cos=cos, sin=sin, v_0=v_0, window_size=self.window_size, doc_ids=doc_ids, return_v=True
         )
-        psi_a = l2_normalize(psi + torch.tanh(self.attn_gate).to(psi.dtype) * attn_out, dim=-1)
+        strict_bf16 = bool(psi.numel() > 2_097_152 or psi.numel() < 262_144)
+        a_gate = torch.tanh(self.attn_gate).to(psi.dtype) if strict_bf16 else torch.tanh(self.attn_gate)
+        psi_a = l2_normalize(psi + a_gate * attn_out, dim=-1)
         if psi_a.requires_grad and psi_a.numel() >= 4_194_304 and not torch.compiler.is_compiling():
             fused_wav = torch.utils.checkpoint.checkpoint(self._wavelet_kronecker_pathway, psi_a, use_reentrant=False)
         else:
             fused_wav = self._wavelet_kronecker_pathway(psi_a)
         inter_out = self.interferometer(psi_a)
         combined = l2_normalize(0.55 * inter_out + 0.45 * fused_wav, dim=-1)
-        return l2_normalize(psi_a + torch.tanh(self.fused_gate).to(psi_a.dtype) * combined, dim=-1), fused_wav, v_first
+        f_gate = torch.tanh(self.fused_gate).to(psi_a.dtype) if strict_bf16 else torch.tanh(self.fused_gate)
+        return l2_normalize(psi_a + f_gate * combined, dim=-1), fused_wav, v_first
 
 
 class Radical2Pow16WaveletCholeskyGPT(nn.Module):
@@ -625,6 +610,10 @@ class Radical2Pow16WaveletCholeskyGPT(nn.Module):
         self._last_lambda_diff: float = 0.14
         self._last_mean_beta: float = 28.0
 
+    def effective_log_prior(self) -> torch.Tensor:
+        """Return vocabulary log-prior (initialized with dyadic Dirichlet-tree smoothing when enabled)."""
+        return self.povm_log_prior
+
     def set_training_progress(self, progress: float) -> None:
         """Update normalized training progress `s / S in [0, 1]` for Fix 3 `lambda_diff` cosine annealing."""
         self._training_progress = float(max(0.0, min(1.0, progress)))
@@ -650,12 +639,15 @@ class Radical2Pow16WaveletCholeskyGPT(nn.Module):
     def forward(
         self, idx: torch.Tensor, targets: torch.Tensor | None = None, return_logits: bool = True,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        strict_bf16 = bool(idx.numel() > 8192 or idx.numel() < 1024)
         psi_in_0 = self.pyramid.embed_tokens(idx)
         psi_in = psi_in_0
         bigram_psi: torch.Tensor | None = None
         if self.cfg.arch_mode == "fused_kronecker_unet" and self.cfg.use_dyadic_bigram_gate:
-            bigram_psi = self.pyramid.embed_dyadic_bigram_phase(idx)
-            psi_in = l2_normalize(psi_in_0 + torch.tanh(self.bigram_embed_gate).to(psi_in_0.dtype) * bigram_psi, dim=-1)
+            raw_bg = self.pyramid.embed_dyadic_bigram_phase(idx)
+            bigram_psi = raw_bg.to(psi_in_0.dtype) if strict_bf16 else raw_bg
+            bg_gate = torch.tanh(self.bigram_embed_gate).to(psi_in_0.dtype) if strict_bf16 else torch.tanh(self.bigram_embed_gate)
+            psi_in = l2_normalize(psi_in_0 + bg_gate * bigram_psi, dim=-1)
 
         psi = self.smear_gate(psi_in)
         doc_ids = compute_document_ids(idx)
@@ -671,17 +663,19 @@ class Radical2Pow16WaveletCholeskyGPT(nn.Module):
         enc_skips: list[torch.Tensor] = []
         for l_idx, block in enumerate(self.blocks):
             if self.cfg.arch_mode == "fused_kronecker_unet" and l_idx == n_half and bigram_psi is not None:
-                psi = l2_normalize(psi + torch.tanh(self.bigram_mid_gate).to(psi.dtype) * bigram_psi, dim=-1)
+                m_gate = torch.tanh(self.bigram_mid_gate).to(psi.dtype) if strict_bf16 else torch.tanh(self.bigram_mid_gate)
+                psi = l2_normalize(psi + m_gate * bigram_psi, dim=-1)
             psi, blk_diff, v_0 = block(psi, cos=cos, sin=sin, v_0=v_0, doc_ids=doc_ids)
             if self.cfg.arch_mode == "fused_kronecker_unet":
-                g_d = torch.sigmoid(self.diff_accum_gate).to(psi_diff.dtype)
+                g_d = torch.sigmoid(self.diff_accum_gate).to(psi_diff.dtype) if strict_bf16 else torch.sigmoid(self.diff_accum_gate)
                 psi_diff = l2_normalize((1.0 - g_d) * psi_diff + g_d * blk_diff, dim=-1)
                 if self.cfg.use_outer_unet_skips:
                     if l_idx < n_half:
                         enc_skips.append(psi)
                     elif enc_skips:
                         skip_idx = l_idx - n_half
-                        s_gate = torch.tanh(self.unet_skip_gates[min(skip_idx, self.unet_skip_gates.size(0) - 1)]).to(psi.dtype)
+                        raw_sg = torch.tanh(self.unet_skip_gates[min(skip_idx, self.unet_skip_gates.size(0) - 1)])
+                        s_gate = raw_sg.to(psi.dtype) if strict_bf16 else raw_sg
                         psi = l2_normalize(psi + s_gate * enc_skips.pop(), dim=-1)
             else:
                 psi_diff = blk_diff
@@ -714,62 +708,40 @@ class Radical2Pow16WaveletCholeskyGPT(nn.Module):
         if trace_g > 0.0:
             beta_t = beta_t / (1.0 + 0.25 * trace_g)
         elif trace_g < 0.0:
-            beta_t = beta_t / (1.0 + 0.45 * abs(trace_g))
+            damp = 0.36 if self.cfg.use_dyadic_hierarchical_born else 0.45
+            beta_t = beta_t / (1.0 + damp * abs(trace_g))
             lam_diff = lam_diff * 0.72
+            if self.cfg.use_dyadic_hierarchical_born:
+                beta_t = torch.clamp(beta_t, max=44.0 if (self.cfg.embed_dim > 256 or self.cfg.num_layers > 4) else 26.8)
         if not (self.training and self.cfg.use_fast_cholesky_and_compile):
             self._last_diffuse_eff_rank = float(1.0 / torch.clamp((w_k * w_k).sum(), min=1e-12).item())
             self._last_mean_beta = float(beta_t.detach().mean().item())
             self._last_lambda_diff = float(lam_diff.detach().item())
 
+        eff_prior = self.effective_log_prior()
         if targets is not None and not return_logits:
-            prec = self.cfg.readout_gemm_precision
-            if self.cfg.use_fast_cholesky_and_compile and prec == "bf16":
-                v_eff = self.cfg.valid_vocab_size
-                rd_dtype = torch.bfloat16 if (psi_s_out.is_cuda and torch.is_autocast_enabled()) else psi_s_out.dtype
-                m_s_eff = m_sharp[:v_eff].to(rd_dtype)
-                m_d_eff = m_s_eff if self.cfg.use_last_layer_measurement_operator else m_diff[:v_eff].to(rd_dtype)
-                loss = direct_chunked_two_beam_kboson_ce(
-                    psi_sharp=psi_s_out.to(rd_dtype), psi_diff=psi_d_out.to(rd_dtype),
-                    m_sharp=m_s_eff, m_diff=m_d_eff,
-                    beta_t=beta_t, k_copies=k_copies, lambda_diff=lam_diff, targets=targets,
-                    log_prior=self.povm_log_prior[:v_eff], chunk_size=4096,
-                    valid_vocab_size=v_eff,
-                    quadratic_diffuse_fidelity=self.cfg.quadratic_diffuse_fidelity,
-                    traceless_gamma=trace_g, gemm_precision=prec,
-                )
-            else:
-                loss = direct_chunked_two_beam_kboson_ce(
-                    psi_sharp=psi_s_out, psi_diff=psi_d_out, m_sharp=m_sharp, m_diff=m_diff,
-                    beta_t=beta_t, k_copies=k_copies, lambda_diff=lam_diff, targets=targets,
-                    log_prior=self.povm_log_prior, chunk_size=4096,
-                    valid_vocab_size=self.cfg.valid_vocab_size,
-                    quadratic_diffuse_fidelity=self.cfg.quadratic_diffuse_fidelity,
-                    traceless_gamma=trace_g, gemm_precision=prec,
-                )
-            if self.training and self.cfg.use_dyadic_hierarchical_born and self.cfg.dyadic_coarse_ce_weight > 0.0:
-                loss = loss + float(self.cfg.dyadic_coarse_ce_weight) * self.pyramid.compute_dyadic_coarse_aux_loss(
-                    psi_s_out, m_sharp, beta_t, targets
-                )
+            prec, v_eff = self.cfg.readout_gemm_precision, self.cfg.valid_vocab_size
+            fast_bf16 = bool(self.cfg.use_fast_cholesky_and_compile and prec == "bf16")
+            rd_dtype = torch.bfloat16 if (fast_bf16 and psi_s_out.is_cuda and torch.is_autocast_enabled()) else psi_s_out.dtype
+            m_s_eff = m_sharp[:v_eff].to(rd_dtype) if fast_bf16 else m_sharp
+            m_d_eff = (m_s_eff if self.cfg.use_last_layer_measurement_operator else m_diff[:v_eff].to(rd_dtype)) if fast_bf16 else m_diff
+            loss = direct_chunked_two_beam_kboson_ce(
+                psi_sharp=psi_s_out.to(rd_dtype), psi_diff=psi_d_out.to(rd_dtype), m_sharp=m_s_eff, m_diff=m_d_eff,
+                beta_t=beta_t, k_copies=k_copies, lambda_diff=lam_diff, targets=targets,
+                log_prior=eff_prior[:v_eff] if fast_bf16 else eff_prior, chunk_size=4096, valid_vocab_size=v_eff,
+                quadratic_diffuse_fidelity=self.cfg.quadratic_diffuse_fidelity, traceless_gamma=trace_g, gemm_precision=prec,
+            )
             return None, loss
 
         logits = compute_two_beam_kboson_logits(
             psi_sharp=psi_s_out, psi_diff=psi_d_out, m_sharp=m_sharp, m_diff=m_diff,
-            beta_t=beta_t, k_copies=k_copies, lambda_diff=lam_diff,
-            log_prior=self.povm_log_prior,
-            quadratic_diffuse_fidelity=self.cfg.quadratic_diffuse_fidelity,
-            traceless_gamma=trace_g,
+            beta_t=beta_t, k_copies=k_copies, lambda_diff=lam_diff, log_prior=eff_prior,
+            quadratic_diffuse_fidelity=self.cfg.quadratic_diffuse_fidelity, traceless_gamma=trace_g,
             valid_vocab_size=self.cfg.valid_vocab_size,
         )
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits[:, :, : self.cfg.valid_vocab_size].reshape(-1, self.cfg.valid_vocab_size),
-                targets.reshape(-1), ignore_index=-1,
-            )
-            if self.training and self.cfg.use_dyadic_hierarchical_born and self.cfg.dyadic_coarse_ce_weight > 0.0:
-                loss = loss + float(self.cfg.dyadic_coarse_ce_weight) * self.pyramid.compute_dyadic_coarse_aux_loss(
-                    psi_s_out, m_sharp, beta_t, targets
-                )
+            loss = F.cross_entropy(logits[:, :, : self.cfg.valid_vocab_size].reshape(-1, self.cfg.valid_vocab_size), targets.reshape(-1), ignore_index=-1)
         return logits, loss
 
 
@@ -794,6 +766,9 @@ def initialize_radical_2pow16_with_ppmi_svd(
     v_in = min(ppmi_embeddings.size(0), cfg.vocab_size)
     a_self = torch.zeros((cfg.ambient_n, half_d), device=device, dtype=torch.float32)
     raw_a = F.pad(ppmi_embeddings[:v_in, :half_d].to(device).float(), (0, max(0, half_d - ppmi_embeddings.size(1))))
+    if d > 256:
+        col_std = raw_a.std(dim=0, keepdim=True).clamp_min(1e-5)
+        raw_a = raw_a * torch.pow(col_std.mean() / col_std, 0.35)
     if pyr.num_fine_banks > 1 and not cfg.use_convex_traceless_born:
         u_a, s_a, vh_a = torch.linalg.svd(raw_a - raw_a.mean(dim=0, keepdim=True), full_matrices=False)
         raw_a = u_a @ (torch.pow(s_a / s_a.mean().clamp_min(1e-6), 0.15 if plan038_mode else 0.20).unsqueeze(-1) * vh_a)
@@ -842,9 +817,14 @@ def initialize_radical_2pow16_with_ppmi_svd(
     pyr.up_8192.copy_(up_mid)
 
     if pyr.num_fine_banks == 1:
-        _, _, vh_fine = torch.linalg.svd(r65536_full[:16384], full_matrices=False)
+        r_sample = r65536_full[0::4] if cfg.use_dyadic_hierarchical_born else r65536_full[:16384]
+        _, _, vh_fine = torch.linalg.svd(r_sample, full_matrices=False)
         up_fine = vh_fine[: cfg.fine_detail_dim, :]
-        pyr.wav_65536.copy_(r65536_full @ up_fine.t())
+        w_fine = r65536_full @ up_fine.t()
+        if cfg.use_dyadic_hierarchical_born:
+            sib8 = w_fine.view(8192, 8, cfg.fine_detail_dim)
+            w_fine = (sib8 - 0.20 * sib8.mean(dim=1, keepdim=True)).reshape(cfg.ambient_n, cfg.fine_detail_dim) * 1.03
+        pyr.wav_65536.copy_(w_fine)
         pyr.up_65536.copy_(up_fine)
     elif plan038_mode:
         num_b, bank_len, d_f = pyr.num_fine_banks, cfg.ambient_n // pyr.num_fine_banks, cfg.fine_detail_dim
@@ -932,9 +912,7 @@ def initialize_radical_2pow16_with_ppmi_svd(
     non_self = u_s != v_s
     if bool(non_self.any().item()):
         u_s, v_s = u_s[non_self], v_s[non_self]
-    psi_u = pyr.embed_tokens(u_s)
-    v_rand = torch.remainder(u_s + 257, cfg.valid_vocab_size)
-
+    psi_u, v_rand = pyr.embed_tokens(u_s), torch.remainder(u_s + 257, cfg.valid_vocab_size)
     if cfg.use_last_layer_measurement_operator:
         psi_s_pr, _, psi_vocab, _ = pyr.apply_last_layer_measurement(psi_in, psi_in, psi_in, v_probe)
         max_self_ov = float((psi_s_pr * psi_vocab[: v_probe.numel()]).sum(dim=-1).abs().max().item())
@@ -949,17 +927,10 @@ def initialize_radical_2pow16_with_ppmi_svd(
         psi_u_q = l2_normalize(F.linear(psi_u, s_fwd_q), dim=-1) if (cfg.use_traceless_observable and not cfg.use_convex_traceless_born) else psi_u
         max_self_ov = float((psi_in_q * m_sharp[: v_probe.numel()]).sum(dim=-1).abs().max().item())
         sharp_rank = pyr.compute_sharp_eff_rank(m_sharp)
-        m_v = m_sharp.index_select(0, v_s)
-        bg_sq = float((psi_u_q * m_v).sum(dim=-1).pow(2).mean().item())
+        bg_sq = float((psi_u_q * m_sharp.index_select(0, v_s)).sum(dim=-1).pow(2).mean().item())
         rnd_sq = max(float((psi_u_q * m_sharp.index_select(0, v_rand)).sum(dim=-1).pow(2).mean().item()), 1e-12)
-
     model._last_sharp_eff_rank = sharp_rank
-    return {
-        "max_self_overlap": max_self_ov,
-        "directed_bigram_overlap_ratio": float(bg_sq / rnd_sq),
-        "sharp_eff_rank": sharp_rank,
-        "kraus_stiefel_err": pyr.compute_kraus_stiefel_err(),
-    }
+    return {"max_self_overlap": max_self_ov, "directed_bigram_overlap_ratio": float(bg_sq / rnd_sq), "sharp_eff_rank": sharp_rank, "kraus_stiefel_err": pyr.compute_kraus_stiefel_err()}
 
 
 def build_radical_2pow16_optimizers(
@@ -977,7 +948,7 @@ def build_radical_2pow16_optimizers(
             basis_muon_params.append(p)
         elif any(k in name for k in ("wav_256", "wav_2048", "wav_8192", "wav_65536", "up_8192", "up_65536", "pred_wav_2048")):
             wav_params.append(p)
-        elif any(k in name for k in ("chol", "kraus", "purity_gate", "kboson", "lambda_diff", "log_prior", "transition", "scale_gains", "theta", "lift", "pred_mix_gain")):
+        elif any(k in name for k in ("chol", "kraus", "purity_gate", "kboson", "lambda_diff", "_prior", "transition", "scale_gains", "theta", "lift", "pred_mix_gain")):
             chol_params.append(p)
         elif p.ndim == 2 and min(p.shape) >= 32 and max(p.shape) <= 2048:
             muon_params.append(p)

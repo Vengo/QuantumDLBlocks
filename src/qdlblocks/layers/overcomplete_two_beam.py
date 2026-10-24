@@ -263,17 +263,12 @@ class OvercompleteTwoBeamInterference(nn.Module):
         psi: torch.Tensor,
         return_second_beam: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        work_dtype = (
-            torch.get_autocast_gpu_dtype()
-            if (psi.is_cuda and torch.is_autocast_enabled())
-            else psi.dtype
-        )
-        psi_w = psi.to(work_dtype)
+        work_dtype = psi.dtype
         u1 = l2_normalize(self.W_beam1, dim=-1, eps=self.eps).to(work_dtype)
         u2 = l2_normalize(self.W_beam2, dim=-1, eps=self.eps).to(work_dtype)
         scale = math.sqrt(float(self.embed_dim))
-        z1_raw = F.linear(psi_w, u1)
-        z2_raw = F.linear(psi_w, u2)
+        z1_raw = F.linear(psi, u1)
+        z2_raw = F.linear(psi, u2)
 
         if not return_second_beam:
             theta_bs = self.beamsplitter_theta if self.use_mach_zehnder_beamsplitter else None
@@ -281,8 +276,8 @@ class OvercompleteTwoBeamInterference(nn.Module):
             phi = self.phase_phi if self.use_cosine_phase_beam_gate else None
             gate_s = self.phase_gate_scale if self.use_cosine_phase_beam_gate else None
             if (
-                psi_w.requires_grad
-                and z1_raw.numel() >= 4_194_304
+                psi.requires_grad
+                and z1_raw.numel() > 16_777_216
                 and not torch.compiler.is_compiling()
             ):
                 interf = torch.utils.checkpoint.checkpoint(
@@ -305,7 +300,7 @@ class OvercompleteTwoBeamInterference(nn.Module):
             z1 = z1_raw * scale
             z2 = z2_raw * scale
             if self.use_mach_zehnder_beamsplitter and self.beamsplitter_theta is not None:
-                theta_bs = self.beamsplitter_theta.to(work_dtype)
+                theta_bs = self.beamsplitter_theta.to(z1.dtype)
                 cos_t = torch.cos(theta_bs)
                 sin_t = torch.sin(theta_bs)
                 z1, z2 = cos_t * z1 - sin_t * z2, sin_t * z1 + cos_t * z2
@@ -317,17 +312,17 @@ class OvercompleteTwoBeamInterference(nn.Module):
                 and self.phase_phi is not None
                 and self.phase_gate_scale is not None
             ):
-                delta_theta = self.phase_omega.to(work_dtype) * (z1 - z2) + self.phase_phi.to(work_dtype)
-                alpha_p = (0.50 * torch.tanh(self.phase_gate_scale)).to(work_dtype)
+                delta_theta = self.phase_omega.to(z1.dtype) * (z1 - z2) + self.phase_phi.to(z1.dtype)
+                alpha_p = (0.50 * torch.tanh(self.phase_gate_scale)).to(z1.dtype)
                 interf = interf * (1.0 + alpha_p * torch.cos(delta_theta))
                 b2 = b2 * (1.0 + alpha_p * torch.sin(delta_theta))
 
         out_1 = F.linear(interf, self.W_out.to(work_dtype))
         if self.use_wavelet_cholesky_branch and self.wavelet_cholesky_branch is not None:
-            wav_delta = self.wavelet_cholesky_branch(psi_w).to(work_dtype)
-            b_scale = (0.35 * torch.tanh(self.wavelet_cholesky_branch.branch_scale)).to(work_dtype)
+            wav_delta = self.wavelet_cholesky_branch(psi)
+            b_scale = (0.35 * torch.tanh(self.wavelet_cholesky_branch.branch_scale)).to(out_1.dtype)
             out_1 = out_1 + b_scale * wav_delta
-        normed_1 = self.post_norm(out_1).to(work_dtype)
+        normed_1 = self.post_norm(out_1.float()).to(work_dtype)
         if (
             self.use_stereographic_lift
             and self.stereo_pole_1 is not None

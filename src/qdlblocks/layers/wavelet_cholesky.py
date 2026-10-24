@@ -83,13 +83,11 @@ class BlockCholeskyLinear(nn.Module):
         if self.fast_spd_bmm:
             if x.is_cuda and torch.is_autocast_enabled():
                 work_dtype = torch.get_autocast_gpu_dtype()
-                out_dtype = work_dtype
             elif x.is_cuda and x.dtype in (torch.float32, torch.bfloat16):
                 work_dtype = torch.bfloat16
-                out_dtype = x.dtype
             else:
                 work_dtype = x.dtype
-                out_dtype = x.dtype
+            out_dtype = x.dtype
             c_mat = self.spd_matrix().to(work_dtype)
             if self.num_blocks == 1:
                 return torch.matmul(x.to(work_dtype), c_mat[0]).to(out_dtype)
@@ -173,15 +171,14 @@ class WaveletCholeskyMultiscaleBranch(nn.Module):
         self, psi: torch.Tensor
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Decompose `psi` across `num_levels` dyadic wavelet scales into `(coarse, details)`."""
-        w_dtype = self._work_dtype(psi)
-        approx = psi.to(w_dtype)
+        approx = psi.float()
         details: list[torch.Tensor] = []
         inv_sqrt2 = math.sqrt(0.5)
         for s in range(self.num_levels):
             x_e = approx[..., 0::2]
             x_o = approx[..., 1::2]
-            p_s = self.lift_predict[s].to(w_dtype)
-            u_s = self.lift_update[s].to(w_dtype)
+            p_s = self.lift_predict[s].float()
+            u_s = self.lift_update[s].float()
             r_o = x_o - p_s * x_e
             r_e = x_e + u_s * r_o
             approx = inv_sqrt2 * (r_e + r_o)
@@ -193,30 +190,27 @@ class WaveletCholeskyMultiscaleBranch(nn.Module):
         self, coarse: torch.Tensor, details: list[torch.Tensor]
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Apply scale-specific Cholesky operators `L_s @ L_s^T` and gated wavelet shrinkage."""
-        w_dtype = self._work_dtype(coarse)
-        g_c = (0.5 * torch.tanh(self.coarse_nonlin_gate.float())).to(w_dtype)
-        c_in = coarse.to(w_dtype) + g_c * F.silu(coarse.to(w_dtype))
-        coarse_out = self.coarse_cholesky(c_in)
+        g_c = 0.5 * torch.tanh(self.coarse_nonlin_gate.float())
+        c_f = coarse.float()
+        coarse_out = self.coarse_cholesky(c_f + g_c * F.silu(c_f))
 
         details_out: list[torch.Tensor] = []
         for s, det in enumerate(details):
-            g_s = (0.5 * torch.tanh(self.detail_nonlin_gate[s].float())).to(w_dtype)
-            d_t = det.to(w_dtype)
-            d_in = d_t + g_s * F.silu(d_t)
-            details_out.append(self.detail_cholesky[s](d_in))
+            g_s = 0.5 * torch.tanh(self.detail_nonlin_gate[s].float())
+            d_f = det.float()
+            details_out.append(self.detail_cholesky[s](d_f + g_s * F.silu(d_f)))
         return coarse_out, details_out
 
     def upsample_amplitudes(
         self, coarse: torch.Tensor, details: list[torch.Tensor]
     ) -> torch.Tensor:
         """Synthesize full-resolution amplitude in `R^d` via exact inverse lifting wavelet steps."""
-        w_dtype = self._work_dtype(coarse)
-        approx = coarse.to(w_dtype)
+        approx = coarse.float()
         inv_sqrt2 = math.sqrt(0.5)
         for s in range(self.num_levels - 1, -1, -1):
-            det = details[s].to(w_dtype)
-            p_s = self.lift_predict[s].to(w_dtype)
-            u_s = self.lift_update[s].to(w_dtype)
+            det = details[s].float()
+            p_s = self.lift_predict[s].float()
+            u_s = self.lift_update[s].float()
             r_e = inv_sqrt2 * (approx - det)
             r_o = inv_sqrt2 * (approx + det)
             x_e = r_e - u_s * r_o
@@ -229,12 +223,12 @@ class WaveletCholeskyMultiscaleBranch(nn.Module):
         coarse, details = self.downsample_amplitudes(psi)
         coarse_t, details_t = self.apply_cholesky_scale_operators(coarse, details)
         recon = self.upsample_amplitudes(coarse_t, details_t)
-        return recon.to(self._work_dtype(psi))
+        return recon.to(psi.dtype)
 
     def forward(self, psi: torch.Tensor) -> torch.Tensor:
         if (
             psi.requires_grad
-            and psi.numel() >= 4_194_304
+            and psi.numel() > 8_388_608
             and not torch.compiler.is_compiling()
         ):
             return torch.utils.checkpoint.checkpoint(

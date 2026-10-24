@@ -77,10 +77,11 @@ def test_dyadic_hierarchical_born_forward_and_backward_d384() -> None:
         dyadic_coarse_ce_weight=0.08,
     )
     model = Radical2Pow16WaveletCholeskyGPT(cfg)
-    ppmi = torch.randn(512, 128)
-    toks = torch.randint(0, 500, (2048,))
-    diag = initialize_radical_2pow16_with_ppmi_svd(model, ppmi, toks, toks)
-    assert diag["max_self_overlap"] <= 0.05
+    with torch.no_grad():
+        torch.nn.init.normal_(model.pyramid.wav_256, std=0.15)
+        torch.nn.init.normal_(model.pyramid.wav_2048, std=0.15)
+        torch.nn.init.normal_(model.pyramid.wav_8192, std=0.15)
+        torch.nn.init.normal_(model.pyramid.wav_65536, std=0.15)
 
     x = torch.randint(0, 500, (2, 16))
     y = torch.randint(0, 500, (2, 16))

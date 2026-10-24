@@ -127,4 +127,12 @@ See also [`scripts/TOOLING_BACKLOG.md`](file:///home/festivity/agy/QuantumDLBloc
   - Decomposes `FineWeb-Edu` token Cross-Entropy (`50,257` classes) into 8-bit coarse dyadic subtree entropy (`256` roots) + 8-bit conditional intra-subtree leaf entropy (`256` leaves/root).
 - **`scripts/fp8_vs_bf16_born_logit_drift_auditor.py`**:
   - Measures cosine similarity, max logit error, and KL divergence between `fp8` (`torch._scaled_mm`) and `bf16` (`torch.mm`) Born-Boltzmann readouts across training checkpoints.
+- **`scripts/empirical_3p28_ceiling_and_wavelet_rank_probe.py`** `[PROMOTED TO EXPERIMENT_PLAN_042]`:
+  - Audits $N=2^{16}$ Wavelet-Cholesky vocabulary reconstruction $R^2$, detector effective rank $R_{\text{sharp}}$, and empirical multi-batch `FineWeb-Edu` optimization capacity ceiling (`< 3.28` / `< 1.80` nats) across $d \in \{256, 384, 512\}$ and proportional wavelet detail ranks `(128, 64)`, `(192, 96)`, `(256, 128)`.
+
+## Plan 042 Candidate (`Nice-to-Have`) Tooling
+- **`scripts/critical_batch_size_gradient_noise_profiler.py`**:
+  - Measures empirical gradient noise scale $B_{\text{simple}} = \operatorname{Tr}(\Sigma) / \|G\|_2^2$ across `B in {8, 16, 24, 32, 48}` on `FineWeb-Edu` to predict the exact critical batch size $B_{\text{crit}}(d, \text{CE})$ at each loss level.
+- **`scripts/isotoken_wsd_cooldown_branch_evaluator.py`**:
+  - Evaluates short 20% WSD cooldown branches (`1.0x -> 0.1x` LR) from any intermediate checkpoint of a long run so intermediate token milestones can be compared on an exact $\tau = 1.0$ cooled-down basis without re-training from Step 0.
 

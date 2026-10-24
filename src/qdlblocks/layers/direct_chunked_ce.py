@@ -752,11 +752,12 @@ class _DirectChunkedTwoBeamKBosonCEFn(torch.autograd.Function):
         )
         chunk_sz = max(1, min(int(chunk_size), n_tok))
         if v_vocab >= 16384:
-            is_high_vram = bool(
+            is_large_batch = bool(
                 psi_s_flat.is_cuda
+                and n_tok > 8192
                 and (torch.cuda.get_device_properties(psi_s_flat.device).total_memory >= 14 * (1024**3))
             )
-            chunk_sz = min(chunk_sz, 2048 if is_high_vram else 1024)
+            chunk_sz = min(chunk_sz, 2048 if is_large_batch else 1024)
         ignore_idx = int(ignore_index)
         quad_w = float(quad_diffuse_weight)
         hole_w = float(bipolar_hole_weight)

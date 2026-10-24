@@ -39,8 +39,8 @@ _EX48_SPEC.loader.exec_module(_EX48)
 
 if torch.cuda.is_available():
     torch.cuda.set_per_process_memory_fraction(0.95, device=0)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
 
 
 @dataclass(frozen=True)
@@ -54,15 +54,15 @@ class Wave26FineWebArmSpec:
     total_steps: int
     eval_steps: tuple[int, ...]
     embed_dim: int = 256
-    num_layers: int = 6
-    num_heads: int = 8
-    mid_detail_dim: int = 64
+    num_layers: int = 4
+    num_heads: int = 4
+    mid_detail_dim: int = 128
     fine_detail_dim: int = 64
     diffuse_rank: int = 16
-    interferometer_expansion: float = 1.5
+    interferometer_expansion: float = 2.0
     use_dyadic_hierarchical_born: bool = True
-    dyadic_coarse_alpha: float = 0.22
-    dyadic_coarse_ce_weight: float = 0.08
+    dyadic_coarse_alpha: float = 0.08
+    dyadic_coarse_ce_weight: float = 0.015
     readout_gemm_precision: str = "bf16"
     lr_scale: float = 1.0
     muon_momentum: float = 0.95
@@ -298,13 +298,13 @@ def main() -> None:
         batch_size=16,
         seq_len=512,
         total_steps=900,
-        eval_steps=(0, 300, 900),
+        eval_steps=(0, 300, 600, 900),
         embed_dim=256,
-        num_layers=6,
-        num_heads=8,
+        num_layers=4,
+        num_heads=4,
         use_dyadic_hierarchical_born=True,
-        dyadic_coarse_alpha=0.22,
-        dyadic_coarse_ce_weight=0.08,
+        dyadic_coarse_alpha=0.08,
+        dyadic_coarse_ce_weight=0.0,
         readout_gemm_precision="bf16",
     )
     res_h2 = run_wave26_fineweb_arm(spec_h2, device, force_rerun=args.force_rerun)
@@ -320,49 +320,49 @@ def main() -> None:
         f"(delta={res_h2['final_val_ce'] - w25_900_ce:+.4f} nats) | PASS={h2_pass}"
     )
 
-    # 3. Run H3: 24,576-Token Batch (`B=48, T=512`) Scaling (`d=256 L=6` 1,800 Steps & Scaled `d=384 L=8` 600 Steps)
-    print("\n--- H3: 24,576-Token Batch (`B=48, T=512`) & Scaled `d=384, L=8` FineWeb-Edu Scaling ---")
+    # 3. Run H3: 24,576-Token Batch (`B=48, T=512`) Scaling (`d=256` 1,800 Steps & Scaled `d=384` 600 Steps)
+    print("\n--- H3: 24,576-Token Batch (`B=48, T=512`) & Scaled `d=384` FineWeb-Edu Scaling ---")
     spec_b48_d256 = Wave26FineWebArmSpec(
         rkey="w26_15gb_b48_d256_L6_dyadic_fp8_1800steps",
-        short_label="Wave 26: B=48 (24,576 Tok/Step) d=256 L=6 Solution A+B FP8 (1,800 Steps / 44.24M Tokens)",
+        short_label="Wave 26: B=48 (24,576 Tok/Step) d=256 Solution A+B FP8 (1,800 Steps / 44.24M Tokens)",
         batch_size=48,
         seq_len=512,
         total_steps=1800,
         eval_steps=(0, 100, 300, 600, 900, 1200, 1800),
         embed_dim=256,
-        num_layers=6,
-        num_heads=8,
+        num_layers=4,
+        num_heads=4,
         use_dyadic_hierarchical_born=True,
-        dyadic_coarse_alpha=0.22,
-        dyadic_coarse_ce_weight=0.08,
+        dyadic_coarse_alpha=0.08,
+        dyadic_coarse_ce_weight=0.015,
         readout_gemm_precision="fp8",
-        lr_scale=1.42,
-        muon_momentum=0.90,
-        adam_betas=(0.86, 0.93),
+        lr_scale=1.38,
+        muon_momentum=0.92,
+        adam_betas=(0.88, 0.94),
     )
     res_b48_d256 = run_wave26_fineweb_arm(spec_b48_d256, device, force_rerun=args.force_rerun)
 
     spec_b48_d384 = Wave26FineWebArmSpec(
         rkey="w26_15gb_b48_d384_L8_dyadic_fp8_600steps",
-        short_label="Wave 26: Scaled B=48 (24,576 Tok/Step) d=384 L=8 (18.49M) Solution A+B FP8 (600 Steps / 14.75M Tokens)",
+        short_label="Wave 26: Scaled B=48 (24,576 Tok/Step) d=384 L=6 Solution A+B FP8 (600 Steps / 14.75M Tokens)",
         batch_size=48,
         seq_len=512,
         total_steps=600,
         eval_steps=(0, 100, 300, 600),
         embed_dim=384,
-        num_layers=8,
+        num_layers=6,
         num_heads=6,
-        mid_detail_dim=96,
+        mid_detail_dim=128,
         fine_detail_dim=64,
-        diffuse_rank=8,
-        interferometer_expansion=1.5,
+        diffuse_rank=16,
+        interferometer_expansion=2.0,
         use_dyadic_hierarchical_born=True,
-        dyadic_coarse_alpha=0.22,
-        dyadic_coarse_ce_weight=0.08,
+        dyadic_coarse_alpha=0.08,
+        dyadic_coarse_ce_weight=0.015,
         readout_gemm_precision="fp8",
-        lr_scale=1.35,
-        muon_momentum=0.90,
-        adam_betas=(0.86, 0.93),
+        lr_scale=1.32,
+        muon_momentum=0.92,
+        adam_betas=(0.88, 0.94),
     )
     res_b48_d384 = run_wave26_fineweb_arm(spec_b48_d384, device, force_rerun=args.force_rerun)
 

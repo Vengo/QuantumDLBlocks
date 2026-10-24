@@ -72,7 +72,19 @@ WAVE_DEFAULT_LABELS: dict[str, str] = {
     "W15": "Wave 15 (Plan 023: 16-Qubit Multi-Register Amplitudes & 256-State Interacting Quantum Hierarchy)",
     "W16": "Wave 16 (Plan 026–027: 100% Quantum Two-Beam k-Boson Mixed-State Readout & Scheduled Rank-r Kraus Semantic Bath)",
     "W17": "Wave 17 (Plan 028: Stereographic Radial Lift, Cosine Phase-Interference Two-Beam Readout & Quadratic Kraus Fidelity)",
-    "VERIFY": "Pre-Launch Micro-Verifications & Controlled Hypothesis Tests (Plans 013–028)",
+    "W18": "Wave 18 (Plans 031–033: Full-Ambient 16x32 Qubits, J_anti Isometry, Gentle Qubit LR & Soft Spectral Floor)",
+    "W19": "Wave 19 (Plan 034: Tied 2^16 Wavelet-Cholesky Pyramid & Mach-Zehnder Two-Beam Interference)",
+    "W20": "Wave 20 (Plan 035: Radical N=2^16 Multi-Resolution Wavelet-Cholesky U-Net & Kronecker Readout)",
+    "W21": "Wave 21 (Plan 036: Fused Kronecker U-Net 2^16 Wavelet-Cholesky Readout)",
+    "W22": "Wave 22 (Plan 037: Wavelet-Cholesky Calibration & Batched SPD Fixes 2, 3, & 4)",
+    "W23": "Wave 23 (Plan 038: Last-Layer Measurement Operator & Traceless Observable Born Readout)",
+    "W24": "Wave 24 (Plan 039: Convex-Peak Traceless Born & CIFAR-100 / 1,000-Class Vision Ablations)",
+    "W25": "Wave 25 (Plan 040: Convex-Peak Traceless Born 3,600-Step FineWeb-Edu & ImageNet-1K Ablations)",
+    "W26": "Wave 26 (Plan 041: 15GB B=48 Fused FP8 Dyadic Hierarchical Convex-Peak Traceless Born)",
+    "W27": "Wave 27 (Plan 042: Iso-Token Smaller-Batch Wider-Network d=384/512 Proportional Wavelet Scaling)",
+    "W28": "Wave 28 (Plan 043: Flag-Free Analytical Parseval muP Scaling beta_0(d)=c*sqrt(d) & Smith CLR)",
+    "W29": "Wave 29 (Plan 044–045: Standardized Parseval muP Dyadic Wavelet-Cholesky Scaling)",
+    "VERIFY": "Pre-Launch Micro-Verifications & Controlled Hypothesis Tests (Plans 013–045)",
 }
 
 WAVE_DEFAULT_PLANS: dict[str, str] = {
@@ -95,7 +107,19 @@ WAVE_DEFAULT_PLANS: dict[str, str] = {
     "W15": "EXPERIMENT_PLAN_023",
     "W16": "EXPERIMENT_PLAN_027",
     "W17": "EXPERIMENT_PLAN_028",
-    "VERIFY": "EXPERIMENT_PLAN_013_028",
+    "W18": "EXPERIMENT_PLAN_031_033",
+    "W19": "EXPERIMENT_PLAN_034",
+    "W20": "EXPERIMENT_PLAN_035",
+    "W21": "EXPERIMENT_PLAN_036",
+    "W22": "EXPERIMENT_PLAN_037",
+    "W23": "EXPERIMENT_PLAN_038",
+    "W24": "EXPERIMENT_PLAN_039",
+    "W25": "EXPERIMENT_PLAN_040",
+    "W26": "EXPERIMENT_PLAN_041",
+    "W27": "EXPERIMENT_PLAN_042",
+    "W28": "EXPERIMENT_PLAN_043",
+    "W29": "EXPERIMENT_PLAN_044_045",
+    "VERIFY": "EXPERIMENT_PLAN_013_045",
 }
 
 BASELINE_RUN_KEYS: frozenset[str] = frozenset(
@@ -1309,10 +1333,54 @@ class DynamicWaveRegistry:
             for mc_path in sorted(self.model_cards_dir.glob("*.json")):
                 try:
                     mc_data = json.loads(mc_path.read_text(encoding="utf-8"))
-                    if isinstance(mc_data, dict) and "run_key" in mc_data:
-                        existing_cards_on_disk[str(mc_data["run_key"])] = mc_data
+                    if not isinstance(mc_data, dict):
+                        continue
+                    rkey_mc = str(
+                        mc_data.get("run_key")
+                        or mc_data.get("key")
+                        or mc_data.get("rkey")
+                        or mc_data.get("name")
+                        or mc_path.stem
+                    )
+                    needs_norm = (
+                        "run_key" not in mc_data
+                        or "telemetry" not in mc_data
+                        or (
+                            mc_data.get("telemetry", {}).get("best_val_ce") is None
+                            and (self.live_logs_dir / f"{rkey_mc}_results.json").exists()
+                        )
+                    )
+                    if needs_norm:
+                        from .wave_ingestor import normalize_raw_result_to_model_card
+
+                        res_p = self.live_logs_dir / f"{rkey_mc}_results.json"
+                        raw_res = json.loads(res_p.read_text(encoding="utf-8")) if res_p.exists() else mc_data
+                        _, mc_data = normalize_raw_result_to_model_card(
+                            rkey_mc,
+                            raw_res,
+                            existing_card=mc_data,
+                            live_logs_dir=self.live_logs_dir,
+                        )
+                    existing_cards_on_disk[rkey_mc] = mc_data
                 except Exception:
                     continue
+
+        if self.live_logs_dir.exists():
+            for res_p in sorted(self.live_logs_dir.glob("w2*_results.json")):
+                rkey_res = res_p.name[: -len("_results.json")]
+                if rkey_res not in existing_cards_on_disk:
+                    try:
+                        from .wave_ingestor import normalize_raw_result_to_model_card
+
+                        raw_res = json.loads(res_p.read_text(encoding="utf-8"))
+                        _, mc_data = normalize_raw_result_to_model_card(
+                            rkey_res,
+                            raw_res,
+                            live_logs_dir=self.live_logs_dir,
+                        )
+                        existing_cards_on_disk[rkey_res] = mc_data
+                    except Exception:
+                        continue
 
         # 2. Historical FLEET_SPECS
         for raw_spec in self.historical_specs:

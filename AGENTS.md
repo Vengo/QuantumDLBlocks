@@ -48,10 +48,10 @@ Every new `EXPERIMENT_PLAN_0XX.md` and subagent workflow MUST include an explici
 
 ## 4. Script & Module Engineering Best Practices (`docs/SCRIPT_BEST_PRACTICES.md`)
 
-All agents and subagents writing or modifying Python files in `examples/`, `scripts/`, and `src/qdlblocks/` MUST enforce the five rules in [`docs/SCRIPT_BEST_PRACTICES.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/SCRIPT_BEST_PRACTICES.md):
+All agents and subagents writing or modifying Python files in `examples/`, `scripts/`, and `src/qdlblocks/` MUST enforce the six rules in [`docs/SCRIPT_BEST_PRACTICES.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/SCRIPT_BEST_PRACTICES.md):
 
-1. **Rule 1 — File-Length Budget (`<= 1,000` Lines Target, `<= 1,200` Hard Ceiling, No Semicolon Line-Packing)**:
-   - Keep new scripts and modules in `examples/`, `scripts/`, and `src/qdlblocks/` `<= 1,000` lines target with an absolute hard ceiling of `1,200` lines, and never pack multiple statements onto one line with semicolons (`a; b`). Extract reusable logic into `src/qdlblocks/benchmarks/` or `src/qdlblocks/layers/`.
+1. **Rule 1 — File-Length Budget (`<= 1,000` Lines Soft Warning Limit, `<= 2,500` Hard Limit, No Semicolon Line-Packing)**:
+   - Keep new scripts and modules in `examples/`, `scripts/`, and `src/qdlblocks/` `<= 1,000` lines soft limit (carries a warning above `1,000` lines) with an absolute hard limit of `2,500` lines, and never pack multiple statements onto one line with semicolons (`a; b`). Extract reusable logic into `src/qdlblocks/benchmarks/` or `src/qdlblocks/layers/`.
 2. **Rule 2 — Function Signature Ceiling (`<= 8` Arguments)**:
    - No new function or method may accept more than `8` positional/keyword arguments (excluding `self`/`cls`). Group domain hyperparameters into frozen `@dataclass(frozen=True)` objects (`BackboneConfig`, `QubitHierarchyConfig`, `KBosonReadoutConfig`, `OptimizerConfig`, `QuantumExperimentSpec` in [`src/qdlblocks/benchmarks/config_models.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/config_models.py)).
 3. **Rule 3 — Strategy / Polymorphic Dispatch Over Boolean Flag Jungles**:
@@ -60,4 +60,44 @@ All agents and subagents writing or modifying Python files in `examples/`, `scri
    - Never copy-paste `initialize_povm_log_prior`, `build_quantum_born_optimizers`, `build_quantum_model_from_spec`, or validation loops into per-plan scripts; always import them from [`src/qdlblocks/benchmarks/config_models.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/config_models.py) and [`src/qdlblocks/benchmarks/calibration_probe.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/calibration_probe.py).
 5. **Rule 5 — No Giant Closure-Capturing Nested Functions**:
    - Keep helper functions top-level, pure, and independently unit-testable via `pytest`.
+6. **Rule 6 — Clean, Flag-Free Per-Experiment Modules Over Boolean-Flag Accumulation in Legacy Models**:
+   - Never thread new `use_*` or `is_*` boolean flags into legacy model or loss files (`wavelet_cholesky_2pow16_gpt.py`, `direct_chunked_ce.py`) when testing a new mathematical formulation. Instead, import shared building-block primitives (`BlockCholeskyLinear`, `WaveletCholeskyMultiscaleBranch`, `OvercompleteTwoBeamInterference`, `StiefelMuon`) into a clean, dedicated, flag-free module and verification script that directly express the experiment's equations with zero legacy branches, leaving previous wave models frozen for reproducible comparison.
 
+## 5. Reusable Building-Blocks Catalog (`docs/BUILDING_BLOCKS.md`) & Mandatory Contribute-Back Protocol
+
+Before drafting any new `EXPERIMENT_PLAN_0XX.md`, writing a new model/layer/kernel, or launching a subagent, agents MUST read [`docs/BUILDING_BLOCKS.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/BUILDING_BLOCKS.md) (and the top-level summary in [`README.md`](file:///home/festivity/agy/QuantumDLBlocks/README.md)) to understand the current state of our reusable components:
+
+1. **Know & Compose the Canonical Building Blocks at Launch**:
+   - **Fused GPU Kernels (`src/qdlblocks/kernels/`)**:
+     - `compiled_parseval_convex_traceless_chunk_step`, `fused_fp8_or_bf16_chunk_gemm`, `quantize_fp8_vocab_transposed` ([`fused_parseval_ce.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/fused_parseval_ce.py)): Reusable `@torch.compile` + FP8/BF16 Tensor-Core readout kernel (`24.7k–25.3k tok/s` at $d=256$).
+     - `flash_born_attention`, `flash_purified_born_attention` ([`flash_born_triton.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/flash_born_triton.py)): $O(T)$ SRAM-tiled Triton Born attention (`64x64` tiles, automatic for $d \ge 384$).
+   - **Canonical Layers & Flag-Free Readouts (`src/qdlblocks/layers/`)**:
+     - `parseval_mup_dyadic_chunked_ce`, `eval_parseval_mup_full_logits`, `ParsevalChunkedCEReadoutSpec` ([`parseval_mup_chunked_ce.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/parseval_mup_chunked_ce.py)): Flag-free analytical Parseval $\mu\text{P}$ scale $\beta_0(d) = c^*\sqrt{d}$ ($c^* = 1.48$) + Convex-Peak Traceless Born + 256-root dyadic conditional readout (replaces legacy `PurityGate`, `kboson_raw_k`, and manual `26.8` / `44.0` temperature clamps).
+     - `BlockCholeskyLinear(d, max_block_size=32, fast_spd_bmm=True)` & `WaveletCholeskyMultiscaleBranch` ([`wavelet_cholesky_branch.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/wavelet_cholesky_branch.py)): Batched `torch.bmm` SPD operators (`2.55x` faster) and Sweldens lifting wavelets.
+     - `OvercompleteTwoBeamInterference` ([`overcomplete_two_beam.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/overcomplete_two_beam.py)): Mach-Zehnder two-beam phase interferometer.
+   - **Canonical Models & Pyramids (`src/qdlblocks/models/`)**:
+     - `ParsevalMuPDyadicGPT` & `ParsevalMuPDyadicConfig` ([`parseval_mup_dyadic_gpt.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/parseval_mup_dyadic_gpt.py)): Current canonical flag-free language model with proportional wavelet detail ranks ($d_{\text{mid}} = d // 2, d_{\text{fine}} = d // 4$) and post-normalization Cholesky metric absorption (`absorb_beta_into_readout_cholesky()`).
+     - `WaveletCholeskyVisionClassifier` & `TiedDyadicWaveletClassPyramid` ([`wavelet_cholesky_vision.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/wavelet_cholesky_vision.py)): `~11s`/run `CIFAR-100` & `ILSVRC ImageNet-1K` ($K=1,000$) fast-loop ablation laboratory.
+   - **Riemannian Stiefel Optimization (`src/qdlblocks/optim/muon.py`)**:
+     - `StiefelMuon` (`polar_express`, `stiefel_penalty=0.02`, `use_normuon=True`, `use_twin_rail=True`): Always route `kraus_generators` (`(R, d, d)`) and 2D orthogonal bases to `StiefelMuon` + `retract_kraus_generators()`.
+2. **Contribute Back When Validating New Components**:
+   - Whenever an experiment wave proves out a reusable kernel, layer, optimizer schedule, or diagnostic probe, extract it into `src/qdlblocks/{kernels,layers,optim,benchmarks}/` or `scripts/`, export it in `__init__.py`, and update [`docs/BUILDING_BLOCKS.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/BUILDING_BLOCKS.md) and [`README.md`](file:///home/festivity/agy/QuantumDLBlocks/README.md) (marking any superseded component as `FROZEN` or `LEGACY`) before closing out the wave.
+
+## 6. Mandatory Standardized Experiment Intent & Progress Logging (`StandardizedExperimentLogger`)
+
+Every training experiment—whether executed on remote Colab (`100M–900M` FineWeb speedruns), on the local workstation (`8 GB` / `15 GB` `FineWeb-Edu` scaling runs), or on vision/synthetic ablation tasks (`CIFAR-100`, `ILSVRC ImageNet-1K`)—MUST record its experimental intent and live progress using [`StandardizedExperimentLogger`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/experiment_logger.py) (`from qdlblocks.benchmarks.experiment_logger import ExperimentIntentSpec, StandardizedExperimentLogger`):
+
+1. **Declare Explicit Intent Before Step 0 (`ExperimentIntentSpec`)**:
+   - Every run must emit an `[EXPERIMENT_INTENT]` header block to `.cache/live_logs/{run_key}.log` and `.cache/model_cards/{run_key}.json` specifying:
+     - `run_key`, `wave_id` (e.g. `W28`, `W29`), `plan_id` (e.g. `EXPERIMENT_PLAN_045`)
+     - `task_domain`: `"fineweb_speedrun"` (full 100M–900M FineWeb), `"fineweb_edu_local"` (local FineWeb-Edu Wavelet-Cholesky scaling), `"vision_ablation"` (`CIFAR-100` / `ImageNet-1K`), or `"micro_verification"`
+     - `hypothesis_intent`: 1–2 sentence statement of what hypothesis the run tests and its quantitative target
+     - `architecture_summary`, `hardware_budget`, `batch_size`, `seq_len`, `total_steps`, `target_tokens_M`
+2. **Stream Standardized Step & Eval Progress Live (`logger.log_step(...)` & `logger.log_eval(...)`)**:
+   - Emit standardized `[STEP ...]` and `[EVAL ...]` lines to `.cache/live_logs/{run_key}.log` and atomically update `.cache/live_logs/{run_key}_results.json`, `.cache/model_cards/{run_key}.json` (`ModelCard v1.0`), and `.cache/benchmarks.db` (`BenchmarkSQLiteDB`) at every evaluation checkpoint (`tokens_M`, `compute_tflops`, `tau_progress`, `val_ce`, `val_ppl`, `top1_acc`, `sharp_eff_rank`, `kraus_stiefel_err`).
+3. **Sync & Verify in WebUI (`scripts/sync_waves_to_webui.py`)**:
+   - After or during any experiment wave, run:
+     ```bash
+     /home/festivity/agy/QuantumDLBlocks/.venv/bin/python /home/festivity/agy/QuantumDLBlocks/scripts/sync_waves_to_webui.py --trigger-reload
+     ```
+     so all runs appear immediately in the appropriate WebUI tab (`🏆 Full FineWeb Speedrun`, `⚡ Local FineWeb-Edu Waves 18–29`, or `🧪 Micro-Verifications & Vision Ablations`).

@@ -46,7 +46,9 @@ def l2_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-12) -> torch.Te
         return x * torch.rsqrt(norm_sq + eps).to(x.real.dtype)
     if (
         x.requires_grad
+        and x.ndim == 3
         and x.dtype in (torch.float16, torch.bfloat16)
+        and x.numel() > 10_000_000
         and not torch.compiler.is_compiling()
     ):
         return _L2NormalizeFn.apply(x, int(dim), float(eps))  # type: ignore[return-value]

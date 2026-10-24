@@ -1,8 +1,40 @@
 # QuantumDLBlocks (`qdlblocks` & `qdlblocks_jax`)
 
-**Density-Matrix, Complex Hilbert-Space, and Stiefel/Born Quantum-Geometric Deep Learning Blocks in Native PyTorch and JAX/Haliax.**
+**Density-Matrix, Complex Hilbert-Space, and Dyadic Wavelet-Cholesky / Parseval $\mu\text{P}$ Quantum-Geometric Deep Learning Blocks in Native PyTorch and JAX/Haliax.**
 
-`qdlblocks` provides modular PyTorch layers, pure JAX + Equinox + Haliax named-axis modules (`qdlblocks_jax`), fused GPU/TPU Flash-Born attention kernels, Stiefel manifold optimizers, Quantum-Geometric Neural Architecture Search (`qdlblocks.qnas`), and multi-domain benchmarks (`qdlblocks.benchmarks`)—without the overhead of gate-level quantum circuit simulators.
+`qdlblocks` provides modular PyTorch layers, reusable fused GPU/TPU kernels (`qdlblocks.kernels`), multi-scale Sweldens Wavelet-Cholesky & Mach-Zehnder interferometric blocks (`qdlblocks.layers`), flag-free Parseval $\mu\text{P}$ $\sqrt{d}$ language and vision models (`qdlblocks.models`), Riemannian Stiefel manifold optimizers (`qdlblocks.optim`), pure JAX + Equinox + Haliax named-axis modules (`qdlblocks_jax`), and standardized iso-token / iso-FLOP benchmarks (`qdlblocks.benchmarks`)—without the overhead of gate-level quantum circuit simulators.
+
+> **Start Here — Authoritative Building-Blocks & Engineering Guides**:
+> - **[`docs/BUILDING_BLOCKS.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/BUILDING_BLOCKS.md)**: Complete catalog of our canonical reusable GPU kernels (`fused_parseval_ce`, `flash_born_triton`), layers (`parseval_mup_dyadic_chunked_ce`, `BlockCholeskyLinear`, `WaveletCholeskyMultiscaleBranch`, `OvercompleteTwoBeamInterference`), models (`ParsevalMuPDyadicGPT`, `WaveletCholeskyVisionClassifier`), optimizers (`StiefelMuon`), diagnostic CLI scripts, and how to contribute new primitives back.
+> - **[`docs/SCRIPT_BEST_PRACTICES.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/SCRIPT_BEST_PRACTICES.md)**: The 6 mandatory engineering rules enforced across the repo via [`scripts/ast_signature_and_length_linter.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/ast_signature_and_length_linter.py) (including Rule 6: clean, flag-free per-experiment modules composing shared building blocks).
+> - **[`AGENTS.md`](file:///home/festivity/agy/QuantumDLBlocks/AGENTS.md)**: Operational workflow for live monitoring, first-class scripts, and mandatory building-block reuse.
+
+---
+
+## Current Canonical Building Blocks & `Waves 20–28` Highlights
+
+### 1. Reusable Fused GPU Kernels & Quantum-Geometric Primitives (See [`docs/BUILDING_BLOCKS.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/BUILDING_BLOCKS.md))
+| Building Block | Module | What It Does & Why It Exists |
+| :--- | :--- | :--- |
+| **Fused Parseval Chunked CE Kernel** | [`qdlblocks.kernels.fused_parseval_ce`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/fused_parseval_ce.py) | Combines Ada/Blackwell `FP8 E4M3` (`torch._scaled_mm`) / `BF16` Tensor-Core GEMMs with a `@torch.compile` (TorchInductor) pointwise kernel for centered sharp & diffuse observables and analytical gradients (**`2.0x` speedup: `11.1k -> 25.3k tok/s`** at $d=256$ in `5.48 GB` VRAM). |
+| **Flag-Free Parseval $\mu\text{P}$ $\sqrt{d}$ Readout** | [`qdlblocks.layers.parseval_mup_chunked_ce`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/parseval_mup_chunked_ce.py) | Replaces dynamic per-token `PurityGate` MLPs, redundant `kboson_raw_k` counters, and manual clamps (`26.8` / `44.0`) with deterministic Parseval frame scaling $\beta_0(d) = c^*\sqrt{d}$ ($c^* = 1.48$), Convex-Peak Traceless Born observable $\widehat{O}_{t,v} = \hat{c}_{t,v} + \gamma(\max(\hat{c}_{t,v},0)^2 - \tau_{t,+})$, and 256-root dyadic coarse-to-fine conditional probability. |
+| **Batched SPD `BlockCholeskyLinear` & Sweldens Wavelets** | [`qdlblocks.layers.wavelet_cholesky_branch`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/wavelet_cholesky_branch.py) | Parameterizes strictly positive-definite metric operators $A = \operatorname{diag}(L_g L_g^\top) \succ 0$ via batched `torch.bmm` (`fast_spd_bmm=True`, **`2.55x` faster**) inside multi-level invertible Sweldens lifting wavelet branches (`WaveletCholeskyMultiscaleBranch`). |
+| **Mach-Zehnder Two-Beam Interferometer** | [`qdlblocks.layers.overcomplete_two_beam`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/overcomplete_two_beam.py) | Mixes attention and multi-scale wavelet pathways through unitary $2 \times 2$ Mach-Zehnder beamsplitters and cosine relative-phase gates (`+0.2025` nat improvement on `ILSVRC ImageNet-1K`). |
+| **Proportional $N=2^{16}$ Dyadic Vocab Pyramid** | [`qdlblocks.models.parseval_mup_dyadic_gpt`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/parseval_mup_dyadic_gpt.py) | Synthesizes $V=50,257$ vocabulary detectors coarse-to-fine across a 16-level binary spectral tree (`256 -> 2048 -> 8192 -> 65536`) with proportional detail ranks ($d_{\text{mid}} = d/2, d_{\text{fine}} = d/4$), compressing vocabulary parameters by `3.4x` while breaking the `3.28` Val CE capacity wall (`< 0.10` nats empirical ceiling). |
+| **Riemannian `StiefelMuon` Optimizer** | [`qdlblocks.optim.muon`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/optim/muon.py) | Quintic `polar_express` Newton-Schulz orthogonalization + continuous Riemannian Stiefel Landing penalty $\gamma W(W^\top W - I)$ (`stiefel_penalty=0.02`) across 2D projections and 3D `kraus_generators` (`kraus_stiefel_err <= 0.015`). |
+
+### 2. Standardized Iso-Token & Multi-Width `FineWeb-Edu` Progression (`Waves 19–28`, Single Local GPU)
+| Wave / Model Variant | Width $d$ / Layers $L$ | Params | Readout Regime | Val CE @ `7.37M` Tok (`900` Steps, $B=16$) | Val CE @ `29.49M` Tok | Throughput (`tok/s`) | Peak VRAM |
+| :--- | :---: | :---: | :--- | :---: | :---: | :---: | :---: |
+| **Classical Transformer Baseline** | `256 / 4` | `30.95M` | Untied Dense Softmax | `5.9152` | `5.5202` | `19,100` | `6.10 GB` |
+| **`Wave 19` (`QuantumBornGPT`)** | `256 / 4` | `38.28M` | Parity-Split Concave $k$-Boson | `5.5840` | `5.1157` | `16,800` | `6.85 GB` |
+| **`Wave 21` (`16-Bank Wavelet-Cholesky`)** | `256 / 4` | `15.59M` | Concave $k$-Boson | `5.4734` | `5.0211` | `12,195` | `6.42 GB` |
+| **`Wave 25` (`w25_8gb_convex_traceless_born`)** | `256 / 4` | `10.40M` | Convex-Peak Traceless Born | `5.4465` | `5.0162` | `25,616` | `5.83 GB` |
+| **`Wave 26` (`w26_15gb_dyadic_convex_traceless`)** | `256 / 4` | `10.40M` | Convex-Traceless + Dyadic Tree | `5.4447` | — | `24,832` | `5.48 GB` |
+| **`Wave 28` (`ParsevalMuPDyadicGPT` $d=256$, Flag-Free)** | `256 / 4` | `10.40M` | **Flag-Free Parseval $\mu\text{P}$ $\beta_0 = c^*\sqrt{d}$** | **`5.4372`** | — | **`24,658`** | **`5.48 GB`** |
+| **`Wave 28` (`ParsevalMuPDyadicGPT` $d=384$, Flag-Free)** | `384 / 6` | `21.35M` | **Flag-Free Parseval $\mu\text{P}$ $\beta_0 = c^*\sqrt{d}$** | **`5.3944`** | — | **`18,335`** | **`6.89 GB`** |
+| **`Wave 28` (`ParsevalMuPDyadicGPT` $d=512$, Flag-Free)** | `512 / 6` | `33.49M` | **Flag-Free Parseval $\mu\text{P}$ $\beta_0 = c^*\sqrt{d}$** | **`5.3671`** | — | **`13,996`** | **`7.66 GB`** |
+| **`Wave 27` (`w27_isotok_29p49M_b24_d512_L6_dyadic_fp8`)** | `512 / 6` | `33.49M` | Convex-Traceless + Dyadic Tree (`B=24`) | `5.3689` (`B=24`) | **`4.7919`** (**All-Time Record**) | `14,118` | `10.12 GB` |
 
 ---
 

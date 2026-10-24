@@ -10,6 +10,19 @@ from .classical_modded_gpt import (
     apply_leaderboard_rotary,
 )
 from .hybrid_classifier import HybridQuantumClassifier
+from .parseval_mup_dyadic_gpt import (
+    ParsevalMuPDyadicConfig,
+    ParsevalMuPDyadicGPT,
+    build_parseval_mup_optimizers,
+    initialize_parseval_mup_with_ppmi_svd,
+)
+from .parseval_mup_ngram_speedrun_gpt import (
+    HashedSurfaceNGramProjector,
+    ParsevalMuPNGramSpeedrunConfig,
+    ParsevalMuPNGramSpeedrunGPT,
+    build_parseval_mup_ngram_optimizers,
+    initialize_parseval_mup_ngram_with_ppmi_svd,
+)
 from .pure_quantum_net import DeepPureQuantumNetwork
 from .speech_ctc import (
     LIBRISPEECH_CHARS,
@@ -24,6 +37,28 @@ from .speech_ctc import (
     levenshtein_distance,
     load_librispeech_dataset,
     text_to_char_indices,
+)
+from .wavelet_cholesky_2pow16_gpt import (
+    ConsistentKroneckerWaveletBlock,
+    FusedKroneckerWaveletUNetBlock,
+    Radical2Pow16Config,
+    Radical2Pow16WaveletCholeskyGPT,
+    Tied2Pow16WaveletCholeskyPyramid,
+    WaveletCholeskyUNetBlock,
+    build_dyadic_2pow16_spectral_tree,
+    build_radical_2pow16_optimizers,
+    initialize_radical_2pow16_with_ppmi_svd,
+)
+from .wavelet_cholesky_vision import (
+    TiedDyadicWaveletClassPyramid,
+    VisionDatasetBundle,
+    VisionWaveletCholeskyConfig,
+    WaveletCholeskyVisionBlock,
+    WaveletCholeskyVisionClassifier,
+    build_1000class_finegrained_dataset,
+    build_vision_wavelet_optimizers,
+    load_or_download_cifar100,
+    load_or_download_imagenet1k_32x32,
 )
 
 __all__ = [
@@ -49,4 +84,33 @@ __all__ = [
     "load_librispeech_dataset",
     "extract_librispeech_word_segments",
     "ReadoutMode",
+    "ParsevalMuPDyadicConfig",
+    "ParsevalMuPDyadicGPT",
+    "initialize_parseval_mup_with_ppmi_svd",
+    "build_parseval_mup_optimizers",
+    "ParsevalMuPNGramSpeedrunConfig",
+    "HashedSurfaceNGramProjector",
+    "ParsevalMuPNGramSpeedrunGPT",
+    "initialize_parseval_mup_ngram_with_ppmi_svd",
+    "build_parseval_mup_ngram_optimizers",
+    "Radical2Pow16Config",
+    "Radical2Pow16WaveletCholeskyGPT",
+    "Tied2Pow16WaveletCholeskyPyramid",
+    "WaveletCholeskyUNetBlock",
+    "ConsistentKroneckerWaveletBlock",
+    "FusedKroneckerWaveletUNetBlock",
+    "build_dyadic_2pow16_spectral_tree",
+    "initialize_radical_2pow16_with_ppmi_svd",
+    "build_radical_2pow16_optimizers",
+    "VisionWaveletCholeskyConfig",
+    "VisionDatasetBundle",
+    "TiedDyadicWaveletClassPyramid",
+    "WaveletCholeskyVisionBlock",
+    "WaveletCholeskyVisionClassifier",
+    "build_vision_wavelet_optimizers",
+    "load_or_download_cifar100",
+    "build_1000class_finegrained_dataset",
+    "load_or_download_imagenet1k_32x32",
 ]
+
+

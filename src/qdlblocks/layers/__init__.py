@@ -123,6 +123,11 @@ from .hierarchical_qubit import (
     Hierarchical16QubitPOVMReadout,
     initialize_hierarchical_16qubit_with_ppmi_svd,
 )
+from .parseval_mup_chunked_ce import (
+    ParsevalChunkedCEReadoutSpec,
+    eval_parseval_mup_full_logits,
+    parseval_mup_dyadic_chunked_ce,
+)
 from .stereographic_lift import (
     ClassicalSoftmaxMLP,
     NaiveBornClassifier,
@@ -133,6 +138,13 @@ from .stereographic_lift import (
     build_concentric_shells_dataset,
     load_fisher_iris_dataset,
     run_iris_and_shells_benchmark,
+)
+from .wavelet_cholesky_branch import (
+    BlockCholeskyLinear,
+    RMSNorm,
+    WaveletCholeskyConfig,
+    WaveletCholeskyMultiscaleBranch,
+    apply_soft_powerlaw_spectral_floor,
 )
 
 __all__ = [
@@ -152,6 +164,14 @@ __all__ = [
     "build_sampled_candidate_set",
     "sampled_softcap_linear_ce",
     "sampled_povm_ce",
+    "ParsevalChunkedCEReadoutSpec",
+    "parseval_mup_dyadic_chunked_ce",
+    "eval_parseval_mup_full_logits",
+    "BlockCholeskyLinear",
+    "RMSNorm",
+    "WaveletCholeskyConfig",
+    "WaveletCholeskyMultiscaleBranch",
+    "apply_soft_powerlaw_spectral_floor",
     "compute_ppmi_svd_embeddings",
     "initialize_quantum_born_with_ppmi_svd",
     "initialize_classical_with_ppmi_svd",

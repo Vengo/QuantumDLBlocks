@@ -78,6 +78,20 @@ from .synthetic_fineweb_walk import (
     run_synthetic_fineweb_overfit_suite,
 )
 
+from .experiment_logger import (
+    VALID_TASK_DOMAINS,
+    ExperimentIntentSpec,
+    StandardizedExperimentLogger,
+    format_intent_header_block,
+    parse_experiment_intent_block,
+)
+from .wave_ingestor import (
+    WAVE_METADATA_W18_TO_W29,
+     infer_task_domain,
+    ingest_all_waves_and_verifications,
+    normalize_raw_result_to_model_card,
+)
+
 __all__ = [
     "RANK_BUCKETS",
     "compute_calibration_rank_decomposition",
@@ -133,6 +147,15 @@ __all__ = [
     "classify_run_tier",
     "compute_family_pareto_and_obsolete",
     "backfill_micro_verifications",
+    "VALID_TASK_DOMAINS",
+    "ExperimentIntentSpec",
+    "StandardizedExperimentLogger",
+    "format_intent_header_block",
+    "parse_experiment_intent_block",
+    "WAVE_METADATA_W18_TO_W29",
+    "infer_task_domain",
+    "normalize_raw_result_to_model_card",
+    "ingest_all_waves_and_verifications",
     "FineWebSyntheticWalkConfig",
     "FineWebSyntheticRandomWalkGenerator",
     "generate_fineweb_synthetic_random_walk",
