@@ -74,6 +74,14 @@ from .wavelet_cholesky_vision import (
     load_or_download_cifar100,
     load_or_download_imagenet1k_32x32,
 )
+from .gemini_packed_complex_rope_gpt import (
+    ComplexUnitaryInterferenceFFN,
+    GeminiPackedComplexRoPEBlock,
+    GeminiPackedComplexRoPEConfig,
+    GeminiPackedComplexRoPEGPT,
+    build_gemini_complex_optimizers,
+    initialize_gemini_complex_gpt_with_ppmi_svd,
+)
 
 __all__ = [
     "DeepPureQuantumNetwork",
@@ -135,6 +143,13 @@ __all__ = [
     "load_or_download_cifar100",
     "build_1000class_finegrained_dataset",
     "load_or_download_imagenet1k_32x32",
+    "ComplexUnitaryInterferenceFFN",
+    "GeminiPackedComplexRoPEBlock",
+    "GeminiPackedComplexRoPEConfig",
+    "GeminiPackedComplexRoPEGPT",
+    "build_gemini_complex_optimizers",
+    "initialize_gemini_complex_gpt_with_ppmi_svd",
 ]
+
 
 

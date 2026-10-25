@@ -55,7 +55,9 @@ WAVE_METADATA_W18_TO_W29: dict[str, tuple[int, str, str, str]] = {
     "W34": (34, "EXPERIMENT_PLAN_049", "Wave 34 (Plan 049: True Dyadic CE Floor, StiefelMuon + Parseval muP Restoration, & d=1024 Max-Width Scaling)", "Restores symplectic StiefelMuon + Parseval muP + causal N-gram + 50,257-way M=4 coincidence and scales width d from 256 to 1024 on 16 GB VRAM."),
     "W35": (35, "EXPERIMENT_PLAN_050", "Wave 35 (Plan 050: Long-Horizon d=1024 Mode B Single-Synthesis Step Caching & 900M-Token Scaling)", "Evaluates d=1024, L=6 (119.99M params) in Mode B (B_micro=8, grad_accum=2) over 1,800 steps (14.75M tok) and projects 900M-token trajectory."),
     "W36": (36, "EXPERIMENT_PLAN_051", "Wave 36 (Plan 051: Pure-Neural Head-to-Head N-Gram Ablation — Differentiable Surface N-Gram vs. Pure Wavelet-Conv Without Static Kneser-Ney Lookup)", "Compares Option 1 (differentiable HashedSurfaceNGramProjector.forward only, _kn_state=None) vs. Option 2 (no HashedSurfaceNGramProjector at all) across d=256 and d=1024 Mode B."),
+    "W37": (37, "EXPERIMENT_PLAN_052", "Wave 37 (Plan 052: Standalone Pure-Complex Register Density GPT — GeminiBornComplexPackedWithRoPE + Refinements 1, 3, & 4, Zero gamma_coh)", "Evaluates standalone GeminiPackedComplexRoPEGPT with ComplexRoPE on Q/K only (Refinement 1), 1-GEMM Hermitian Triangle Packing (Refinement 3), and V-Space Krylov Power Iteration Probing (Refinement 4) vs. Q-Probe on FineWeb-Edu."),
 }
+
 
 
 def infer_task_domain(run_key: str, raw_data: dict[str, Any] | None = None) -> str:

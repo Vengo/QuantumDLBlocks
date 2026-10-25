@@ -161,9 +161,29 @@ from .wavelet_cholesky_branch import (
     WaveletCholeskyMultiscaleBranch,
     apply_soft_powerlaw_spectral_floor,
 )
+from .packed_complex_register_density_attn import (
+    ComplexProbeMode,
+    ComplexRoPE,
+    PackedComplexRegisterDensityAttention,
+    complex_l2_normalize,
+    explicit_mcweeny_density_probe,
+    krylov_purified_density_probe,
+    pack_hermitian_outer_product,
+    pack_hermitian_outer_product_and_ket,
+    unpack_hermitian_matrix,
+)
 
 __all__ = [
     "ComplexLinear",
+    "ComplexProbeMode",
+    "ComplexRoPE",
+    "PackedComplexRegisterDensityAttention",
+    "complex_l2_normalize",
+    "explicit_mcweeny_density_probe",
+    "krylov_purified_density_probe",
+    "pack_hermitian_outer_product",
+    "pack_hermitian_outer_product_and_ket",
+    "unpack_hermitian_matrix",
     "MultiHeadComplexProjection",
     "PureQuantumAttention",
     "ComplexSuperpositionAttention",
@@ -286,6 +306,7 @@ __all__ = [
     "SPAMNoise",
     "DepolarizingNoise",
 ]
+
 
 
 

@@ -1,6 +1,6 @@
 # QuantumDLBlocks Reusable Building Blocks & Kernel Catalog (`docs/BUILDING_BLOCKS.md`)
 
-**Authoritative Agent & Researcher Reference for Composable Quantum-Geometric Primitives, Fused GPU Kernels, Stiefel Optimizers, and Diagnostic Probes (Current as of `Wave 34` / `EXPERIMENT_PLAN_049`).**
+**Authoritative Agent & Researcher Reference for Composable Quantum-Geometric Primitives, Fused GPU Kernels, Stiefel Optimizers, and Diagnostic Probes (Current as of `Wave 37` / `EXPERIMENT_PLAN_052`).**
 
 > **Mandatory Agent Instruction (See [`AGENTS.md`](file:///home/festivity/agy/QuantumDLBlocks/AGENTS.md) Sections 5 & 6)**:
 > 1. **Read Before Planning or Coding**: Every agent and subagent MUST consult this catalog before drafting a new `EXPERIMENT_PLAN_0XX.md` or writing model/layer/kernel code so that new experiments compose our proven, high-throughput building blocks instead of re-implementing them or reviving superseded legacy patterns.
@@ -15,13 +15,14 @@
 | :--- | :--- | :--- | :---: | :--- |
 | **Fused Readout & CE GPU Kernel** | `compiled_m4_coincidence_chunk_step`, `compiled_parseval_convex_traceless_chunk_step`, `fused_fp8_or_bf16_chunk_gemm`, `quantize_fp8_vocab_transposed` | `from qdlblocks.kernels import ...` ([`fused_parseval_ce.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/fused_parseval_ce.py)) | **CANONICAL (`Waves 28 & 34`)** | Unfused eager elementwise chunk steps or `float32` backward GEMMs |
 | **Fused Attention GPU Kernel** | `flash_born_attention`, `flash_purified_born_attention` (supports both `head_dim = 64` and non-pow2 `head_dim in {48, 80, 96, 112}` via `BLOCK_D = next_power_of_2(HEAD_DIM)`) | `from qdlblocks.kernels import ...` ([`flash_born_triton.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/flash_born_triton.py)) | **CANONICAL (`Wave 34`)** | Materialized $O(B \cdot H \cdot T^2)$ attention matrices at $d \ge 384$ or $T \ge 1024$ |
+| **Packed Complex Register Density & Krylov Attention** | `PackedComplexRegisterDensityAttention`, `ComplexRoPE`, `krylov_purified_density_probe`, `pack_hermitian_outer_product_and_ket` | `from qdlblocks.layers import ...` ([`packed_complex_register_density_attn.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/packed_complex_register_density_attn.py)) | **CANONICAL (`Wave 37`)** | Un-refined `Q-Probe` ($\rho_t^{\text{purified}} |q_t^{\text{rot}}\rangle$) or explicit $O(d_h^3)$ matrix squaring `rho @ rho` |
 | **Unit-Sphere & Product-of-Spheres Readout** | `parseval_mup_dyadic_chunked_ce`, `subspace_coincidence_dyadic_chunked_ce`, `subspace_l2_normalize` (pair-strided `(..., d//8, 4, 2)`), `strided_subspace_l2_normalize`, `SubspaceCoincidenceSpec` | `from qdlblocks.layers import ...` ([`parseval_mup_chunked_ce.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/parseval_mup_chunked_ce.py), [`subspace_coincidence_born.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/subspace_coincidence_born.py)) | **CANONICAL (`Waves 28–34`)** | `direct_chunked_two_beam_kboson_ce` + `ContextualBlochPurityGate` + `kboson_raw_k` + manual clamps (`26.8` / `44.0`) |
 | **Level-Separated Wavelets & 1D Conv Bank** | `WaveletScaleState` (pair-strided symplectic layout), `MultiRateWavefunctionConvBank` | `from qdlblocks.layers import WaveletScaleState, MultiRateWavefunctionConvBank` ([`multirate_wavefunction_conv.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/multirate_wavefunction_conv.py)) | **CANONICAL (`Waves 32–34`)** | Global L2 normalization over summed wavelet levels `l2_normalize(c3+c2+c1+c0)` that crushes fine leaves |
 | **SPD Metric Conditioning** | `BlockCholeskyLinear(d, max_block_size=32, fast_spd_bmm=True)` | `from qdlblocks.layers import BlockCholeskyLinear` ([`wavelet_cholesky_branch.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/wavelet_cholesky_branch.py)) | **CANONICAL (`2.55x` BMM)** | `fast_spd_bmm=False` sequential Python `for b in range(num_blocks)` loop |
 | **Multi-Scale Wavelet Branch** | `WaveletCholeskyMultiscaleBranch`, `WaveletCholeskyConfig` | `from qdlblocks.layers import WaveletCholeskyMultiscaleBranch` ([`wavelet_cholesky_branch.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/wavelet_cholesky_branch.py)) | **CANONICAL** | Single-scale Euclidean MLPs |
 | **Two-Beam Phase Interferometer** | `OvercompleteTwoBeamInterference` | `from qdlblocks.layers import OvercompleteTwoBeamInterference` ([`overcomplete_two_beam.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/overcomplete_two_beam.py)) | **CANONICAL** | Single-beam additive residuals without Mach-Zehnder phase gating |
 | **Dyadic $2^{16}$ Vocab Pyramid** | `Tied2Pow16WaveletCholeskyPyramid`, `build_dyadic_2pow16_spectral_tree` (with $d_{\text{mid}}=d/2, d_{\text{fine}}=d/4$, `num_fine_up_banks=1`) | `from qdlblocks.models import Tied2Pow16WaveletCholeskyPyramid` ([`wavelet_cholesky_2pow16_gpt.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/wavelet_cholesky_2pow16_gpt.py)) | **CANONICAL** | Fixed $(128, 64)$ ranks at $d > 256$ (rank-starved) or `16`-bank ambient synthesis |
-| **Flag-Free Language Models** | `LevelSeparatedWaveletConvGPT` (`Waves 32–34`), `ParsevalMuPSubspaceCoincidenceGPT` (`Wave 31`), `ParsevalMuPNGramSpeedrunGPT` (`Waves 29–30`), `ParsevalMuPDyadicGPT` (`Wave 28`) | `from qdlblocks.models import LevelSeparatedWaveletConvGPT, ParsevalMuPSubspaceCoincidenceGPT, ParsevalMuPNGramSpeedrunGPT, ParsevalMuPDyadicGPT` ([`level_separated_wavelet_conv_gpt.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/level_separated_wavelet_conv_gpt.py)) | **CANONICAL (`Waves 28–34`)** | `Radical2Pow16WaveletCholeskyGPT` (frozen `Waves 20–27` baseline) & `QuantumBornGPT` (`Waves 1–19`) |
+| **Flag-Free Language Models** | `GeminiPackedComplexRoPEGPT` (`Wave 37` standalone pure-complex), `LevelSeparatedWaveletConvGPT` (`Waves 32–36`), `ParsevalMuPSubspaceCoincidenceGPT` (`Wave 31`), `ParsevalMuPNGramSpeedrunGPT` (`Waves 29–30`), `ParsevalMuPDyadicGPT` (`Wave 28`) | `from qdlblocks.models import GeminiPackedComplexRoPEGPT, LevelSeparatedWaveletConvGPT, ParsevalMuPSubspaceCoincidenceGPT, ParsevalMuPNGramSpeedrunGPT, ParsevalMuPDyadicGPT` ([`gemini_packed_complex_rope_gpt.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/gemini_packed_complex_rope_gpt.py), [`level_separated_wavelet_conv_gpt.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/level_separated_wavelet_conv_gpt.py)) | **CANONICAL (`Waves 28–37`)** | `Radical2Pow16WaveletCholeskyGPT` (frozen `Waves 20–27` baseline) & `QuantumBornGPT` (`Waves 1–19`) |
 | **Fast-Loop Vision Ablation Lab** | `WaveletCholeskyVisionClassifier`, `TiedDyadicWaveletClassPyramid`, `load_or_download_imagenet1k_32x32` | `from qdlblocks.models import WaveletCholeskyVisionClassifier` ([`wavelet_cholesky_vision.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/wavelet_cholesky_vision.py)) | **CANONICAL (`~11s`/run)** | Slow multi-hour language runs for initial readout/layer screening |
 | **Riemannian Stiefel Optimizer** | `StiefelMuon` (`polar_express`, `stiefel_penalty=0.02`, `use_normuon=True`, `use_twin_rail=True`, routes both 3D `kraus_generators` and 2D backbone projections) | `from qdlblocks.optim import StiefelMuon` ([`muon.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/optim/muon.py)) | **CANONICAL (`Wave 34`)** | Hard periodic QR snapping or routing `kraus_generators` / 2D `qkv_proj` to Euclidean `AdamW` |
 | **Experiment Logger & WebUI Ingestor** | `StandardizedExperimentLogger`, `ExperimentIntentSpec`, `ingest_all_waves_and_verifications` | `from qdlblocks.benchmarks import StandardizedExperimentLogger, ExperimentIntentSpec` ([`experiment_logger.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/experiment_logger.py)) | **CANONICAL (`Plan 044`)** | Ad-hoc unparsed JSON dumps without `[EXPERIMENT_INTENT]` or `ModelCard v1.0` |
@@ -118,6 +119,24 @@ Writing custom GPU kernels inside a single `examples/XX_*.py` script prevents re
   from qdlblocks.layers import MultiRateWavefunctionConvBank, WaveletScaleState
   ```
 
+### 3.6 Packed Complex Register Density Attention & Associative V-Space Krylov Probe (`packed_complex_register_density_attn.py` — `Wave 37` / `EXPERIMENT_PLAN_052.md`)
+- **When to Use It**: Whenever operating on pure complex Hilbert space registers $|\psi_{b,h,t}\rangle \in \mathbb{C}^{d_h}$ ($d_h = 32$) where context is accumulated as a Hermitian density operator $\rho_t = \sum_{s \le t} w_{ts} |v_s\rangle\langle v_s| \in \mathbb{C}^{32 \times 32}$ and purified via McWeeny purification $\rho_t^{\text{purified}} = \rho_t^2 / \operatorname{Tr}(\rho_t^2)$.
+- **Why It Was Built (`EXPERIMENT_PLAN_052.md` — Refinements 1, 3, & 4)**:
+  1. **Refinement 1 (Translation-Equivariant `ComplexRoPE` on $Q, K$ Only)**: Rotates $Q$ and $K$ across all 32 complex frequencies while keeping $V$ and the probe in position-invariant content space (`max_rope_shift_err < 3.8e-8`).
+  2. **Refinement 3 (Single-Pass `torch.where` 1-GEMM Hermitian + Ket Packing & $O(d_h^2)$ Associative Krylov Evaluation)**: Packs upper-triangular symmetric $\rho_{\text{re}}$, strict-lower-triangular skew-symmetric $\rho_{\text{im}}$, and ket $[v_{\text{re}}, v_{\text{im}}]$ (`width = 1088` at $d_h = 32$) into a single `torch.matmul(w_ts, packed_v)` and evaluates $\rho_t(\rho_t |\bar{v}_t\rangle) / (\|\rho_{\text{re},t}\|_F^2 + \|\rho_{\text{im},t}\|_F^2 + \varepsilon)$ in two $O(d_h^2)$ matrix-vector products (`16x` fewer purification FLOPs than explicit $O(d_h^3)$ matrix squaring, `< 7.5e-8` max error).
+  3. **Refinement 4 (`V-Space Krylov Probe` $|\bar{v}_t\rangle$)**: Probing $\rho_t^{\text{purified}}$ with the V-space first-moment anchor $|\bar{v}_t\rangle = \operatorname{normalize}_{\mathbb{C}}(\sum_{s \le t} w_{ts} |v_s\rangle)$ instead of $|q_t\rangle$ eliminates Step-0 $W_Q \perp W_V$ random phase scrambling (`6.45x` higher Step-0 probe norm, `-0.0503` nats / `-28.0` PPL better on `FineWeb-Edu`).
+- **Usage**:
+  ```python
+  from qdlblocks.layers import (
+      ComplexLinear,
+      ComplexRoPE,
+      PackedComplexRegisterDensityAttention,
+      krylov_purified_density_probe,
+      pack_hermitian_outer_product_and_ket,
+      unpack_hermitian_matrix,
+  )
+  ```
+
 ---
 
 ## 4. Reference Architectures & Dyadic Pyramids (`src/qdlblocks/models/`)
@@ -172,6 +191,18 @@ Writing custom GPU kernels inside a single `examples/XX_*.py` script prevents re
       build_level_separated_wavelet_conv_optimizers,
       initialize_level_separated_wavelet_conv_with_ppmi_svd,
       synthesize_level_separated_wavelet_state,
+  )
+  ```
+
+### 4.6 Standalone Pure-Complex Register Density GPT (`gemini_packed_complex_rope_gpt.py` — `Wave 37` / `EXPERIMENT_PLAN_052.md`)
+- **What It Is**: Standalone pure-complex autoregressive language model operating on $H$ quantum registers of dimension $d_h = 32$ complex amplitudes ($\mathbb{C}^{d_{\text{complex}}}$) with `PackedComplexRegisterDensityAttention` (`V-Space Krylov Probe`, Refinements 1, 3, & 4), `ComplexUnitaryInterferenceFFN`, and token-chunked complex Born readout. On `FineWeb-Edu` (`300` steps / `2.46M` tokens at $d_{\text{complex}} = 128, H = 4, d_h = 32 \implies 256$ real DoF/token, $L = 6$), `GeminiPackedComplexRoPEGPT` (`v_krylov`) reached **`6.2951` Val CE (`541.89` PPL)**, beating both the original `Q-Probe` (`6.3454` Val CE, `-0.0503` nats) and `Wave 36` `Option 2` (`6.3157` Val CE, `-0.0206` nats).
+- **Minimal Usage**:
+  ```python
+  from qdlblocks.models import (
+      GeminiPackedComplexRoPEConfig,
+      GeminiPackedComplexRoPEGPT,
+      build_gemini_complex_optimizers,
+      initialize_gemini_complex_gpt_with_ppmi_svd,
   )
   ```
 

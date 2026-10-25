@@ -56,3 +56,28 @@ In `Wave 35` ([`EXPERIMENT_PLAN_050.md`](file:///home/festivity/agy/QuantumDLBlo
    - [`scripts/sync_waves_to_webui.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/sync_waves_to_webui.py)
 2. **Verification Runner Built**:
    - [`examples/61_verify_plan051_pure_neural_ngram_ablation.py`](file:///home/festivity/agy/QuantumDLBlocks/examples/61_verify_plan051_pure_neural_ngram_ablation.py)
+
+---
+
+## 6. Empirical Results, Telemetry & Post-Mortem Analysis (`Wave 36`)
+
+### 6.1 `H1` Audit: Train/Eval Parity & Fast Startup Without `_kn_state`
+- With `_kn_state = None` (`disable_kn_lookup()` in Option 1, `disable_projector()` in Option 2), chunked training CE and full evaluation logit CE matched within `5.79e-03` (Option 1) and `6.88e-03` (Option 2) under `bfloat16` autocast (`< 1` ULP of `bfloat16` machine epsilon `7.81e-03`) across $\tau \in \{0.0, 0.5, 1.0\}$, and `d = 256` initialization completed in **`9.5–10.7s`**.
+
+### 6.2 `H2` Pure-Neural Head-to-Head Matrix (`300` Steps / `2.46M` Tokens, `_kn_state = None`)
+
+| Run Key | Width / Mode | Option | Active Params (`N-Gram`) | Step `0` Val CE | Step `300` Train CE | **Step `300` Val CE** | **Step `300` Top-1** | `Sub8192 R_s` | `Fine65536 R_s` | Peak VRAM | Speed |
+| :--- | :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `w36_opt1_diff_ngram_d256_L6_300steps` | `d=256, L=6` | **Option 1** (`Diff N-Gram`) | `24.42M` (`12.60M`) | `8.3644` | `5.5081` | `6.3481` | `16.29%` | `51.8` | `41.5` | `6,673 MiB` | `12,157 tok/s` |
+| **`w36_opt2_no_ngram_d256_L6_300steps`** | **`d=256, L=6`** | **Option 2 (`No N-Gram`)** | **`11.82M` (`0.00M`)** | `8.4713` | `5.7986` | **`6.3157` (`-0.0324`)** | `15.28%` | **`52.7`** | `38.9` | **`6,553 MiB`** | **`12,260 tok/s`** |
+| `w36_opt1_diff_ngram_d1024_L6_mode_b_300steps` | `d=1024, L=6` (`Mode B`) | **Option 1** (`Diff N-Gram`) | `119.95M` (`12.65M`) | `8.1652` | `5.3569` | `6.5200` | `15.21%` | `185.8` | `156.1` | `9,364 MiB` | `5,168 tok/s` |
+| **`w36_opt2_no_ngram_d1024_L6_mode_b_300steps`** | **`d=1024, L=6` (`Mode B`)** | **Option 2 (`No N-Gram`)** | **`107.30M` (`0.00M`)** | `8.2746` | `5.8149` | **`6.3567` (`-0.1633`)** | **`15.55%`** | **`192.9`** | **`156.3`** | **`9,233 MiB`** | **`5,180 tok/s`** |
+
+### 6.3 Key Architectural Conclusions
+1. **Option 2 (`No N-Gram At All`) Wins Decisively at Both `d = 256` and `d = 1024`**:
+   - At `d = 256, L = 6`, dropping `HashedSurfaceNGramProjector` completely (**Option 2**) cut parameter count by **`-51.6%` (`24.42M -> 11.82M`)** and improved validation CE by **`-0.0324` nats (`6.3157` vs. `6.3481`)**.
+   - At `d = 1024, L = 6` Mode B, dropping `HashedSurfaceNGramProjector` (**Option 2**) cut `12.65M` parameters (`119.95M -> 107.30M`), saved `131 MiB` of VRAM (`9,233 MiB`), improved validation CE by **`-0.1633` nats (`6.3567` vs. `6.5200`)**, and improved Top-1 accuracy (`15.55%` vs. `15.21%`)!
+2. **Why Option 1 Hurt Generalization**:
+   - The `12.65M` unregularized `(65536, 64)` surface hash-bucket parameters (`unigram_table, bigram_table, trigram_table`) rapidly memorized training-set bucket transitions (`train_ce = 5.36` vs. `val_ce = 6.52` at `d = 1024`, a `1.16`-nat overfitting gap!) and starved the quantum backbone and wavelet pyramid of gradient signal during early steps.
+   - Without `HashedSurfaceNGramProjector`, the per-layer [`MultiRateWavefunctionConvBank`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/multirate_wavefunction_conv.py) (`(4, 2, 1, 1)`) and [`SubspaceProjectorBornAttention`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/attention.py) learn clean, generalizable representations with higher wavelet subspace participation (`Sub8192 R_s = 192.9`, `Fine65536 R_s = 156.3`).
+
