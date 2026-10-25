@@ -1,0 +1,1200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>QuantumBornGPT — Interactive Geometric & Decision-Boundary Playground</title>
+<style>
+  :root {
+    --bg: #0b0f19;
+    --panel: #131a2a;
+    --panel-alt: #192236;
+    --border: #26324d;
+    --text: #e6edf7;
+    --muted: #8ea0c0;
+    --accent: #38bdf8;
+    --accent-2: #a855f7;
+    --good: #22c55e;
+    --warn: #f59e0b;
+    --bad: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+    line-height: 1.45;
+  }
+  header {
+    padding: 16px 24px;
+    background: linear-gradient(90deg, #0f172a 0%, #172036 100%);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+  }
+  header h1 {
+    margin: 0;
+    font-size: 1.2rem;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  header .subtitle {
+    color: var(--muted);
+    font-size: 0.84rem;
+  }
+  .toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  button {
+    background: var(--panel-alt);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 12px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+  button:hover {
+    border-color: var(--accent);
+    background: #1f2b44;
+  }
+  button.active, button.primary {
+    background: #0284c7;
+    border-color: var(--accent);
+    color: #fff;
+  }
+  button.primary.running {
+    background: #d97706;
+    border-color: #fbbf24;
+  }
+  .container {
+    max-width: 1480px;
+    margin: 0 auto;
+    padding: 16px 20px 32px;
+    display: grid;
+    grid-template-columns: 330px 1fr 410px;
+    gap: 16px;
+  }
+  @media (max-width: 1200px) {
+    .container { grid-template-columns: 1fr; }
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .card-title {
+    font-size: 0.85rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    font-weight: 700;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .btn-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+  }
+  .btn-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .btn-stack button {
+    text-align: left;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .badge {
+    font-size: 0.7rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: rgba(56, 189, 248, 0.14);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .badge.warn {
+    background: rgba(245, 158, 11, 0.16);
+    color: #fbbf24;
+  }
+  .badge.good {
+    background: rgba(34, 197, 94, 0.16);
+    color: #4ade80;
+  }
+  .slider-group {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .slider-header {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.8rem;
+  }
+  .slider-header span.val {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--accent);
+    font-weight: 700;
+  }
+  input[type="range"] {
+    width: 100%;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  .metrics-bar {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+  }
+  .metric-box {
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  .metric-box .label {
+    font-size: 0.72rem;
+    color: var(--muted);
+  }
+  .metric-box .value {
+    font-size: 1.08rem;
+    font-weight: 700;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    margin-top: 2px;
+  }
+  .canvas-wrap {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+  canvas {
+    background: #080c14;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    width: 100%;
+    height: auto;
+    cursor: crosshair;
+  }
+  .legend {
+    display: flex;
+    gap: 14px;
+    font-size: 0.78rem;
+    color: var(--muted);
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .swatch {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    display: inline-block;
+  }
+  .insight-box {
+    background: rgba(56, 189, 248, 0.07);
+    border-left: 3px solid var(--accent);
+    padding: 10px 12px;
+    border-radius: 4px;
+    font-size: 0.81rem;
+    color: #d1def2;
+  }
+  .hover-readout {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.77rem;
+    background: var(--panel-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>QuantumBornGPT — Interactive Decision-Boundary & Bloch-Sphere Playground</h1>
+    <div class="subtitle">Explore why single rank-1 detectors are restricted to spherical caps, and how Two-Beam Phase Interference + Multi-Mode Concept POVMs unlock arbitrary topologies.</div>
+  </div>
+  <div class="toolbar">
+    <button id="btnPlay" class="primary">&#9654; Train / Optimize (60 FPS)</button>
+    <button id="btnStep20">Step +25</button>
+    <button id="btnReset">Reset / Re-Init Weights</button>
+    <span id="stepCounter" style="font-family:monospace; font-size:0.85rem; color:var(--accent); margin-left:6px;">Step: 0</span>
+  </div>
+</header>
+
+<div class="container">
+  <!-- LEFT COLUMN: CONTROLS -->
+  <div class="card">
+    <div class="card-title">1. Dataset Topology</div>
+    <div class="btn-stack" id="datasetButtons">
+      <button data-ds="iris" class="active">
+        <span>Fisher's Iris (Petal L vs W)</span>
+        <span class="badge">Collinear Ray</span>
+      </button>
+      <button data-ds="rings">
+        <span>Circle in a Ring (Shells)</span>
+        <span class="badge">Pure Radial</span>
+      </button>
+      <button data-ds="spirals">
+        <span>Two Interleaved Spirals</span>
+        <span class="badge warn">High Winding</span>
+      </button>
+      <button data-ds="xor">
+        <span>XOR / 4-Quadrant Polysemy</span>
+        <span class="badge warn">Disconnected</span>
+      </button>
+      <button data-ds="gaussians">
+        <span>Overlapping Gaussians</span>
+        <span class="badge">Calibration / ECE</span>
+      </button>
+    </div>
+
+    <div class="card-title" style="margin-top:6px;">2. Quantum / Classical Architecture</div>
+    <div class="btn-stack" id="archButtons">
+      <button data-arch="naive">
+        <span>1. Naive Pure-State Born (S¹ L2)</span>
+        <span class="badge warn">Erases ||x||</span>
+      </button>
+      <button data-arch="stereo1">
+        <span>2. 1-Layer Stereographic (Rank-1 Cap)</span>
+        <span class="badge warn">1 Circle Only</span>
+      </button>
+      <button data-arch="twobeam">
+        <span>3. Stereographic Two-Beam k-Boson</span>
+        <span class="badge">Wave 16/18</span>
+      </button>
+      <button data-arch="multimode" class="active">
+        <span>4. Multi-Mode Concept POVM + 2-Beam</span>
+        <span class="badge good">Unrestricted!</span>
+      </button>
+      <button data-arch="mlp">
+        <span>5. Classical 2-Layer SiLU MLP</span>
+        <span class="badge">Softmax Baseline</span>
+      </button>
+    </div>
+
+    <div class="card-title" style="margin-top:6px;">3. Quantum Geometric Hyperparameters</div>
+
+    <div class="slider-group">
+      <div class="slider-header">
+        <span>Stereographic Radius (&tau;<sub>stereo</sub>)</span>
+        <span class="val" id="valTau">1.10</span>
+      </div>
+      <input type="range" id="sliderTau" min="0.20" max="2.80" step="0.05" value="1.10" />
+    </div>
+
+    <div class="slider-group">
+      <div class="slider-header">
+        <span>Two-Beam Phase Freq (&omega;<sub>phase</sub>)</span>
+        <span class="val" id="valOmega">1.80</span>
+      </div>
+      <input type="range" id="sliderOmega" min="0.00" max="4.00" step="0.05" value="1.80" />
+    </div>
+
+    <div class="slider-group">
+      <div class="slider-header">
+        <span>k-Boson Exponent (k<sub>eff</sub>)</span>
+        <span class="val" id="valK">18.0</span>
+      </div>
+      <input type="range" id="sliderK" min="2.0" max="40.0" step="0.5" value="18.0" />
+    </div>
+
+    <div class="slider-group">
+      <div class="slider-header">
+        <span>Diffuse Kraus Bath (&lambda;<sub>diff</sub>)</span>
+        <span class="val" id="valLam">0.18</span>
+      </div>
+      <input type="range" id="sliderLam" min="0.00" max="0.50" step="0.01" value="0.18" />
+    </div>
+
+    <div class="slider-group">
+      <div class="slider-header">
+        <span>Concept Prototypes / Frame Dim (M)</span>
+        <span class="val" id="valModes">16</span>
+      </div>
+      <input type="range" id="sliderModes" min="4" max="24" step="4" value="16" />
+    </div>
+
+    <div class="insight-box" id="archInsight"></div>
+  </div>
+
+  <!-- CENTER COLUMN: 2D DECISION BOUNDARY & METRICS -->
+  <div class="card">
+    <div class="metrics-bar">
+      <div class="metric-box">
+        <div class="label">Val Cross-Entropy</div>
+        <div class="value" id="mCE">0.000</div>
+      </div>
+      <div class="metric-box">
+        <div class="label">Top-1 Accuracy</div>
+        <div class="value" id="mAcc">0.0%</div>
+      </div>
+      <div class="metric-box">
+        <div class="label">Calibration (ECE)</div>
+        <div class="value" id="mECE">0.000</div>
+      </div>
+      <div class="metric-box">
+        <div class="label">Beam Ortho |&langle;&psi;₁,&psi;₂&rangle;|</div>
+        <div class="value" id="mOrtho">0.00e+0</div>
+      </div>
+      <div class="metric-box">
+        <div class="label">Mean Hit Prob p̄<sub>hit</sub></div>
+        <div class="value" id="mHitP">0.000</div>
+      </div>
+    </div>
+
+    <div class="canvas-wrap">
+      <canvas id="boundaryCanvas" width="560" height="520"></canvas>
+      <div class="legend">
+        <div class="legend-item"><span class="swatch" style="background:#38bdf8;"></span>Class 0 (Setosa / Inner / Spiral A)</div>
+        <div class="legend-item"><span class="swatch" style="background:#f97316;"></span>Class 1 (Versicolor / Outer / Spiral B)</div>
+        <div class="legend-item"><span class="swatch" style="background:#a855f7;"></span>Class 2 (Virginica / Cluster C)</div>
+        <div class="legend-item"><span class="swatch" style="border:2px solid #ef4444; background:transparent;"></span>Misclassified Sample</div>
+      </div>
+    </div>
+
+    <div class="hover-readout" id="hoverInfo">
+      Hover over any point in the 2D feature plane to inspect its stereographic S² ket &psi;(x), class probabilities P(c|x), and NLL contribution.
+    </div>
+  </div>
+
+  <!-- RIGHT COLUMN: 3D STEREOGRAPHIC BLOCH SPHERE & LOSS HISTORY -->
+  <div class="card">
+    <div class="card-title">
+      <span>Stereographic S² Lift & Detector Cones</span>
+      <span style="font-size:0.72rem; color:var(--accent);">Drag Sphere to Rotate 3D</span>
+    </div>
+    <canvas id="sphereCanvas" width="380" height="340"></canvas>
+
+    <div class="card-title" style="margin-top:4px;">
+      <span>Live Optimization Trajectory (Val CE Nats)</span>
+      <span id="lossMinLabel" style="font-family:monospace; color:var(--good); font-size:0.76rem;">Best: --</span>
+    </div>
+    <canvas id="lossCanvas" width="380" height="150"></canvas>
+
+    <div class="insight-box" id="geometryNote">
+      <strong>Why Single-Cap Models Look Restricted:</strong> In <em>2. 1-Layer Stereographic</em>, each class only has a single unit detector M<sub>c</sub> &in; S². A plane cutting S² projects back to R² as a <strong>single circle</strong>. Switching to <em>4. Multi-Mode Concept POVM + 2-Beam</em> computes quadratic fidelities |&langle;H<sub>m</sub>|&psi;&rangle;|<sub>+</sub>² across M prototype cones before pooling, unlocking multi-lobed and spiral boundaries!
+    </div>
+  </div>
+</div>
+
+<script>
+// ============================================================================
+// 1. DETERMINISTIC PRNG & DATASET GENERATORS
+// ============================================================================
+function mulberry32(a) {
+  return function() {
+    let t = a += 0x6D2B79F5;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function randn(rng) {
+  let u = 0, v = 0;
+  while (u === 0) u = rng();
+  while (v === 0) v = rng();
+  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+function generateDataset(type) {
+  const rng = mulberry32(1337);
+  const pts = [];
+  if (type === "iris") {
+    // Fisher's Iris standardized Petal Length (x1) vs Petal Width (x2)
+    // Setosa: (-1.30, -1.25), Versicolor: (0.28, 0.16), Virginica: (1.03, 1.09) along same positive ray!
+    const centers = [
+      { x: -1.30, y: -1.22, sx: 0.16, sy: 0.15, c: 0, n: 45 },
+      { x: 0.28,  y: 0.22,  sx: 0.26, sy: 0.22, c: 1, n: 48 },
+      { x: 1.08,  y: 1.02,  sx: 0.30, sy: 0.28, c: 2, n: 48 }
+    ];
+    for (const g of centers) {
+      for (let i = 0; i < g.n; i++) {
+        const z1 = randn(rng), z2 = randn(rng);
+        pts.push({
+          x: g.x + z1 * g.sx + 0.08 * z2,
+          y: g.y + z2 * g.sy + 0.08 * z1,
+          c: g.c
+        });
+      }
+    }
+    return { pts, numClasses: 3 };
+  }
+  if (type === "rings") {
+    for (let i = 0; i < 70; i++) {
+      const r = Math.max(0.08, 0.55 + randn(rng) * 0.14);
+      const th = rng() * Math.PI * 2;
+      pts.push({ x: r * Math.cos(th), y: r * Math.sin(th), c: 0 });
+    }
+    for (let i = 0; i < 90; i++) {
+      const r = 1.65 + randn(rng) * 0.16;
+      const th = rng() * Math.PI * 2;
+      pts.push({ x: r * Math.cos(th), y: r * Math.sin(th), c: 1 });
+    }
+    return { pts, numClasses: 2 };
+  }
+  if (type === "spirals") {
+    const N = 80;
+    for (let i = 0; i < N; i++) {
+      const t = 0.45 + (i / (N - 1)) * 2.55 * Math.PI;
+      const r = 0.23 * t;
+      const n1 = randn(rng) * 0.07, n2 = randn(rng) * 0.07;
+      pts.push({ x:  r * Math.cos(t) + n1, y:  r * Math.sin(t) + n2, c: 0 });
+      pts.push({ x: -r * Math.cos(t) - n1, y: -r * Math.sin(t) - n2, c: 1 });
+    }
+    return { pts, numClasses: 2 };
+  }
+  if (type === "xor") {
+    // 4-Quadrant Disconnected Polysemy: Class 0 in (+,+) and (-,-); Class 1 in (-,+) and (+,-)
+    const quads = [
+      { x:  1.1, y:  1.1, c: 0 },
+      { x: -1.1, y: -1.1, c: 0 },
+      { x: -1.1, y:  1.1, c: 1 },
+      { x:  1.1, y: -1.1, c: 1 }
+    ];
+    for (const q of quads) {
+      for (let i = 0; i < 36; i++) {
+        pts.push({
+          x: q.x + randn(rng) * 0.32,
+          y: q.y + randn(rng) * 0.32,
+          c: q.c
+        });
+      }
+    }
+    return { pts, numClasses: 2 };
+  }
+  // Overlapping Gaussians (3 classes)
+  const g3 = [
+    { x: -0.95, y:  0.70, c: 0 },
+    { x:  0.95, y:  0.70, c: 1 },
+    { x:  0.00, y: -0.95, c: 2 }
+  ];
+  for (const g of g3) {
+    for (let i = 0; i < 50; i++) {
+      pts.push({
+        x: g.x + randn(rng) * 0.56,
+        y: g.y + randn(rng) * 0.56,
+        c: g.c
+      });
+    }
+  }
+  return { pts, numClasses: 3 };
+}
+
+// ============================================================================
+// 2. QUANTUM & CLASSICAL MODEL STATE AND FORWARD EVALUATOR
+// ============================================================================
+const state = {
+  datasetType: "iris",
+  arch: "multimode",
+  tau: 1.10,
+  omega: 1.80,
+  kBoson: 18.0,
+  lamDiff: 0.18,
+  numModes: 16,
+  step: 0,
+  playing: false,
+  lossHistory: [],
+  bestCE: Infinity,
+  rotYaw: -0.65,
+  rotPitch: 0.42,
+  hoverPt: null
+};
+
+let dataset = generateDataset(state.datasetType);
+let params = {};
+
+function initModelParams() {
+  const rng = mulberry32(42 + state.numModes * 7);
+  const M = state.numModes;
+  const C = dataset.numClasses;
+
+  // Stereographic S^2 prototypes H_m (M unit vectors in R^3) + Two-Beam frame vectors U1, U2 in R^3
+  const H = [];
+  const U1 = [];
+  const U2 = [];
+  const phi = [];
+  for (let m = 0; m < M; m++) {
+    // Spread prototypes evenly across the northern hemisphere of S^2 using a Fibonacci spiral
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    const z = 0.15 + 0.82 * ((m + 0.5) / M);
+    const rad = Math.sqrt(Math.max(0.01, 1 - z * z));
+    const th = m * golden;
+    H.push([rad * Math.cos(th), rad * Math.sin(th), z]);
+
+    // Random orthogonal-ish frame directions in R^3
+    let u1 = [randn(rng), randn(rng), randn(rng)];
+    let n1 = Math.hypot(u1[0], u1[1], u1[2]) + 1e-8;
+    u1 = [u1[0]/n1, u1[1]/n1, u1[2]/n1];
+
+    // J_pair-inspired orthogonal partner
+    let u2 = [-u1[1], u1[0], u1[2] * 0.5 + randn(rng) * 0.3];
+    let n2 = Math.hypot(u2[0], u2[1], u2[2]) + 1e-8;
+    u2 = [u2[0]/n2, u2[1]/n2, u2[2]/n2];
+
+    U1.push(u1);
+    U2.push(u2);
+    phi.push((rng() - 0.5) * 1.5);
+  }
+
+  // Class detectors M_sharp (C x 3), M_diff (C x 3), and Concept Affinity matrix A (C x M)
+  const M_sharp = [];
+  const M_diff = [];
+  const A_concept = [];
+  const W_mlp = [];
+  const bias = new Array(C).fill(0);
+
+  for (let c = 0; c < C; c++) {
+    const ang = (c / C) * Math.PI * 2 + 0.4;
+    let ms = [Math.cos(ang) * 0.8, Math.sin(ang) * 0.8, 0.55];
+    let ns = Math.hypot(ms[0], ms[1], ms[2]);
+    M_sharp.push([ms[0]/ns, ms[1]/ns, ms[2]/ns]);
+
+    // J_pair orthogonal partner for diffuse detector
+    let md = [-ms[1]/ns, ms[0]/ns, ms[2]/ns];
+    M_diff.push(md);
+
+    const rowA = [];
+    const rowW = [];
+    for (let m = 0; m < M; m++) {
+      rowA.push((rng() - 0.5) * 0.4);
+      rowW.push((rng() - 0.5) * 0.6);
+    }
+    A_concept.push(rowA);
+    W_mlp.push(rowW);
+  }
+
+  // Fit initial prototype affinities A_concept & M_sharp using one fast Closed-Form Ridge / Centroid step
+  // so every dataset starts with a sensible Step-0 quantum alignment (mirroring PPMI-SVD init!)
+  params = { H, U1, U2, phi, M_sharp, M_diff, A_concept, W_mlp, bias };
+  warmStartClosedForm();
+  state.step = 0;
+  state.lossHistory = [];
+  state.bestCE = Infinity;
+  document.getElementById("stepCounter").textContent = "Step: 0";
+}
+
+function liftPoint(x, y, arch, tau) {
+  if (arch === "naive") {
+    // Naive L2 normalization in R^2: erases radial magnitude ||x||_2!
+    const norm = Math.hypot(x, y) + 1e-6;
+    return [x / norm, y / norm, 0.0];
+  }
+  // Stereographic Northern-Hemisphere Lift onto S^2 in R^3
+  const norm = Math.hypot(x, y, tau) + 1e-8;
+  return [x / norm, y / norm, tau / norm];
+}
+
+function dot3(a, b) {
+  return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+
+function norm3(v) {
+  const n = Math.hypot(v[0], v[1], v[2]) + 1e-8;
+  return [v[0]/n, v[1]/n, v[2]/n];
+}
+
+// Compute hidden quantum features + beams for a point (x, y)
+function computeQuantumFeatures(x, y) {
+  const psi0 = liftPoint(x, y, state.arch, state.tau);
+  const M = state.numModes;
+  const omega = state.omega;
+  const features = new Array(M);
+
+  // Accumulate 3D sharp & diffuse state vectors for BeamOrtho and S^2 visualization
+  let b1 = [0, 0, 0];
+  let b2 = [0, 0, 0];
+
+  for (let m = 0; m < M; m++) {
+    const z1 = dot3(psi0, params.U1[m]) * 1.732;
+    const z2 = dot3(psi0, params.U2[m]) * 1.732;
+    const dTheta = omega * (z1 - z2) + params.phi[m];
+
+    // Cosine / Sine Quadrature Phase Interference
+    const silu2 = z2 / (1 + Math.exp(-z2));
+    const silu1 = z1 / (1 + Math.exp(-z1));
+    const interf1 = (z1 * z1) * silu2 * (1 + 0.45 * Math.cos(dTheta));
+    const interf2 = (z2 * z2) * silu1 * (1 + 0.45 * Math.sin(dTheta));
+
+    for (let d = 0; d < 3; d++) {
+      b1[d] += interf1 * params.U1[m][d] + 0.35 * psi0[d];
+      b2[d] += interf2 * params.U2[m][d];
+    }
+
+    // Concept prototype fidelity on S^2 + phase interference modulation
+    const cProto = dot3(psi0, params.H[m]);
+    const posProto = Math.max(0, cProto);
+    const waveGate = 0.5 * (1 + Math.cos(omega * 1.6 * (x * params.U1[m][0] + y * params.U1[m][1]) + params.phi[m]));
+    features[m] = (posProto * posProto) * (0.45 + 0.55 * waveGate);
+  }
+
+  const psiSharp = norm3(b1);
+  // Exact Gram-Schmidt orthogonalization of Beam 2 against Beam 1
+  const proj = dot3(b2, psiSharp);
+  const b2Ortho = [
+    b2[0] - proj * psiSharp[0],
+    b2[1] - proj * psiSharp[1],
+    b2[2] - proj * psiSharp[2]
+  ];
+  const psiDiff = (state.arch === "stereo1" || state.arch === "naive")
+    ? norm3(b2) // Without Gram-Schmidt -> high collinearity!
+    : norm3(b2Ortho);
+
+  const beamOrtho = Math.abs(dot3(psiSharp, psiDiff));
+  return { psi0, psiSharp, psiDiff, features, beamOrtho };
+}
+
+function forwardPoint(x, y) {
+  const C = dataset.numClasses;
+  const k = state.kBoson;
+  const lam = state.lamDiff;
+  const qf = computeQuantumFeatures(x, y);
+  const logits = new Array(C);
+
+  for (let c = 0; c < C; c++) {
+    if (state.arch === "naive") {
+      // Trap 1 & 2: Pure S^1 L2 state + Antipodally symmetric |<M_c | psi0>|^2
+      const cosSharp = dot3(qf.psi0, [params.M_sharp[c][0], params.M_sharp[c][1], 0]);
+      const ampSq = cosSharp * cosSharp + 0.02;
+      logits[c] = (k * 0.35) * Math.log(ampSq) + params.bias[c];
+    } else if (state.arch === "stereo1") {
+      // Single-Beam 1-Layer Stereographic Born: strictly a single circular cap on S^2!
+      const cosSharp = dot3(qf.psi0, params.M_sharp[c]);
+      const fid = Math.max(1e-4, 0.5 * (1 + cosSharp));
+      logits[c] = k * Math.log(2.0 * fid) + params.bias[c];
+    } else if (state.arch === "twobeam") {
+      // Wave 16/18 Two-Beam k-Boson with Positive-Part Quadratic Kraus Fidelity
+      const cSharp = dot3(qf.psiSharp, params.M_sharp[c]);
+      const cDiff  = dot3(qf.psiDiff,  params.M_diff[c]);
+      const cPos   = Math.max(0, cDiff);
+      const fDiff  = cDiff + 0.5 * cPos * cPos;
+      // Add subtle 2-beam interference feature contribution
+      let featSum = 0;
+      for (let m = 0; m < state.numModes; m++) {
+        featSum += 0.18 * params.A_concept[c][m] * qf.features[m];
+      }
+      const z = Math.max(1e-4, 1.0 + 0.88 * cSharp + lam * fDiff + featSum);
+      logits[c] = k * Math.log(z) + params.bias[c];
+    } else if (state.arch === "multimode") {
+      // Multi-Mode Concept POVM + Two-Beam k-Boson:
+      // Evaluates non-linear concept fidelities f_m(x) = ReLU(<H_m|psi>)^2 FIRST, then pools!
+      const cSharp = dot3(qf.psiSharp, params.M_sharp[c]);
+      const cDiff  = dot3(qf.psiDiff,  params.M_diff[c]);
+      const cPos   = Math.max(0, cDiff);
+      let conceptFid = 0;
+      for (let m = 0; m < state.numModes; m++) {
+        conceptFid += params.A_concept[c][m] * qf.features[m];
+      }
+      const fSharp = 0.5 * (1 + cSharp);
+      const fDiff  = 0.5 * (1 + cDiff) + 0.5 * cPos * cPos;
+      const z = Math.max(1e-4, (1 - lam) * fSharp + lam * fDiff + conceptFid);
+      logits[c] = k * Math.log(2.0 * z) + params.bias[c];
+    } else {
+      // Classical 2-Layer SiLU MLP + Softmax
+      let sum = params.bias[c];
+      for (let m = 0; m < state.numModes; m++) {
+        const u = params.U1[m][0] * x + params.U1[m][1] * y + params.phi[m];
+        const silu = u / (1 + Math.exp(-u));
+        sum += params.W_mlp[c][m] * silu * 2.5;
+      }
+      logits[c] = sum;
+    }
+  }
+
+  // Stable Softmax
+  let maxL = -Infinity;
+  for (let c = 0; c < C; c++) if (logits[c] > maxL) maxL = logits[c];
+  let sumExp = 0;
+  const probs = new Array(C);
+  for (let c = 0; c < C; c++) {
+    probs[c] = Math.exp(logits[c] - maxL);
+    sumExp += probs[c];
+  }
+  let pred = 0;
+  for (let c = 0; c < C; c++) {
+    probs[c] /= sumExp;
+    if (probs[c] > probs[pred]) pred = c;
+  }
+  return { probs, pred, qf };
+}
+
+// Fast closed-form centroid/prototype alignment at Step 0 (analogous to PPMI-SVD init)
+function warmStartClosedForm() {
+  const C = dataset.numClasses;
+  const M = state.numModes;
+  const counts = new Array(C).fill(0);
+  const sumPsi = Array.from({ length: C }, () => [0, 0, 0]);
+  const sumFeat = Array.from({ length: C }, () => new Array(M).fill(0));
+  const meanFeat = new Array(M).fill(0);
+
+  for (const pt of dataset.pts) {
+    const qf = computeQuantumFeatures(pt.x, pt.y);
+    counts[pt.c]++;
+    for (let d = 0; d < 3; d++) sumPsi[pt.c][d] += qf.psi0[d];
+    for (let m = 0; m < M; m++) {
+      sumFeat[pt.c][m] += qf.features[m];
+      meanFeat[m] += qf.features[m] / dataset.pts.length;
+    }
+  }
+
+  for (let c = 0; c < C; c++) {
+    const cnt = Math.max(1, counts[c]);
+    params.M_sharp[c] = norm3(sumPsi[c]);
+    // Symplectic J_pair orthogonal partner for diffuse bath
+    params.M_diff[c] = norm3([-params.M_sharp[c][1], params.M_sharp[c][0], params.M_sharp[c][2] * 0.4]);
+    for (let m = 0; m < M; m++) {
+      const centered = (sumFeat[c][m] / cnt) - meanFeat[m];
+      params.A_concept[c][m] = centered * 2.2;
+      params.W_mlp[c][m] = centered * 2.8;
+    }
+  }
+}
+
+// ============================================================================
+// 3. ANALYTICAL GRADIENT STEP + STIEFEL RETRACTION (LIVE TRAINING LOOP)
+// ============================================================================
+function trainStep(numSteps = 1) {
+  const C = dataset.numClasses;
+  const M = state.numModes;
+  const N = dataset.pts.length;
+  const lrDetector = 0.045;
+  const lrConcept = 0.08;
+
+  for (let s = 0; s < numSteps; s++) {
+    const gMSharp = Array.from({ length: C }, () => [0, 0, 0]);
+    const gMDiff  = Array.from({ length: C }, () => [0, 0, 0]);
+    const gA      = Array.from({ length: C }, () => new Array(M).fill(0));
+    const gW      = Array.from({ length: C }, () => new Array(M).fill(0));
+    const gBias   = new Array(C).fill(0);
+
+    for (let i = 0; i < N; i++) {
+      const pt = dataset.pts[i];
+      const out = forwardPoint(pt.x, pt.y);
+      for (let c = 0; c < C; c++) {
+        const err = out.probs[c] - (pt.c === c ? 1.0 : 0.0); // dL / dLogit_c
+        gBias[c] += err / N;
+        const psiVec = (state.arch === "stereo1" || state.arch === "naive") ? out.qf.psi0 : out.qf.psiSharp;
+        for (let d = 0; d < 3; d++) {
+          gMSharp[c][d] += (err * psiVec[d]) / N;
+          gMDiff[c][d]  += (err * out.qf.psiDiff[d] * state.lamDiff) / N;
+        }
+        for (let m = 0; m < M; m++) {
+          gA[c][m] += (err * out.qf.features[m]) / N;
+          const u = params.U1[m][0] * pt.x + params.U1[m][1] * pt.y + params.phi[m];
+          const silu = u / (1 + Math.exp(-u));
+          gW[c][m] += (err * silu) / N;
+        }
+      }
+    }
+
+    // Apply Riemannian / Stiefel retraction on unit detectors + Concept affinity update
+    for (let c = 0; c < C; c++) {
+      params.bias[c] -= 0.03 * gBias[c];
+      for (let d = 0; d < 3; d++) {
+        params.M_sharp[c][d] -= lrDetector * gMSharp[c][d];
+        params.M_diff[c][d]  -= lrDetector * gMDiff[c][d];
+      }
+      params.M_sharp[c] = norm3(params.M_sharp[c]);
+      params.M_diff[c]  = norm3(params.M_diff[c]);
+
+      for (let m = 0; m < M; m++) {
+        params.A_concept[c][m] -= lrConcept * gA[c][m];
+        params.W_mlp[c][m]     -= lrConcept * gW[c][m];
+      }
+    }
+    state.step++;
+  }
+  document.getElementById("stepCounter").textContent = `Step: ${state.step}`;
+}
+
+// ============================================================================
+// 4. TELEMETRY & RENDERING ENGINE (2D BOUNDARY + 3D SPHERE + LOSS CHART)
+// ============================================================================
+const CLASS_RGB = [
+  [56, 189, 248],   // Class 0: Cyan-Blue
+  [249, 115, 22],   // Class 1: Orange
+  [168, 85, 247]    // Class 2: Purple
+];
+
+function computeDatasetMetrics() {
+  let totalCE = 0;
+  let hits = 0;
+  let sumHitProb = 0;
+  let sumBeamOrtho = 0;
+  const bins = Array.from({ length: 10 }, () => ({ conf: 0, acc: 0, n: 0 }));
+
+  for (const pt of dataset.pts) {
+    const out = forwardPoint(pt.x, pt.y);
+    const pTarget = Math.max(1e-7, out.probs[pt.c]);
+    totalCE += -Math.log(pTarget);
+    sumBeamOrtho += out.qf.beamOrtho;
+
+    const pMax = out.probs[out.pred];
+    const isHit = (out.pred === pt.c) ? 1 : 0;
+    if (isHit) {
+      hits++;
+      sumHitProb += pTarget;
+    }
+    const bIdx = Math.min(9, Math.floor(pMax * 10));
+    bins[bIdx].conf += pMax;
+    bins[bIdx].acc += isHit;
+    bins[bIdx].n++;
+  }
+
+  const N = dataset.pts.length;
+  const ce = totalCE / N;
+  const acc = (hits / N) * 100;
+  const meanHitP = hits > 0 ? (sumHitProb / hits) : 0;
+  const beamOrtho = sumBeamOrtho / N;
+
+  let ece = 0;
+  for (const b of bins) {
+    if (b.n > 0) {
+      ece += (b.n / N) * Math.abs((b.acc / b.n) - (b.conf / b.n));
+    }
+  }
+
+  if (ce < state.bestCE) state.bestCE = ce;
+  if (state.playing || state.lossHistory.length === 0) {
+    state.lossHistory.push(ce);
+    if (state.lossHistory.length > 160) state.lossHistory.shift();
+  }
+
+  document.getElementById("mCE").textContent = ce.toFixed(4);
+  document.getElementById("mAcc").textContent = acc.toFixed(1) + "%";
+  document.getElementById("mECE").textContent = ece.toFixed(4);
+  document.getElementById("mOrtho").textContent = beamOrtho < 1e-4 ? "0.00e+0" : beamOrtho.toFixed(3);
+  document.getElementById("mHitP").textContent = meanHitP.toFixed(3);
+  document.getElementById("lossMinLabel").textContent = `Best: ${state.bestCE.toFixed(4)} nats`;
+}
+
+function renderBoundaryCanvas() {
+  const canvas = document.getElementById("boundaryCanvas");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  const gridX = 88, gridY = 82;
+  const cellW = W / gridX, cellH = H / gridY;
+
+  for (let gy = 0; gy < gridY; gy++) {
+    const y = 2.35 - (gy + 0.5) / gridY * 4.7;
+    for (let gx = 0; gx < gridX; gx++) {
+      const x = -2.35 + (gx + 0.5) / gridX * 4.7;
+      const out = forwardPoint(x, y);
+      const rgb = CLASS_RGB[out.pred];
+      const pMax = out.probs[out.pred];
+      const baseChance = 1 / dataset.numClasses;
+      const conf = Math.max(0, Math.min(1, (pMax - baseChance) / (1 - baseChance)));
+
+      const r = Math.round(11 + (rgb[0] - 11) * (0.14 + 0.52 * conf));
+      const g = Math.round(15 + (rgb[1] - 15) * (0.14 + 0.52 * conf));
+      const b = Math.round(25 + (rgb[2] - 25) * (0.14 + 0.52 * conf));
+      ctx.fillStyle = `rgb(${r},${g},${b})`;
+      ctx.fillRect(gx * cellW, gy * cellH, Math.ceil(cellW), Math.ceil(cellH));
+    }
+  }
+
+  // Coordinate Axes
+  ctx.strokeStyle = "rgba(255,255,255,0.12)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, H / 2); ctx.lineTo(W, H / 2);
+  ctx.moveTo(W / 2, 0); ctx.lineTo(W / 2, H);
+  ctx.stroke();
+
+  // Draw Stereographic Reference Circle ||x||_2 = tau_stereo
+  if (state.arch !== "naive" && state.arch !== "mlp") {
+    const rPx = (state.tau / 4.7) * W;
+    ctx.save();
+    ctx.setLineDash([5, 5]);
+    ctx.strokeStyle = "rgba(56, 189, 248, 0.45)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(W / 2, H / 2, rPx, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Draw Data Points
+  for (const pt of dataset.pts) {
+    const px = ((pt.x + 2.35) / 4.7) * W;
+    const py = ((2.35 - pt.y) / 4.7) * H;
+    const out = forwardPoint(pt.x, pt.y);
+    const rgb = CLASS_RGB[pt.c];
+
+    if (out.pred !== pt.c) {
+      ctx.beginPath();
+      ctx.arc(px, py, 8.2, 0, Math.PI * 2);
+      ctx.strokeStyle = "#ef4444";
+      ctx.lineWidth = 2.2;
+      ctx.stroke();
+    }
+
+    ctx.beginPath();
+    ctx.arc(px, py, 4.8, 0, Math.PI * 2);
+    ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+    ctx.fill();
+    ctx.strokeStyle = "#0b0f19";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+  }
+}
+
+function project3D(v, W, H) {
+  const cy = Math.cos(state.rotYaw), sy = Math.sin(state.rotYaw);
+  const cp = Math.cos(state.rotPitch), sp = Math.sin(state.rotPitch);
+  // Rotate around Z (yaw), then X (pitch) so Z (tau_stereo pole) points upward
+  const x1 = v[0] * cy - v[1] * sy;
+  const y1 = v[0] * sy + v[1] * cy;
+  const z1 = v[2];
+  const y2 = y1 * cp - z1 * sp;
+  const z2 = y1 * sp + z1 * cp;
+  const scale = 128;
+  return {
+    x: W / 2 + x1 * scale,
+    y: H / 2 + 24 - z2 * scale,
+    depth: y2
+  };
+}
+
+function renderSphereCanvas() {
+  const canvas = document.getElementById("sphereCanvas");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  // Wireframe latitude rings on S^2
+  const lats = [0.0, 0.35, 0.70, 0.93];
+  for (const z of lats) {
+    const r = Math.sqrt(1 - z * z);
+    ctx.beginPath();
+    for (let i = 0; i <= 60; i++) {
+      const th = (i / 60) * Math.PI * 2;
+      const p = project3D([r * Math.cos(th), r * Math.sin(th), z], W, H);
+      if (i === 0) ctx.moveTo(p.x, p.y);
+      else ctx.lineTo(p.x, p.y);
+    }
+    ctx.strokeStyle = z === 0 ? "rgba(245, 158, 11, 0.40)" : "rgba(142, 160, 192, 0.18)";
+    ctx.lineWidth = z === 0 ? 1.5 : 1;
+    ctx.stroke();
+  }
+
+  // North Pole Axis ([0, 0, 1])
+  const pOrigin = project3D([0, 0, 0], W, H);
+  const pNorth  = project3D([0, 0, 1.12], W, H);
+  ctx.beginPath();
+  ctx.moveTo(pOrigin.x, pOrigin.y);
+  ctx.lineTo(pNorth.x, pNorth.y);
+  ctx.strokeStyle = "rgba(56, 189, 248, 0.5)";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.fillStyle = "#38bdf8";
+  ctx.font = "11px monospace";
+  ctx.fillText("Pole |0_stereo> (z=1)", pNorth.x - 52, pNorth.y - 6);
+
+  // Draw Class Detector Vectors M_sharp[c]
+  for (let c = 0; c < dataset.numClasses; c++) {
+    const m = state.arch === "naive"
+      ? norm3([params.M_sharp[c][0], params.M_sharp[c][1], 0])
+      : params.M_sharp[c];
+    const pm = project3D(m, W, H);
+    const rgb = CLASS_RGB[c];
+    ctx.beginPath();
+    ctx.moveTo(pOrigin.x, pOrigin.y);
+    ctx.lineTo(pm.x, pm.y);
+    ctx.strokeStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+    ctx.lineWidth = 2.6;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(pm.x, pm.y, 5.5, 0, Math.PI * 2);
+    ctx.fillStyle = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+    ctx.fill();
+    ctx.fillText(`M_${c}`, pm.x + 7, pm.y + 3);
+  }
+
+  // Project Lifted Dataset Kets psi0(x) onto S^2
+  for (const pt of dataset.pts) {
+    const psi0 = liftPoint(pt.x, pt.y, state.arch, state.tau);
+    const p = project3D(psi0, W, H);
+    const rgb = CLASS_RGB[pt.c];
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 3.3, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.88)`;
+    ctx.fill();
+  }
+}
+
+function renderLossCanvas() {
+  const canvas = document.getElementById("lossCanvas");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+
+  const hist = state.lossHistory;
+  if (hist.length < 2) return;
+
+  const maxV = Math.max(...hist, 0.4);
+  const minV = Math.min(...hist, 0.02);
+  const span = Math.max(0.05, maxV - minV);
+
+  ctx.strokeStyle = "rgba(255,255,255,0.08)";
+  ctx.beginPath();
+  ctx.moveTo(0, H * 0.5); ctx.lineTo(W, H * 0.5);
+  ctx.stroke();
+
+  ctx.beginPath();
+  for (let i = 0; i < hist.length; i++) {
+    const px = 12 + (i / (hist.length - 1)) * (W - 24);
+    const py = H - 14 - ((hist[i] - minV) / span) * (H - 28);
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.strokeStyle = "#38bdf8";
+  ctx.lineWidth = 2.2;
+  ctx.stroke();
+}
+
+function updateArchDescription() {
+  const box = document.getElementById("archInsight");
+  const map = {
+    naive: "<strong>1. Naive Pure-State Born (S¹ L2):</strong> Divides out radial norm ||x||₂ (collapsing all points onto the orange equator z=0 on the sphere) and uses |&langle;M<sub>c</sub>|&psi;&rangle;|². Fails on Iris Versicolor/Virginica and Concentric Rings.",
+    stereo1: "<strong>2. 1-Layer Stereographic (Single Cap):</strong> Preserves radial norm ||x||₂ as polar latitude on S², <em>but</em> each class only has a single unit detector vector M<sub>c</sub> &in; S²—restricting every decision region to a <strong>single circular cap</strong>! Try it on <em>Two Spirals</em> or <em>XOR</em> to see the geometric bottleneck.",
+    twobeam: "<strong>3. Stereographic Two-Beam k-Boson (Wave 16/18):</strong> Adds Gram-Schmidt orthogonal Beam 2 (&langle;&psi;₁,&psi;₂&rangle; = 0), quadrature cos/sin phase gates, and positive-part quadratic Kraus bath c<sub>diff</sub> + &frac12;ReLU(c<sub>diff</sub>)².",
+    multimode: "<strong>4. Multi-Mode Concept POVM + 2-Beam:</strong> Evaluates quadratic fidelities f<sub>m</sub>(x) = ReLU(&langle;H<sub>m</sub>|&psi;&rangle;)² across M=16 hemisphere prototypes <em>before</em> linear readout pooling. Breaks the single-cap bottleneck on Spirals and XOR!",
+    mlp: "<strong>5. Classical 2-Layer SiLU MLP:</strong> Unconstrained Euclidean hidden layer with Softmax readout."
+  };
+  box.innerHTML = map[state.arch];
+}
+
+function renderAll() {
+  computeDatasetMetrics();
+  renderBoundaryCanvas();
+  renderSphereCanvas();
+  renderLossCanvas();
+  updateArchDescription();
+}
+
+// ============================================================================
+// 5. UI EVENT WIRING & INTERACTIVE DRAG / HOVER
+// ============================================================================
+document.querySelectorAll("#datasetButtons button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#datasetButtons button").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    state.datasetType = btn.dataset.ds;
+    dataset = generateDataset(state.datasetType);
+    initModelParams();
+    renderAll();
+  });
+});
+
+document.querySelectorAll("#archButtons button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll("#archButtons button").forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    state.arch = btn.dataset.arch;
+    state.lossHistory = [];
+    state.bestCE = Infinity;
+    renderAll();
+  });
+});
+
+function bindSlider(id, valId, key, fmt = v => v.toFixed(2), reinit = false) {
+  const el = document.getElementById(id);
+  el.addEventListener("input", () => {
+    state[key] = parseFloat(el.value);
+    document.getElementById(valId).textContent = fmt(state[key]);
+    if (reinit) initModelParams();
+    else warmStartClosedForm();
+    renderAll();
+  });
+}
+bindSlider("sliderTau", "valTau", "tau");
+bindSlider("sliderOmega", "valOmega", "omega");
+bindSlider("sliderK", "valK", "kBoson", v => v.toFixed(1));
+bindSlider("sliderLam", "valLam", "lamDiff");
+bindSlider("sliderModes", "valModes", "numModes", v => v.toFixed(0), true);
+
+document.getElementById("btnPlay").addEventListener("click", () => {
+  state.playing = !state.playing;
+  const btn = document.getElementById("btnPlay");
+  btn.textContent = state.playing ? "⏸ Pause Optimization" : "▶ Train / Optimize (60 FPS)";
+  btn.classList.toggle("running", state.playing);
+});
+
+document.getElementById("btnStep20").addEventListener("click", () => {
+  trainStep(25);
+  renderAll();
+});
+
+document.getElementById("btnReset").addEventListener("click", () => {
+  initModelParams();
+  renderAll();
+});
+
+// Hover inspection on 2D boundary canvas
+const bCanvas = document.getElementById("boundaryCanvas");
+bCanvas.addEventListener("mousemove", e => {
+  const rect = bCanvas.getBoundingClientRect();
+  const x = -2.35 + ((e.clientX - rect.left) / rect.width) * 4.7;
+  const y =  2.35 - ((e.clientY - rect.top) / rect.height) * 4.7;
+  const out = forwardPoint(x, y);
+  const pStr = out.probs.map((p, idx) => `P(c=${idx})=${(p*100).toFixed(1)}%`).join(" | ");
+  const kStr = out.qf.psi0.map(v => v.toFixed(2)).join(", ");
+  document.getElementById("hoverInfo").textContent =
+    `Coord x=(${x.toFixed(2)}, ${y.toFixed(2)})  ||x||₂=${Math.hypot(x,y).toFixed(2)}  |  S² Ket ψ₀=[${kStr}]  |  ${pStr}`;
+});
+
+// 3D Sphere Drag Rotation
+const sCanvas = document.getElementById("sphereCanvas");
+let dragging = false, lastX = 0, lastY = 0;
+sCanvas.addEventListener("mousedown", e => { dragging = true; lastX = e.clientX; lastY = e.clientY; });
+window.addEventListener("mouseup", () => { dragging = false; });
+window.addEventListener("mousemove", e => {
+  if (!dragging) return;
+  state.rotYaw += (e.clientX - lastX) * 0.012;
+  state.rotPitch = Math.max(-1.2, Math.min(1.2, state.rotPitch + (e.clientY - lastY) * 0.012));
+  lastX = e.clientX; lastY = e.clientY;
+  renderSphereCanvas();
+});
+
+function animLoop() {
+  if (state.playing) {
+    trainStep(2);
+    renderAll();
+  }
+  requestAnimationFrame(animLoop);
+}
+
+initModelParams();
+renderAll();
+requestAnimationFrame(animLoop);
+</script>
+</body>
+</html>

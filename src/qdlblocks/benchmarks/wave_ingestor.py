@@ -47,7 +47,14 @@ WAVE_METADATA_W18_TO_W29: dict[str, tuple[int, str, str, str]] = {
     "W26": (26, "EXPERIMENT_PLAN_041", "Wave 26 (Plan 041: 15GB B=48 Fused FP8 Dyadic Hierarchical Convex-Peak Traceless Born)", "Tests 15GB B=48 (24,576 tok/step) Fused FP8 Dyadic Hierarchical Convex-Peak Traceless Born up to 44.24M tokens (4.8199 CE)."),
     "W27": (27, "EXPERIMENT_PLAN_042", "Wave 27 (Plan 042: Iso-Token Smaller-Batch Wider-Network d=384/512 Proportional Wavelet Scaling)", "Tests Iso-Token Smaller-Batch (B=16/24) Wider-Network (d=384/512, L=6) Proportional Wavelet Rank Scaling (4.7919 CE at 29.49M tok)."),
     "W28": (28, "EXPERIMENT_PLAN_043", "Wave 28 (Plan 043: Flag-Free Analytical Parseval muP Scaling beta_0(d)=c*sqrt(d) & Smith CLR)", "Tests Flag-Free Analytical Parseval muP Scaling beta_0(d)=1.48*sqrt(d) with zero legacy gates/clamps across d in {256, 384, 512}."),
-    "W29": (29, "EXPERIMENT_PLAN_044_045", "Wave 29 (Plan 044–045: Standardized Parseval muP Dyadic Wavelet-Cholesky Scaling)", "Tests Standardized Parseval muP Dyadic Wavelet-Cholesky Scaling with live StandardizedExperimentLogger telemetry."),
+    "W29": (29, "EXPERIMENT_PLAN_044_045", "Wave 29 (Plan 044–045: Standardized Parseval muP + Hashed Surface N-Gram + V^(0) Speedrun)", "Tests ParsevalMuPNGramSpeedrunGPT breaking <3.90 Val CE under 150M tokens with live StandardizedExperimentLogger telemetry."),
+    "W30": (30, "EXPERIMENT_PLAN_046", "Wave 30 (Plan 046: Live Sub-3.28 Demonstration at d=512, L=6 & 150M/900M Feasibility Study)", "Demonstrates full-depth d=512, L=6 ParsevalMuPNGramSpeedrunGPT scaling toward <3.28 Val CE by 900M tokens."),
+    "W31": (31, "EXPERIMENT_PLAN_046", "Wave 31 (Plan 046: Subspace-Projector Product-of-Spheres Coincidence Born Readout)", "Tests Product-of-Spheres M=4 subspace normalization and multi-subspace coincidence Born gating on FineWeb-Edu."),
+    "W32": (32, "EXPERIMENT_PLAN_047", "Wave 32 (Plan 047: Level-Separated Wavelet-Domain Convolution & Dyadic Subspace Coincidence GPT)", "Tests MultiRateWavefunctionConvBank (4,2,1,1) and LevelSeparatedWaveletConvGPT on FineWeb-Edu."),
+    "W33": (33, "EXPERIMENT_PLAN_048", "Wave 33 (Plan 048: Progress-Ramped Coincidence Warmup & Per-Layer Pre-Attention Multi-Rate Wavelet Conv GPT)", "Tests progress-ramped coincidence scheduling gamma_c(tau)=0.22*tau and per-layer PreAttnMultiRateWaveletConvBlock on FineWeb-Edu."),
+    "W34": (34, "EXPERIMENT_PLAN_049", "Wave 34 (Plan 049: True Dyadic CE Floor, StiefelMuon + Parseval muP Restoration, & d=1024 Max-Width Scaling)", "Restores symplectic StiefelMuon + Parseval muP + causal N-gram + 50,257-way M=4 coincidence and scales width d from 256 to 1024 on 16 GB VRAM."),
+    "W35": (35, "EXPERIMENT_PLAN_050", "Wave 35 (Plan 050: Long-Horizon d=1024 Mode B Single-Synthesis Step Caching & 900M-Token Scaling)", "Evaluates d=1024, L=6 (119.99M params) in Mode B (B_micro=8, grad_accum=2) over 1,800 steps (14.75M tok) and projects 900M-token trajectory."),
+    "W36": (36, "EXPERIMENT_PLAN_051", "Wave 36 (Plan 051: Pure-Neural Head-to-Head N-Gram Ablation — Differentiable Surface N-Gram vs. Pure Wavelet-Conv Without Static Kneser-Ney Lookup)", "Compares Option 1 (differentiable HashedSurfaceNGramProjector.forward only, _kn_state=None) vs. Option 2 (no HashedSurfaceNGramProjector at all) across d=256 and d=1024 Mode B."),
 }
 
 
@@ -62,7 +69,7 @@ def infer_task_domain(run_key: str, raw_data: dict[str, Any] | None = None) -> s
         return "vision_ablation"
     if rk_low.startswith(("verify", "micro_", "plan0", "h1_", "h2_", "h3_")):
         return "micro_verification"
-    if rk_low.startswith(tuple(f"w{n}_" for n in range(18, 30))):
+    if rk_low.startswith(tuple(f"w{n}_" for n in range(18, 100))):
         return "fineweb_edu_local"
     tok_m = float((raw_data or {}).get("target_tokens_M") or (raw_data or {}).get("total_tokens_M") or 0.0)
     if 0.0 < tok_m < 50.0:
@@ -506,7 +513,7 @@ def ingest_all_waves_and_verifications(
     backfill_micro_verifications(active_db, cache_dir=cdir, model_cards_dir=mdir)
 
     candidate_keys: set[str] = set()
-    w18_29_prefixes = tuple(f"w{n}_" for n in range(18, 30)) + ("verify", "micro_", "plan0")
+    w18_29_prefixes = tuple(f"w{n}_" for n in range(18, 100)) + ("verify", "micro_", "plan0")
     for mc_file in sorted(mdir.glob("*.json")):
         if mc_file.stem.lower().startswith(w18_29_prefixes):
             candidate_keys.add(mc_file.stem)

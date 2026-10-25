@@ -128,6 +128,21 @@ from .parseval_mup_chunked_ce import (
     eval_parseval_mup_full_logits,
     parseval_mup_dyadic_chunked_ce,
 )
+from .subspace_coincidence_born import (
+    SubspaceCoincidenceSpec,
+    blend_subspace_l2_normalize,
+    compute_coarse_cluster_centers,
+    compute_multi_subspace_coincidence_observable,
+    compute_subspace_cosines,
+    eval_subspace_coincidence_full_logits,
+    strided_subspace_l2_normalize,
+    subspace_coincidence_dyadic_chunked_ce,
+    subspace_l2_normalize,
+)
+from .multirate_wavefunction_conv import (
+    MultiRateWavefunctionConvBank,
+    WaveletScaleState,
+)
 from .stereographic_lift import (
     ClassicalSoftmaxMLP,
     NaiveBornClassifier,
@@ -167,6 +182,17 @@ __all__ = [
     "ParsevalChunkedCEReadoutSpec",
     "parseval_mup_dyadic_chunked_ce",
     "eval_parseval_mup_full_logits",
+    "SubspaceCoincidenceSpec",
+    "blend_subspace_l2_normalize",
+    "subspace_l2_normalize",
+    "strided_subspace_l2_normalize",
+    "compute_subspace_cosines",
+    "compute_multi_subspace_coincidence_observable",
+    "compute_coarse_cluster_centers",
+    "subspace_coincidence_dyadic_chunked_ce",
+    "eval_subspace_coincidence_full_logits",
+    "WaveletScaleState",
+    "MultiRateWavefunctionConvBank",
     "BlockCholeskyLinear",
     "RMSNorm",
     "WaveletCholeskyConfig",

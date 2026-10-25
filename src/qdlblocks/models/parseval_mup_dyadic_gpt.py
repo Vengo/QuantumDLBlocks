@@ -1,11 +1,26 @@
-"""Flag-Free Parseval muP sqrt(d) Dyadic Wavelet-Cholesky GPT (Plan 043 / Wave 28).
+"""Flag-Free Parseval muP sqrt(d) Dyadic Wavelet-Cholesky GPT (`Wave 28` / `EXPERIMENT_PLAN_043.md`).
 
-Implements the dedicated Rule-6 flag-free model for Wave 28 (`EXPERIMENT_PLAN_043.md`):
-- Analytical Parseval frame scale `beta_0(d) = c* sqrt(d)` (`c* = 1.48`) with zero
-  contextual gates, zero photon counters, zero temperature ceilings, and zero mode flags.
-- Proportional wavelet detail ranks `(mid_detail_dim = d // 2, fine_detail_dim = d // 4)`.
-- Post-normalization Cholesky metric temperature absorption (`absorb_beta_into_readout_cholesky`)
-  and spectral `muP` width-scaled optimizer builder (`eta(d) = eta(256) * sqrt(256 / d)`).
+When to Use This Building Block:
+- Use `ParsevalMuPDyadicGPT` as the canonical flag-free base language model whenever training
+  or scaling a unit-sphere quantum Born-rule language model across widths `d in {128, 256, 384, 512, 768, 1024}`
+  without per-width temperature tuning or boolean configuration flags.
+
+Why It Was Built & Mathematical Provenance (`EXPERIMENT_PLAN_043.md` / `Wave 28`):
+1. **Analytical Parseval `muP` Scale `beta_0(d) = c* sqrt(d)` (`c* = 1.48`)**:
+   On the unit sphere `S^{d-1}`, a tight Parseval frame `{m_v}_{v=1}^V` has off-diagonal inner-product
+   standard deviation `sigma = 1 / sqrt(d)`, whereas an aligned target has `c_{t,y} = O(1)`. Setting
+   `beta_0(d) = c* sqrt(d)` (`c* = 1.48`, calibrated at `d_base = 128` in `scripts/unit_sphere_mup_transfer_grid_search.py`)
+   locks background logit variance to `(c*)^2` across all widths `d` and eliminates legacy `PurityGate`,
+   `kboson_raw_k`, and manual `26.8` / `44.0` temperature clamps (`5.4372` Val CE at 900 steps, beating
+   `Wave 25` `5.4465` and `Wave 21` `5.4734`).
+2. **Proportional Dyadic Wavelet Ranks (`d_mid = d // 2`, `d_fine = d // 4`)**:
+   Discovered in `Wave 27` (`EXPERIMENT_PLAN_042.md`) and `scripts/empirical_3p28_ceiling_and_wavelet_rank_probe.py`:
+   keeping `(d_mid, d_fine)` fixed at `(128, 64)` when scaling to `d >= 384` starves the $2^{16}$ vocabulary
+   frame of rank. Scaling `d_mid = d // 2` and `d_fine = d // 4` preserves full frame participation ratio.
+3. **Post-Normalization Cholesky Metric Temperature Absorption (`absorb_beta_into_readout_cholesky`)**:
+   Verified in `scripts/cholesky_metric_temperature_absorber.py` (`< 7.6e-6` logit difference): absorbs
+   `beta_0(d)^{1/2}` directly into the lower-triangular Cholesky factors `L <- beta_0(d)^{1/4} L` applied
+   after unit normalization.
 """
 
 from __future__ import annotations
@@ -41,7 +56,41 @@ from .wavelet_cholesky_2pow16_gpt import (
     build_dyadic_2pow16_spectral_tree,
 )
 
-_INV_SOFTPLUS_ONE = math.log(math.e - 1.0)
+# ==============================================================================
+# Top-of-File Named Constants (Rule 7 of docs/SCRIPT_BEST_PRACTICES.md)
+# Documented in EXPERIMENT_PLAN_043.md (Wave 28) & EXPERIMENT_PLAN_046.md
+# ==============================================================================
+_INV_SOFTPLUS_ONE: float = math.log(math.e - 1.0)
+
+# Reference width d_ref = 256 for spectral muP learning-rate & temperature transfer
+MUP_REFERENCE_EMBED_DIM: float = 256.0
+
+# Zero-shot unit-sphere Parseval muP constant c* = 1.48 (calibrated at d_base = 128)
+DEFAULT_MUP_C_STAR: float = 1.48
+
+# Progress ramp beta(tau) = beta_0(d) * (BETA_PROGRESS_START + BETA_PROGRESS_SLOPE * tau)
+BETA_PROGRESS_START: float = 0.95
+BETA_PROGRESS_SLOPE: float = 0.08
+
+# GPU standard readout schedule damping calibration (Wave 28, EXPERIMENT_PLAN_043.md):
+# Compensates for elevated early-step cosine variance before Stiefel Kraus equilibration.
+GPU_READOUT_PROG_BASE: float = 0.705
+GPU_READOUT_PROG_SLOPE: float = 0.330
+GPU_READOUT_WIDTH_EXPONENT: float = 0.32
+GPU_READOUT_GAMMA_DAMP_COEFF: float = 0.36
+GPU_DIFFUSE_LAMBDA_SCALE: float = 0.76
+
+# Stiefel retraction threshold & landing rate for kraus_generators (Wave 22 / Wave 28)
+KRAUS_SVD_FALLBACK_ERR_THRESHOLD: float = 0.03
+DEFAULT_KRAUS_SMOOTH_LANDING_RATE: float = 0.08
+
+# Residual & skip gate initializations
+INIT_BIGRAM_EMBED_GATE: float = 0.14
+INIT_BIGRAM_MID_GATE: float = 0.10
+INIT_UNET_SKIP_GATE: float = 0.12
+INIT_DIFF_ACCUM_GATE: float = 0.45
+DEFAULT_DYADIC_COARSE_ALPHA: float = 0.08
+
 _PYR_KEYS = (
     "vocab_size valid_vocab_size ambient_n num_layers embed_dim num_heads "
     "block_size window_size kraus_spectral_floor interferometer_expansion "
@@ -53,7 +102,7 @@ _CHOL_KEYS = "chol kraus_raw _prior transition scale_gains theta lift pred_mix_g
 
 @dataclass
 class ParsevalMuPDyadicConfig:
-    """Configuration for Flag-Free Parseval muP Dyadic Wavelet-Cholesky GPT."""
+    """Configuration for Flag-Free Parseval muP Dyadic Wavelet-Cholesky GPT (`Wave 28`)."""
 
     vocab_size: int = 50304
     valid_vocab_size: int = 50257
@@ -66,7 +115,7 @@ class ParsevalMuPDyadicConfig:
     kraus_spectral_floor: float = 6.5
     traceless_gamma: float = 0.25
     dyadic_coarse_weight: float = 0.14
-    mup_c_star: float = 1.48
+    mup_c_star: float = DEFAULT_MUP_C_STAR
     lambda_diff_start: float = 0.20
     lambda_diff_end: float = 0.05
     mid_detail_dim: int = 0
@@ -89,7 +138,7 @@ def _inv_softplus(y: torch.Tensor) -> torch.Tensor:
 
 
 class ParsevalMuPDyadicGPT(nn.Module):
-    """Flag-Free Parseval muP sqrt(d) Dyadic Wavelet-Cholesky Amplitude Transducer (Wave 28)."""
+    """Flag-Free Parseval muP sqrt(d) Dyadic Wavelet-Cholesky Amplitude Transducer (`Wave 28` / `Plan 043`)."""
 
     def __init__(self, cfg: ParsevalMuPDyadicConfig) -> None:
         super().__init__()
@@ -104,7 +153,7 @@ class ParsevalMuPDyadicGPT(nn.Module):
         kw.update(arch_mode="fused_kronecker_unet", fine_detail_dim=self.fine_detail_dim, mid_detail_dim=self.mid_detail_dim)
         pyr_cfg = Radical2Pow16Config(
             **kw, diffuse_rank=cfg.kraus_rank, use_dyadic_hierarchical_born=True,
-            dyadic_coarse_alpha=0.08, use_fast_cholesky_and_compile=True,
+            dyadic_coarse_alpha=DEFAULT_DYADIC_COARSE_ALPHA, use_fast_cholesky_and_compile=True,
         )
 
         self.pyramid = Tied2Pow16WaveletCholeskyPyramid(pyr_cfg)
@@ -116,10 +165,10 @@ class ParsevalMuPDyadicGPT(nn.Module):
         self.blocks = nn.ModuleList([RadicalWaveletCholeskyBlock(pyr_cfg, i) for i in range(cfg.num_layers)])
         self.unet_ref_block = WaveletCholeskyUNetBlock
         self.final_norm = RMSNorm(cfg.embed_dim)
-        self.bigram_embed_gate = nn.Parameter(torch.full((cfg.embed_dim,), 0.14))
-        self.bigram_mid_gate = nn.Parameter(torch.full((cfg.embed_dim,), 0.10))
-        self.unet_skip_gates = nn.Parameter(torch.full((max(1, cfg.num_layers // 2), cfg.embed_dim), 0.12))
-        self.diff_accum_gate = nn.Parameter(torch.full((cfg.embed_dim,), 0.45))
+        self.bigram_embed_gate = nn.Parameter(torch.full((cfg.embed_dim,), INIT_BIGRAM_EMBED_GATE))
+        self.bigram_mid_gate = nn.Parameter(torch.full((cfg.embed_dim,), INIT_BIGRAM_MID_GATE))
+        self.unet_skip_gates = nn.Parameter(torch.full((max(1, cfg.num_layers // 2), cfg.embed_dim), INIT_UNET_SKIP_GATE))
+        self.diff_accum_gate = nn.Parameter(torch.full((cfg.embed_dim,), INIT_DIFF_ACCUM_GATE))
         self.povm_log_prior = nn.Parameter(torch.zeros(cfg.vocab_size, dtype=torch.float32))
         self._last_diffuse_eff_rank = float(cfg.kraus_rank)
         self._last_sharp_eff_rank = 64.0
@@ -132,7 +181,7 @@ class ParsevalMuPDyadicGPT(nn.Module):
 
     def current_beta(self) -> float:
         """Return deterministic Parseval progress-ramped scale `beta(tau) = beta_0(d) * (0.95 + 0.08 * tau)`."""
-        return self.beta_0 * (0.95 + 0.08 * self._training_progress)
+        return self.beta_0 * (BETA_PROGRESS_START + BETA_PROGRESS_SLOPE * self._training_progress)
 
     def current_lambda_diff(self) -> float:
         """Return unscaled diffuse bath mixing weight `lambda_diff(tau)`."""
@@ -168,13 +217,13 @@ class ParsevalMuPDyadicGPT(nn.Module):
         return m_sharp_unit, m_diff, w_k
 
     @torch.no_grad()
-    def retract_kraus_generators(self, smooth_landing_rate: float = 0.08) -> float:
+    def retract_kraus_generators(self, smooth_landing_rate: float = DEFAULT_KRAUS_SMOOTH_LANDING_RATE) -> float:
         """Retract `kraus_generators` onto the Stiefel manifold without legacy contragredient branches."""
         kg = self.pyramid.kraus_generators.data.float()
         d = kg.size(-1)
         gram = torch.bmm(kg.transpose(-2, -1), kg) - torch.eye(d, device=kg.device, dtype=torch.float32).unsqueeze(0)
         err = float((torch.linalg.norm(gram, dim=(-2, -1)) / math.sqrt(float(d))).mean().item())
-        u, _, vh = torch.linalg.svd(kg, full_matrices=False) if err > 0.03 else (None, None, None)
+        u, _, vh = torch.linalg.svd(kg, full_matrices=False) if err > KRAUS_SVD_FALLBACK_ERR_THRESHOLD else (None, None, None)
         denom = 1.0 + (torch.linalg.norm(gram, dim=(-2, -1), keepdim=True) / math.sqrt(float(d)))
         kg_out = torch.bmm(u, vh) if u is not None else kg - float(smooth_landing_rate) * torch.bmm(kg, gram / denom)
         self.pyramid.kraus_generators.data.copy_(kg_out.to(self.pyramid.kraus_generators.dtype))
@@ -191,15 +240,18 @@ class ParsevalMuPDyadicGPT(nn.Module):
         """Build `ParsevalChunkedCEReadoutSpec` accounting for post-normalization Cholesky absorption."""
         s, c = self._beta_absorbed_scale, self.cfg
         is_gpu_std = bool(self.pyramid.wav_256.is_cuda and s == 1.0)
-        prog_scale = (0.705 + 0.330 * self._training_progress) * ((256.0 / float(c.embed_dim)) ** 0.32)
-        damp = ((1.0 + 0.36 * float(c.traceless_gamma)) / prog_scale) if is_gpu_std else 1.0
+        prog_scale = (GPU_READOUT_PROG_BASE + GPU_READOUT_PROG_SLOPE * self._training_progress) * (
+            (MUP_REFERENCE_EMBED_DIM / float(c.embed_dim)) ** GPU_READOUT_WIDTH_EXPONENT
+        )
+        damp = ((1.0 + GPU_READOUT_GAMMA_DAMP_COEFF * float(c.traceless_gamma)) / prog_scale) if is_gpu_std else 1.0
         cw = 0.0 if is_gpu_std else float(c.dyadic_coarse_weight)
         vc = self.pyramid.perm_v_to_leaf[: c.valid_vocab_size] >> 8
         b_eff = (self.current_beta() / damp) / s
-        lam_eff = (b_eff * self.current_lambda_diff() * 0.76) if is_gpu_std else self.current_lambda_diff_scaled()
+        lam_eff = (b_eff * self.current_lambda_diff() * GPU_DIFFUSE_LAMBDA_SCALE) if is_gpu_std else self.current_lambda_diff_scaled()
         kw = {"beta_0": b_eff, "lambda_diff_scaled": lam_eff, "chunk_size": int(chunk_size)}
         kw.update(traceless_gamma=float(c.traceless_gamma) / s, dyadic_coarse_weight=cw, valid_vocab_size=int(c.valid_vocab_size))
         return ParsevalChunkedCEReadoutSpec(**kw, gemm_precision=str(c.readout_gemm_precision), v_to_coarse=vc)
+
 
     def forward(
         self, idx: torch.Tensor, targets: torch.Tensor | None = None, return_logits: bool | None = None
@@ -258,14 +310,29 @@ def initialize_parseval_mup_with_ppmi_svd(
     pyr.perm_v_to_leaf.copy_(perm_v_to_leaf)
     pyr.leaf_to_v.copy_(leaf_to_v)
     v_in = min(ppmi_embeddings.size(0), cfg.vocab_size)
+    d_in = min(half_d, ppmi_embeddings.size(1))
+    toks = init_tokens.to(device=device, dtype=torch.long)
+    src, dst = torch.remainder(toks[:-1], cfg.vocab_size), torch.remainder(toks[1:], cfg.vocab_size)
     a_self = torch.zeros((cfg.ambient_n, half_d), device=device, dtype=torch.float32)
-    raw_a = F.pad(ppmi_embeddings[:v_in, :half_d].to(device).float(), (0, max(0, half_d - ppmi_embeddings.size(1))))
+    base_a = ppmi_embeddings[:v_in, :d_in].to(device).float()
+    if half_d > d_in:
+        extra_d = half_d - d_in
+        src2, dst2 = torch.remainder(toks[:-2], v_in), torch.remainder(toks[2:], v_in)
+        hop2 = torch.zeros_like(base_a)
+        hop2.index_add_(0, dst2, l2_normalize(base_a, dim=-1).index_select(0, src2))
+        hop2 = l2_normalize(hop2, dim=-1)
+        quad_a = l2_normalize(base_a * torch.roll(base_a, shifts=7, dims=-1), dim=-1)
+        gen_ext = torch.Generator(device=device).manual_seed(137)
+        q_proj, _ = torch.linalg.qr(torch.randn((d_in, d_in), generator=gen_ext, device=device))
+        ext_a = (0.65 * hop2 + 0.35 * quad_a) @ q_proj[:, :extra_d]
+        ext_a = ext_a * (base_a.std() / (ext_a.std() + 1e-6))
+        raw_a = torch.cat([base_a, ext_a], dim=-1)
+    else:
+        raw_a = base_a
     if d > 256:
         col_std = raw_a.std(dim=0, keepdim=True) + 1e-5
         raw_a = raw_a * torch.pow(col_std.mean() / col_std, 0.35)
     a_self[:v_in] = l2_normalize(raw_a, dim=-1)
-    toks = init_tokens.to(device=device, dtype=torch.long)
-    src, dst = torch.remainder(toks[:-1], cfg.vocab_size), torch.remainder(toks[1:], cfg.vocab_size)
     b_pred = torch.zeros_like(a_self)
     b_pred.index_add_(0, dst, a_self.index_select(0, src))
     b_pred = l2_normalize(b_pred, dim=-1)
@@ -332,7 +399,7 @@ def build_parseval_mup_optimizers(
             wav_params.append(p)
         elif any(k in name for k in _CHOL_KEYS):
             chol_params.append(p)
-        elif p.ndim == 2 and min(p.shape) >= 32 and max(p.shape) <= 2048:
+        elif p.ndim == 2 and min(p.shape) >= 32 and max(p.shape) <= 4096:
             muon_params.append(p)
         else:
             body_params.append(p)

@@ -3566,7 +3566,14 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
 
       function App() {
         const [snap, setSnap] = useState(window.__INITIAL_SNAPSHOT__);
-        const [activeTab, setActiveTab] = useState("main"); // "main" | "fineweb_edu" | "micro" | "colab"
+        const [activeTab, setActiveTab] = useState(() => {
+          try {
+            const p = new URLSearchParams(window.location.search).get("tab");
+            if (p === "visualizer" || window.location.hash === "#visualizer") return "visualizer";
+            if (p && ["main", "fineweb_edu", "micro", "colab", "visualizer"].includes(p)) return p;
+          } catch (e) {}
+          return "main";
+        });
         const [autoPoll, setAutoPoll] = useState(true);
         const [lastFetchStatus, setLastFetchStatus] = useState("Live");
         const [hoveredKey, setHoveredKey] = useState(null);
@@ -4332,7 +4339,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             )
           ),
 
-          // Top 4-Tab Navigation Bar
+          // Top 5-Tab Navigation Bar
           h("div", { className: "nav-tabs" },
             h("button", {
               className: "tab-btn" + (activeTab === "main" ? " active" : ""),
@@ -4341,7 +4348,7 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             h("button", {
               className: "tab-btn" + (activeTab === "fineweb_edu" ? " active" : ""),
               onClick: () => setActiveTab("fineweb_edu")
-            }, `⚡ FineWeb-Edu & Wavelet-Cholesky (Waves 18–29 • ${finewebEduCatalog.length} Runs)`),
+            }, `⚡ FineWeb-Edu & Wavelet-Cholesky (Waves 18–35 • ${finewebEduCatalog.length} Runs)`),
             h("button", {
               className: "tab-btn" + (activeTab === "micro" ? " active" : ""),
               onClick: () => setActiveTab("micro")
@@ -4350,12 +4357,51 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
               className: "tab-btn" + (activeTab === "colab" ? " active" : ""),
               onClick: () => setActiveTab("colab")
             }, `🖥️ Live Colab Fleet & SQLite Job Queue (${colabSessions.length} GPUs • ${queuedCount} Queued)`),
+            h("button", {
+              className: "tab-btn" + (activeTab === "visualizer" ? " active" : ""),
+              onClick: () => setActiveTab("visualizer")
+            }, "🌐 Interactive Bloch-Sphere & Decision-Boundary Playground"),
             h("span", { style: { marginLeft: "auto", fontSize: 11.5, color: "#8b949e", paddingRight: 6 } },
               `🗄️ SQLite WAL: ${catalog.length} speedrun / ${finewebEduCatalog.length} edu / ${microCatalog.length} micro / ${sessionQueue.length} queue`
             )
           ),
 
-          // TAB 2: Dedicated FineWeb-Edu & Wavelet-Cholesky Scaling Explorer (Waves 18–29)
+          // TAB 5: Interactive Geometric & Bloch-Sphere Playground (visualizer.html)
+          activeTab === "visualizer" && h("div", null,
+            h("div", { className: "insight-banner", style: { marginBottom: 10 } },
+              h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 } },
+                h("div", null,
+                  h("div", { style: { fontWeight: 700, color: "#38bdf8", fontSize: 13.5 } },
+                    "🌐 QuantumBornGPT — Interactive Decision-Boundary & Bloch-Sphere Playground (visualizer.html)"
+                  ),
+                  h("div", { style: { color: "#c9d1d9", marginTop: 3 } },
+                    "Explore why single rank-1 detectors are restricted to spherical caps, and how Two-Beam Phase Interference + Multi-Mode Concept POVMs unlock arbitrary topologies across Iris, Rings, Spirals, XOR, and Gaussians."
+                  )
+                ),
+                h("a", {
+                  href: "/visualizer",
+                  target: "_blank",
+                  rel: "noopener noreferrer",
+                  className: "btn active",
+                  style: { textDecoration: "none", fontWeight: 700 }
+                }, "↗ Open Standalone Fullscreen (/visualizer)")
+              )
+            ),
+            h("iframe", {
+              src: "/visualizer",
+              title: "QuantumBornGPT Interactive Geometric & Decision-Boundary Playground",
+              style: {
+                width: "100%",
+                height: "calc(100vh - 175px)",
+                minHeight: "880px",
+                border: "1px solid #30363d",
+                borderRadius: "10px",
+                background: "#0b0f19"
+              }
+            })
+          ),
+
+          // TAB 2: Dedicated FineWeb-Edu & Wavelet-Cholesky Scaling Explorer (Waves 18–35)
           activeTab === "fineweb_edu" && h("div", null,
             h("div", { className: "kpi-grid" },
               h("div", { className: "kpi-card", style: { borderLeft: "3px solid #00ff88" } },
@@ -4383,14 +4429,15 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             h("div", { className: "toolbar-panel" },
               h("div", { className: "toolbar-row" },
                 h("div", { className: "preset-group" },
-                  h("span", { className: "section-lbl" }, "Wave Filter (Waves 18–29):"),
-                  ["ALL", "W29", "W28", "W27", "W26", "W25", "W24", "W23", "W22", "W21", "W20", "W19", "W18"].map(wid =>
+                  h("span", { className: "section-lbl" }, "Wave Filter (Waves 18–35):"),
+                  ["ALL", "W35", "W34", "W33", "W32", "W31", "W30", "W29", "W28", "W27", "W26", "W25", "W24", "W23", "W22", "W21", "W20", "W19", "W18"].map(wid =>
                     h("button", {
                       key: "edu-w-" + wid,
                       className: "btn preset" + (eduFilterWave === wid ? " active" : ""),
                       onClick: () => setEduFilterWave(wid)
                     }, wid)
                   ),
+
                   h("input", {
                     className: "search-input",
                     placeholder: "Search w28, parseval, smith_clr, d512, intent...",
@@ -5485,6 +5532,15 @@ def create_benchmark_http_server(
                     snap_ref = state["latest_snap"]
                 body = (format_terminal_report(snap_ref) + "\n").encode("utf-8")
                 self._send_bytes(200, "text/plain; charset=utf-8", body)
+                return
+
+            if path in ("/visualizer", "/visualizer/", "/visualizer.html", "/playground"):
+                vis_file = ROOT / "visualizer.html"
+                if not vis_file.exists():
+                    self._send_json(404, {"ok": False, "error": "visualizer.html not found"})
+                    return
+                body = vis_file.read_bytes()
+                self._send_bytes(200, "text/html; charset=utf-8", body)
                 return
 
             with state_lock:

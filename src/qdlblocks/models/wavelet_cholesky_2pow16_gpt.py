@@ -148,9 +148,6 @@ class Tied2Pow16WaveletCholeskyPyramid(nn.Module):
     def _lift_fine_wavelet(self, flat_p: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
         """Lift fine-scale `(ambient_n, d_fine)` wavelet coefficients to `R^d` using 1 or `B` subtree banks."""
         if self.num_fine_banks == 1:
-            if self.cfg.use_fast_cholesky_and_compile and flat_p.numel() > 16384:
-                c0_all = F.linear(self.chol_65536(self.wav_65536), self.up_65536.t())
-                return c0_all.index_select(0, flat_p).view(*target_shape, -1)
             w0 = self.chol_65536(self.wav_65536.index_select(0, flat_p)).view(*target_shape, -1)
             return F.linear(w0, self.up_65536.t())
 
@@ -173,22 +170,22 @@ class Tied2Pow16WaveletCholeskyPyramid(nn.Module):
         """Synthesize normalized multi-scale wavelet amplitudes for arbitrary 16-bit leaf indices."""
         flat_p = leaf_idx.reshape(-1)
         g = F.softplus(self.scale_gains)
-        c3 = self.chol_256(self.wav_256).index_select(0, flat_p >> 8).view(*leaf_idx.shape, -1)
-        c2 = self.chol_2048(self.wav_2048).index_select(0, flat_p >> 5).view(*leaf_idx.shape, -1)
+        acc = g[0] * self.chol_256(self.wav_256).index_select(0, flat_p >> 8).view(*leaf_idx.shape, -1)
+        acc = acc + g[1] * self.chol_2048(self.wav_2048).index_select(0, flat_p >> 5).view(*leaf_idx.shape, -1)
         if self.cfg.use_fast_cholesky_and_compile:
             c1_table = F.linear(self.chol_8192(self.wav_8192), self.up_8192.t())
-            c1 = c1_table.index_select(0, flat_p >> 3).view(*leaf_idx.shape, -1)
+            acc = acc + g[2] * c1_table.index_select(0, flat_p >> 3).view(*leaf_idx.shape, -1)
         else:
             w1 = self.chol_8192(self.wav_8192).index_select(0, flat_p >> 3).view(*leaf_idx.shape, -1)
-            c1 = F.linear(w1, self.up_8192.t())
-        c0 = self._lift_fine_wavelet(flat_p, leaf_idx.shape)
-        return l2_normalize(g[0] * c3 + g[1] * c2 + g[2] * c1 + g[3] * c0, dim=-1)
+            acc = acc + g[2] * F.linear(w1, self.up_8192.t())
+        acc = acc + g[3] * self._lift_fine_wavelet(flat_p, leaf_idx.shape)
+        return l2_normalize(acc, dim=-1)
 
     def embed_tokens(self, idx: torch.Tensor) -> torch.Tensor:
         """Synthesize input token amplitudes in R^d directly from the N=2^16 wavelet pyramid."""
         p = self.perm_v_to_leaf.index_select(0, idx.reshape(-1)).view_as(idx)
         out = self._synthesize_leaf_vectors(p)
-        use_bf16 = bool(idx.is_cuda and torch.is_autocast_enabled() and (idx.numel() > 8192 or idx.numel() < 1024))
+        use_bf16 = bool(idx.is_cuda and torch.is_autocast_enabled())
         return out.to(torch.get_autocast_gpu_dtype()) if use_bf16 else out
 
     def _synthesize_raw_detectors(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -260,7 +257,7 @@ class Tied2Pow16WaveletCholeskyPyramid(nn.Module):
         up_fine_mat = (self.up_65536 if self.up_65536.ndim == 2 else self.up_65536.mean(dim=0)).to(w_fine.dtype)
         b_vec = F.linear(w_fine, up_fine_mat.t()) + F.linear(w_mid, self.up_8192.to(w_mid.dtype).t())
         out = l2_normalize(b_vec, dim=-1)
-        use_bf16 = bool(idx.is_cuda and torch.is_autocast_enabled() and (idx.numel() > 8192 or idx.numel() < 1024))
+        use_bf16 = bool(idx.is_cuda and torch.is_autocast_enabled())
         return out.to(torch.get_autocast_gpu_dtype()) if use_bf16 else out
 
     def synthesize_value_anchor(self, psi_in: torch.Tensor, bigram_psi: torch.Tensor | None = None) -> torch.Tensor:

@@ -170,7 +170,7 @@ def parse_args(argv: list[str] | None = None) -> StaticExporterConfig:
     """Parse CLI arguments into `StaticExporterConfig`."""
     p = argparse.ArgumentParser(description="Export standalone HTML leaderboard snapshot from `.cache/benchmarks.db`.")
     p.add_argument("--db-path", type=str, default=str(DEFAULT_DB_PATH))
-    p.add_argument("--out", type=str, default=str(REPO_ROOT / ".cache" / "leaderboard_snapshot.html"))
+    p.add_argument("--out", "--html-out", dest="out", type=str, default=str(REPO_ROOT / ".cache" / "leaderboard_snapshot.html"))
     p.add_argument("--title", type=str, default="QuantumDLBlocks Benchmark Leaderboard Snapshot")
     ns = p.parse_args(argv)
     return StaticExporterConfig(db_path=ns.db_path, out=ns.out, title=ns.title)

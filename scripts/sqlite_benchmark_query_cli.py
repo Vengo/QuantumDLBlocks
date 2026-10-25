@@ -49,11 +49,11 @@ def query_benchmark_rows(cfg: QueryCLIConfig) -> list[dict[str, Any]]:
         db.close()
 
     tier_low = cfg.tier.strip().lower()
-    if tier_low == "main_benchmark":
+    if tier_low in ("main_benchmark", "fineweb_speedrun", "main"):
         pool = list(snap.get("runs_catalog", []))
-    elif tier_low == "fineweb_edu_local":
+    elif tier_low in ("fineweb_edu_local", "fineweb_edu", "edu"):
         pool = list(snap.get("fineweb_edu_catalog", []))
-    elif tier_low == "micro_verification":
+    elif tier_low in ("micro_verification", "vision_ablation", "micro"):
         pool = list(snap.get("micro_runs_catalog", []))
     else:
         pool = (
@@ -139,7 +139,7 @@ def parse_args(argv: list[str] | None = None) -> QueryCLIConfig:
     """Parse CLI arguments into `QueryCLIConfig`."""
     p = argparse.ArgumentParser(description="Query `.cache/benchmarks.db` and render a Markdown table.")
     p.add_argument("--db-path", type=str, default=str(DEFAULT_DB_PATH))
-    p.add_argument("--tier", type=str, default="all", help="all | main_benchmark | fineweb_edu_local | micro_verification")
+    p.add_argument("--tier", "--domain", dest="tier", type=str, default="all", help="all | main_benchmark | fineweb_edu_local | micro_verification")
     p.add_argument("--wave", type=str, default="", help="Optional wave filter (e.g. W28, W27, W26)")
     p.add_argument("--family", type=str, default="", help="Optional arch_family filter")
     p.add_argument("--pareto-only", action="store_true")

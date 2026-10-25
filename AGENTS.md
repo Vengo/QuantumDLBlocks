@@ -48,10 +48,10 @@ Every new `EXPERIMENT_PLAN_0XX.md` and subagent workflow MUST include an explici
 
 ## 4. Script & Module Engineering Best Practices (`docs/SCRIPT_BEST_PRACTICES.md`)
 
-All agents and subagents writing or modifying Python files in `examples/`, `scripts/`, and `src/qdlblocks/` MUST enforce the six rules in [`docs/SCRIPT_BEST_PRACTICES.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/SCRIPT_BEST_PRACTICES.md):
+All agents and subagents writing or modifying Python files in `examples/`, `scripts/`, and `src/qdlblocks/` MUST enforce the eight rules in [`docs/SCRIPT_BEST_PRACTICES.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/SCRIPT_BEST_PRACTICES.md):
 
-1. **Rule 1 — File-Length Budget (`<= 1,000` Lines Soft Warning Limit, `<= 2,500` Hard Limit, No Semicolon Line-Packing)**:
-   - Keep new scripts and modules in `examples/`, `scripts/`, and `src/qdlblocks/` `<= 1,000` lines soft limit (carries a warning above `1,000` lines) with an absolute hard limit of `2,500` lines, and never pack multiple statements onto one line with semicolons (`a; b`). Extract reusable logic into `src/qdlblocks/benchmarks/` or `src/qdlblocks/layers/`.
+1. **Rule 1 — Comment-Free Code-Length Budget (`<= 1,000` SLOC Soft Warning Limit, `<= 2,500` SLOC Hard Limit, Comments & Docstrings Are Free)**:
+   - [`scripts/ast_signature_and_length_linter.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/ast_signature_and_length_linter.py) counts **only executable code lines (SLOC)**—comments (`# ...`), module/class/function docstrings (`"""..."""`), and blank lines do **not** count against the `<= 1,000` soft limit or `<= 2,500` hard limit (or `<= 40` nested-function limit). Never strip comments/docstrings or pack statements with semicolons (`a; b`).
 2. **Rule 2 — Function Signature Ceiling (`<= 8` Arguments)**:
    - No new function or method may accept more than `8` positional/keyword arguments (excluding `self`/`cls`). Group domain hyperparameters into frozen `@dataclass(frozen=True)` objects (`BackboneConfig`, `QubitHierarchyConfig`, `KBosonReadoutConfig`, `OptimizerConfig`, `QuantumExperimentSpec` in [`src/qdlblocks/benchmarks/config_models.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/config_models.py)).
 3. **Rule 3 — Strategy / Polymorphic Dispatch Over Boolean Flag Jungles**:
@@ -62,6 +62,10 @@ All agents and subagents writing or modifying Python files in `examples/`, `scri
    - Keep helper functions top-level, pure, and independently unit-testable via `pytest`.
 6. **Rule 6 — Clean, Flag-Free Per-Experiment Modules Over Boolean-Flag Accumulation in Legacy Models**:
    - Never thread new `use_*` or `is_*` boolean flags into legacy model or loss files (`wavelet_cholesky_2pow16_gpt.py`, `direct_chunked_ce.py`) when testing a new mathematical formulation. Instead, import shared building-block primitives (`BlockCholeskyLinear`, `WaveletCholeskyMultiscaleBranch`, `OvercompleteTwoBeamInterference`, `StiefelMuon`) into a clean, dedicated, flag-free module and verification script that directly express the experiment's equations with zero legacy branches, leaving previous wave models frozen for reproducible comparison.
+7. **Rule 7 — Top-of-File Named Constants & Mandatory `EXPERIMENT_PLAN_0XX.md` Synchronization**:
+   - All numerical constants, scaling coefficients, exponents, thresholds, and empirical calibration factors must be defined as documented `UPPER_SNAKE_CASE` constants at the start of the file (never as unexplained inline magic numbers inside functions). Introducing or modifying any constant during implementation requires updating the corresponding `EXPERIMENT_PLAN_0XX.md` (and [`docs/BUILDING_BLOCKS.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/BUILDING_BLOCKS.md) if in a shared module) to document its definition and rationale.
+8. **Rule 8 — Thorough Building-Block Commenting & Experiment Provenance**:
+   - Because comments and docstrings do not count against line limits, every reusable building block in `src/qdlblocks/` must be commented thoroughly enough for a fresh reviewer to understand *when* that piece is useful, *why* it was built mathematically, and *which experiment/wave* (`EXPERIMENT_PLAN_0XX.md` / `Wave XX`) generated and validated it.
 
 ## 5. Reusable Building-Blocks Catalog (`docs/BUILDING_BLOCKS.md`) & Mandatory Contribute-Back Protocol
 
@@ -73,15 +77,16 @@ Before drafting any new `EXPERIMENT_PLAN_0XX.md`, writing a new model/layer/kern
      - `flash_born_attention`, `flash_purified_born_attention` ([`flash_born_triton.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/flash_born_triton.py)): $O(T)$ SRAM-tiled Triton Born attention (`64x64` tiles, automatic for $d \ge 384$).
    - **Canonical Layers & Flag-Free Readouts (`src/qdlblocks/layers/`)**:
      - `parseval_mup_dyadic_chunked_ce`, `eval_parseval_mup_full_logits`, `ParsevalChunkedCEReadoutSpec` ([`parseval_mup_chunked_ce.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/parseval_mup_chunked_ce.py)): Flag-free analytical Parseval $\mu\text{P}$ scale $\beta_0(d) = c^*\sqrt{d}$ ($c^* = 1.48$) + Convex-Peak Traceless Born + 256-root dyadic conditional readout (replaces legacy `PurityGate`, `kboson_raw_k`, and manual `26.8` / `44.0` temperature clamps).
+     - `subspace_l2_normalize`, `subspace_coincidence_dyadic_chunked_ce`, `eval_subspace_coincidence_full_logits`, `SubspaceCoincidenceSpec` ([`subspace_coincidence_born.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/subspace_coincidence_born.py)): Product-of-Spheres $(\frac{1}{\sqrt{M}}\mathbb{S}^{d/M - 1})^M$ normalization and $M$-subspace coincidence gating (`Wave 31` / `EXPERIMENT_PLAN_046.md`).
      - `BlockCholeskyLinear(d, max_block_size=32, fast_spd_bmm=True)` & `WaveletCholeskyMultiscaleBranch` ([`wavelet_cholesky_branch.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/wavelet_cholesky_branch.py)): Batched `torch.bmm` SPD operators (`2.55x` faster) and Sweldens lifting wavelets.
      - `OvercompleteTwoBeamInterference` ([`overcomplete_two_beam.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/overcomplete_two_beam.py)): Mach-Zehnder two-beam phase interferometer.
    - **Canonical Models & Pyramids (`src/qdlblocks/models/`)**:
-     - `ParsevalMuPDyadicGPT` & `ParsevalMuPDyadicConfig` ([`parseval_mup_dyadic_gpt.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/parseval_mup_dyadic_gpt.py)): Current canonical flag-free language model with proportional wavelet detail ranks ($d_{\text{mid}} = d // 2, d_{\text{fine}} = d // 4$) and post-normalization Cholesky metric absorption (`absorb_beta_into_readout_cholesky()`).
+     - `ParsevalMuPDyadicGPT` ([`parseval_mup_dyadic_gpt.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/parseval_mup_dyadic_gpt.py)), `ParsevalMuPNGramSpeedrunGPT` ([`parseval_mup_ngram_speedrun_gpt.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/parseval_mup_ngram_speedrun_gpt.py)), and `ParsevalMuPSubspaceCoincidenceGPT` ([`parseval_mup_subspace_coincidence_gpt.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/parseval_mup_subspace_coincidence_gpt.py)): Current canonical flag-free language models with proportional wavelet detail ranks ($d_{\text{mid}} = d // 2, d_{\text{fine}} = d // 4$) and post-normalization Cholesky metric absorption (`absorb_beta_into_readout_cholesky()`).
      - `WaveletCholeskyVisionClassifier` & `TiedDyadicWaveletClassPyramid` ([`wavelet_cholesky_vision.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/wavelet_cholesky_vision.py)): `~11s`/run `CIFAR-100` & `ILSVRC ImageNet-1K` ($K=1,000$) fast-loop ablation laboratory.
    - **Riemannian Stiefel Optimization (`src/qdlblocks/optim/muon.py`)**:
      - `StiefelMuon` (`polar_express`, `stiefel_penalty=0.02`, `use_normuon=True`, `use_twin_rail=True`): Always route `kraus_generators` (`(R, d, d)`) and 2D orthogonal bases to `StiefelMuon` + `retract_kraus_generators()`.
 2. **Contribute Back When Validating New Components**:
-   - Whenever an experiment wave proves out a reusable kernel, layer, optimizer schedule, or diagnostic probe, extract it into `src/qdlblocks/{kernels,layers,optim,benchmarks}/` or `scripts/`, export it in `__init__.py`, and update [`docs/BUILDING_BLOCKS.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/BUILDING_BLOCKS.md) and [`README.md`](file:///home/festivity/agy/QuantumDLBlocks/README.md) (marking any superseded component as `FROZEN` or `LEGACY`) before closing out the wave.
+   - Whenever an experiment wave proves out a reusable kernel, layer, optimizer schedule, or diagnostic probe, extract it into `src/qdlblocks/{kernels,layers,optim,benchmarks}/` or `scripts/`, export it in `__init__.py`, comment it thoroughly with its `Wave` / `EXPERIMENT_PLAN_0XX` provenance (Rule 8), and update [`docs/BUILDING_BLOCKS.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/BUILDING_BLOCKS.md) and [`README.md`](file:///home/festivity/agy/QuantumDLBlocks/README.md) (marking any superseded component as `FROZEN` or `LEGACY`) before closing out the wave.
 
 ## 6. Mandatory Standardized Experiment Intent & Progress Logging (`StandardizedExperimentLogger`)
 
@@ -101,3 +106,18 @@ Every training experiment—whether executed on remote Colab (`100M–900M` Fine
      /home/festivity/agy/QuantumDLBlocks/.venv/bin/python /home/festivity/agy/QuantumDLBlocks/scripts/sync_waves_to_webui.py --trigger-reload
      ```
      so all runs appear immediately in the appropriate WebUI tab (`🏆 Full FineWeb Speedrun`, `⚡ Local FineWeb-Edu Waves 18–29`, or `🧪 Micro-Verifications & Vision Ablations`).
+
+## 7. Implementer Context-Budget & Graceful Experiment Wrap-Up Protocol
+
+When implementing and running an `EXPERIMENT_PLAN_0XX.md`, implementer agents and subagents MUST follow this discipline:
+
+1. **Successful Code Implementation Does Not Require Full Run Evaluation Success at All Costs**:
+   - Delivering clean, well-commented code that passes `pytest` unit tests and `scripts/ast_signature_and_length_linter.py` is a successful code implementation even if a full training evaluation does not pass every empirical target on the first try.
+2. **Proactive Error Fixing vs. Context-Limit Discipline**:
+   - Agents should proactively fix code/runtime errors without stopping prematurely for instructions. However, if diagnosing or tuning a training evaluation approaches the limit of the agent's context window (or exceeds `2–3` training retries), **stop retrying** rather than exhausting context.
+3. **Wrap Up with a Structured Results & Post-Mortem Document**:
+   - When wrapping up an experiment whose full training evaluation partially succeeded or revealed unexpected dynamics, update `EXPERIMENT_PLAN_0XX.md` (Section 6) with:
+     - All constants introduced/modified during implementation (Rule 7 Constants Ledger),
+     - The exact empirical results and telemetry observed, and
+     - Concrete mathematical/architectural ideas and hypotheses about what happened and what the next wave should test.
+

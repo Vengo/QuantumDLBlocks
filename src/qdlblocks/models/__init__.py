@@ -10,6 +10,14 @@ from .classical_modded_gpt import (
     apply_leaderboard_rotary,
 )
 from .hybrid_classifier import HybridQuantumClassifier
+from .level_separated_wavelet_conv_gpt import (
+    LevelSeparatedWaveletConvConfig,
+    LevelSeparatedWaveletConvGPT,
+    PreAttnMultiRateWaveletConvBlock,
+    build_level_separated_wavelet_conv_optimizers,
+    initialize_level_separated_wavelet_conv_with_ppmi_svd,
+    synthesize_level_separated_wavelet_state,
+)
 from .parseval_mup_dyadic_gpt import (
     ParsevalMuPDyadicConfig,
     ParsevalMuPDyadicGPT,
@@ -22,6 +30,12 @@ from .parseval_mup_ngram_speedrun_gpt import (
     ParsevalMuPNGramSpeedrunGPT,
     build_parseval_mup_ngram_optimizers,
     initialize_parseval_mup_ngram_with_ppmi_svd,
+)
+from .parseval_mup_subspace_coincidence_gpt import (
+    ParsevalMuPSubspaceCoincidenceConfig,
+    ParsevalMuPSubspaceCoincidenceGPT,
+    build_subspace_coincidence_optimizers,
+    initialize_subspace_coincidence_with_ppmi_svd,
 )
 from .pure_quantum_net import DeepPureQuantumNetwork
 from .speech_ctc import (
@@ -84,6 +98,12 @@ __all__ = [
     "load_librispeech_dataset",
     "extract_librispeech_word_segments",
     "ReadoutMode",
+    "LevelSeparatedWaveletConvConfig",
+    "LevelSeparatedWaveletConvGPT",
+    "PreAttnMultiRateWaveletConvBlock",
+    "synthesize_level_separated_wavelet_state",
+    "initialize_level_separated_wavelet_conv_with_ppmi_svd",
+    "build_level_separated_wavelet_conv_optimizers",
     "ParsevalMuPDyadicConfig",
     "ParsevalMuPDyadicGPT",
     "initialize_parseval_mup_with_ppmi_svd",
@@ -93,6 +113,10 @@ __all__ = [
     "ParsevalMuPNGramSpeedrunGPT",
     "initialize_parseval_mup_ngram_with_ppmi_svd",
     "build_parseval_mup_ngram_optimizers",
+    "ParsevalMuPSubspaceCoincidenceConfig",
+    "ParsevalMuPSubspaceCoincidenceGPT",
+    "initialize_subspace_coincidence_with_ppmi_svd",
+    "build_subspace_coincidence_optimizers",
     "Radical2Pow16Config",
     "Radical2Pow16WaveletCholeskyGPT",
     "Tied2Pow16WaveletCholeskyPyramid",

@@ -9,6 +9,10 @@ from .flash_born import (
     get_rdna4_autotune_configs,
 )
 from .fused_parseval_ce import (
+    M4_GEOM_EPS_OFFSET,
+    M4_GEOM_EPS_SQ,
+    M4_SUBSPACE_SCALE,
+    compiled_m4_coincidence_chunk_step,
     compiled_parseval_convex_traceless_chunk_step,
     fused_fp8_or_bf16_chunk_gemm,
     quantize_fp8_vocab_transposed,
@@ -17,6 +21,10 @@ from .fused_parseval_ce import (
 __all__ = [
     "HAS_TRITON",
     "IS_HIP",
+    "M4_GEOM_EPS_OFFSET",
+    "M4_GEOM_EPS_SQ",
+    "M4_SUBSPACE_SCALE",
+    "compiled_m4_coincidence_chunk_step",
     "compiled_parseval_convex_traceless_chunk_step",
     "flash_born_attention",
     "flash_purified_born_attention",
@@ -25,4 +33,5 @@ __all__ = [
     "get_rdna4_autotune_configs",
     "quantize_fp8_vocab_transposed",
 ]
+
 

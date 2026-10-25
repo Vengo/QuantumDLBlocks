@@ -15,16 +15,17 @@ An engineering audit of the repository identified three anti-patterns that accum
      1. `examples/42_*.py` routed `value_embeds`, `unigram_qubits`, and `higher_states` into the **Gentle `2x` Zero-Weight-Decay Qubit Embedding `AdamW` group (`lr = 0.006, weight_decay = 0.0`)**, whereas `examples/11_*.py` omitted `value_embeds` (letting it fall into `weight_decay = 0.01`) and set `sparse_lr = 0.010` (`2.5 * 0.004`).
      2. `examples/42_*.py` initialized `model.povm_log_prior` via **Bose-saturated empirical log-unigram frequencies (`alpha = 0.62`, top-16 knee saturation)**, whereas `examples/11_*.py` did not call `initialize_povm_log_prior`.
 
-To prevent these failure modes permanently, all new and refactored code in `QuantumDLBlocks` MUST obey **Rules 1–6** below.
+To prevent these failure modes permanently, all new and refactored code in `QuantumDLBlocks` MUST obey **Rules 1–8** and the **Graceful Experiment Wrap-Up Protocol** below.
 
 ---
 
-## 2. The Six Mandatory Engineering Rules
+## 2. The Eight Mandatory Engineering Rules
 
-### Rule 1: File-Length Budget (`<= 1,000` Lines Soft Warning Limit, `<= 2,500` Lines Hard Limit, No Semicolon Line-Packing)
-- **Soft Limit (`<= 1,000` lines)**: Every new script or module in `examples/`, `scripts/`, and `src/qdlblocks/` should aim for **`<= 1,000` lines**. Exceeding `1,000` lines emits a soft-limit warning in `scripts/ast_signature_and_length_linter.py` (status `WARN (PASS)`).
-- **Hard Limit (`<= 2,500` lines)**: No Python file in `examples/`, `scripts/`, or `src/qdlblocks/` may exceed **`2,500` lines** (`FAIL` in `scripts/ast_signature_and_length_linter.py`).
-- **No Artificial Line-Packing**: Never pack multiple statements onto a single line with semicolons (`a = 1; b = 2`) or strip docstrings/readability formatting to artificially lower line counts.
+### Rule 1: Comment-Free Code-Length Budget (`<= 1,000` SLOC Soft Warning Limit, `<= 2,500` SLOC Hard Limit, Comments & Docstrings Are Free)
+- **Comments & Docstrings Do NOT Count Against Line Limits**: [`scripts/ast_signature_and_length_linter.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/ast_signature_and_length_linter.py) (`count_code_and_doc_lines`) strips all `#` comments, module/class/function docstrings (`"""..."""`), and blank lines before evaluating file and nested-function line limits. **Never skimp on comments or docstrings to save lines.**
+- **Soft Limit (`<= 1,000` executable code lines / SLOC)**: Every script or module in `examples/`, `scripts/`, and `src/qdlblocks/` should aim for **`<= 1,000` executable code lines (SLOC)**. Exceeding `1,000` SLOC emits a soft-limit warning in `scripts/ast_signature_and_length_linter.py` (status `WARN (PASS)`).
+- **Hard Limit (`<= 2,500` executable code lines / SLOC)**: No Python file in `examples/`, `scripts/`, or `src/qdlblocks/` may exceed **`2,500` SLOC** (`FAIL` in `scripts/ast_signature_and_length_linter.py`).
+- **No Artificial Line-Packing**: Never pack multiple statements onto a single line with semicolons (`a = 1; b = 2`).
 - **How to Comply**: Keep experiment modules focused (Rule 6) and extract reusable domain logic, data loaders, math kernels, or telemetry formatters into dedicated modules under `src/qdlblocks/benchmarks/` or `src/qdlblocks/layers/`.
 
 ### Rule 2: Function Signature Ceiling (`<= 8` Arguments) via Frozen `@dataclass` Configs
@@ -62,6 +63,18 @@ To prevent these failure modes permanently, all new and refactored code in `Quan
   1. **Share Stable Building-Block Primitives by Import**: Reusable, representation-agnostic building blocks (`BlockCholeskyLinear`, `WaveletCholeskyMultiscaleBranch`, `OvercompleteTwoBeamInterference`, `SubspaceProjectorBornAttention`, `StiefelMuon`, `build_dyadic_2pow16_spectral_tree`) live in `src/qdlblocks/layers/` and `src/qdlblocks/optim/` and are imported directly without modification.
   2. **Write a Clean, Direct, Flag-Free Module for the New Architecture**: Implement the new mathematical formulation in its own self-contained, straight-line module (e.g., `src/qdlblocks/models/parseval_mup_dyadic_gpt.py` and `src/qdlblocks/layers/parseval_mup_chunked_ce.py`, `~200–350` lines each) where `forward()` executes **only** the equation of that architecture—with zero `use_*` boolean flags, zero `if is_convex:` branches, and zero `Optional` legacy modules (`self.purity_gate = None`).
   3. **Freeze Previous Wave Models for Reproducible Baseline Comparisons**: Previous wave models remain untouched and frozen so cross-wave comparisons can import and evaluate both classes side-by-side in a clean verification script without risk of breaking historical baselines.
+
+### Rule 7: Top-of-File Named Constants & Mandatory `EXPERIMENT_PLAN_0XX.md` Synchronization
+- **Rule**: All numerical constants, scaling coefficients, damping exponents, thresholds, and empirical calibration factors MUST be defined as documented `UPPER_SNAKE_CASE` constants at the top of the file—never as unexplained inline "magic numbers" (such as `0.705 + 0.330 * progress` or `0.12 * w_c`) inside functions or methods.
+- **Mandatory Plan Synchronization**: Whenever any new constant is introduced or calibrated while implementing an `EXPERIMENT_PLAN_0XX.md`:
+  1. Define it at the top of the Python module with a comment stating its mathematical role and how it was derived/calibrated.
+  2. **Update the corresponding `EXPERIMENT_PLAN_0XX.md`** (in a dedicated **Constants & Calibration Ledger** table) and [`docs/BUILDING_BLOCKS.md`](file:///home/festivity/agy/QuantumDLBlocks/docs/BUILDING_BLOCKS.md) (if inside a reusable building block) so that code and specification never drift apart.
+
+### Rule 8: Thorough Building-Block Commenting & Experiment Provenance
+- **Rule**: Because comments and docstrings do **not** count against line limits (Rule 1), every reusable building block in `src/qdlblocks/{kernels,layers,models,optim,benchmarks}/` MUST be commented thoroughly enough for an independent, zero-context reviewer to understand:
+  1. **When to Use It**: The specific regime or bottleneck where the building block is useful (e.g., $V \gg d$ vocabulary readout, multi-scale channel conditioning, or $M$-subspace anti-collapse).
+  2. **Why It Was Built (Mathematical Rationale)**: The failure mode it resolves and the governing equation or invariance law it enforces.
+  3. **Experiment Provenance (`Wave XX` / `EXPERIMENT_PLAN_0XX.md`)**: Explicit citation of the experiment plan and wave that created and validated the building block, along with its key quantitative finding.
 
 ---
 
@@ -213,7 +226,24 @@ class ParsevalMuPDyadicGPT(nn.Module):
 ## 4. Automated AST Verification in CI / Pytest
 
 Every new module and CLI utility is verified via [`scripts/ast_signature_and_length_linter.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/ast_signature_and_length_linter.py) and `pytest` to enforce:
-1. Total line count `<= 1,000` lines target (`<= 1,200` hard ceiling) with zero semicolon statement packing.
+1. Executable code line count (SLOC, excluding comments and docstrings) `<= 1,000` soft limit (`<= 2,500` hard ceiling) with zero semicolon statement packing.
 2. Every `ast.FunctionDef` and `ast.AsyncFunctionDef` has `<= 8` parameters (excluding `self`/`cls`).
-3. New architectural waves are implemented in clean, flag-free modules (Rule 6) rather than adding boolean flags to legacy monoliths.
+3. New architectural waves are implemented in clean, flag-free modules (Rule 6) with documented top-of-file constants (Rule 7) and thorough provenance docstrings (Rule 8).
+
+---
+
+## 5. Implementer Context-Budget & Graceful Experiment Wrap-Up Protocol
+
+When implementing and evaluating an `EXPERIMENT_PLAN_0XX.md`, agents and subagents must balance **autonomous error-fixing** against **context-window discipline**:
+
+1. **Code Implementation Success $\ne$ Mandatory Full Training Evaluation Pass**:
+   - Successfully implementing the planned architecture, passing unit tests (`pytest`), and passing `scripts/ast_signature_and_length_linter.py` is a complete engineering deliverable even if a full training evaluation does not immediately beat every empirical baseline.
+2. **Proactive Debugging Within Bounded Context (`<= 2–3` Training Retries)**:
+   - Agents are encouraged to fix runtime errors, shape mismatches, or initialization bugs autonomously without stopping prematurely to ask for instructions.
+   - However, if diagnosing or tuning a full training evaluation begins to consume a large fraction of the agent's context window (or requires more than `2–3` GPU training retries), **do NOT loop endlessly on hyperparameter/training retries until context exhaustion**.
+3. **Graceful Experiment Wrap-Up & Post-Mortem Documentation**:
+   - Instead of exhausting the context window on repeated training runs, wrap up the experiment cleanly by adding a **Section 6: Experiment Outcomes, Constants Ledger, & Post-Mortem Analysis** to `EXPERIMENT_PLAN_0XX.md` (and syncing logs to the WebUI via `scripts/sync_waves_to_webui.py`) that records:
+     - **What Succeeded**: Analytical/CPU probes, mathematical invariants, unit tests, and throughput measurements.
+     - **Empirical Training Results Observed**: Exact metrics (`val_ce`, `top1_acc`, `R_sharp`, `kraus_stiefel_err`) from the runs executed.
+     - **Root-Cause Diagnosis & Next-Step Hypotheses**: Concrete mathematical or architectural hypotheses explaining why the training run behaved as it did and what specific change the next experiment should test.
 

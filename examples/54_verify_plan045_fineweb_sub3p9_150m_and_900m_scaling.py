@@ -224,11 +224,6 @@ def run_w29_arm(
     init_stats = initialize_parseval_mup_ngram_with_ppmi_svd(
         model, shared_data["ppmi_emb_256"], shared_data["init_tokens"], shared_data["prior_tokens"]
     )
-    if shared_data.get("kn_state") is not None:
-        model.ngram_proj._kn_state = shared_data["kn_state"]
-    else:
-        shared_data["kn_state"] = model.ngram_proj._kn_state
-
     muon_opt, adam_opt = build_parseval_mup_ngram_optimizers(
         model, base_muon_lr=spec.eta_max, base_wav_lr=0.0085, base_head_lr=0.005
     )

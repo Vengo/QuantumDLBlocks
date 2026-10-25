@@ -7,13 +7,23 @@ import torch.nn.functional as F
 
 
 # =====================================================================
+# Top-of-File Named Constants (Rule 7 of docs/SCRIPT_BEST_PRACTICES.md)
+# Documented in EXPERIMENT_PLAN_049.md (Wave 34 Constants & Calibration Ledger)
+# =====================================================================
+CUSTOM_L2_NORM_MIN_NUMEL: int = 262144
+
+
+# =====================================================================
 # 1. Pure-State Hyperspherical & Stiefel Manifold Operations
 # =====================================================================
 class _L2NormalizeFn(torch.autograd.Function):
     """Memory-efficient L2 normalization saving only `y` (in `x.dtype`) and `r_inv` (`(..., 1)`)."""
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, dim: int, eps: float) -> torch.Tensor:  # type: ignore[override]
+    def forward(ctx, x: torch.Tensor, dim: int = -1, eps: float = 1e-12) -> torch.Tensor:  # type: ignore[override]
+        if isinstance(dim, float):
+            eps = float(dim)
+            dim = -1
         x_f = x.float()
         r_inv = torch.rsqrt(torch.sum(x_f * x_f, dim=dim, keepdim=True) + eps)
         y = (x_f * r_inv).to(x.dtype)
@@ -45,10 +55,11 @@ def l2_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-12) -> torch.Te
         norm_sq = torch.sum(x.real.float().square() + x.imag.float().square(), dim=dim, keepdim=True)
         return x * torch.rsqrt(norm_sq + eps).to(x.real.dtype)
     if (
-        x.requires_grad
-        and x.ndim == 3
+        x.is_cuda
+        and x.requires_grad
+        and x.ndim >= 2
         and x.dtype in (torch.float16, torch.bfloat16)
-        and x.numel() > 10_000_000
+        and x.numel() >= CUSTOM_L2_NORM_MIN_NUMEL
         and not torch.compiler.is_compiling()
     ):
         return _L2NormalizeFn.apply(x, int(dim), float(eps))  # type: ignore[return-value]

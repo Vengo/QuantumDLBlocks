@@ -1,6 +1,6 @@
 # QuantumDLBlocks Reusable Building Blocks & Kernel Catalog (`docs/BUILDING_BLOCKS.md`)
 
-**Authoritative Agent & Researcher Reference for Composable Quantum-Geometric Primitives, Fused GPU Kernels, Stiefel Optimizers, and Diagnostic Probes (Current as of `Wave 29` / `EXPERIMENT_PLAN_045`).**
+**Authoritative Agent & Researcher Reference for Composable Quantum-Geometric Primitives, Fused GPU Kernels, Stiefel Optimizers, and Diagnostic Probes (Current as of `Wave 34` / `EXPERIMENT_PLAN_049`).**
 
 > **Mandatory Agent Instruction (See [`AGENTS.md`](file:///home/festivity/agy/QuantumDLBlocks/AGENTS.md) Sections 5 & 6)**:
 > 1. **Read Before Planning or Coding**: Every agent and subagent MUST consult this catalog before drafting a new `EXPERIMENT_PLAN_0XX.md` or writing model/layer/kernel code so that new experiments compose our proven, high-throughput building blocks instead of re-implementing them or reviving superseded legacy patterns.
@@ -13,16 +13,17 @@
 
 | Subsystem | Canonical Reusable Component (Use This!) | Import Path | Status | Superseded / Frozen Counterpart (Do NOT Extend) |
 | :--- | :--- | :--- | :---: | :--- |
-| **Fused Readout & CE GPU Kernel** | `compiled_parseval_convex_traceless_chunk_step`, `fused_fp8_or_bf16_chunk_gemm`, `quantize_fp8_vocab_transposed` | `from qdlblocks.kernels import ...` ([`fused_parseval_ce.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/fused_parseval_ce.py)) | **CANONICAL (`Wave 28`)** | Unfused eager elementwise chunk steps or `float32` backward GEMMs |
-| **Fused Attention GPU Kernel** | `flash_born_attention`, `flash_purified_born_attention` | `from qdlblocks.kernels import ...` ([`flash_born_triton.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/flash_born_triton.py)) | **CANONICAL** | Materialized $O(B \cdot H \cdot T^2)$ attention matrices at $d \ge 384$ or $T \ge 1024$ |
-| **Unit-Sphere Readout & Loss Layer** | `parseval_mup_dyadic_chunked_ce`, `eval_parseval_mup_full_logits`, `ParsevalChunkedCEReadoutSpec` | `from qdlblocks.layers import ...` ([`parseval_mup_chunked_ce.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/parseval_mup_chunked_ce.py)) | **CANONICAL (`Wave 28`)** | `direct_chunked_two_beam_kboson_ce` + `ContextualBlochPurityGate` + `kboson_raw_k` + manual clamps (`26.8` / `44.0`) |
+| **Fused Readout & CE GPU Kernel** | `compiled_m4_coincidence_chunk_step`, `compiled_parseval_convex_traceless_chunk_step`, `fused_fp8_or_bf16_chunk_gemm`, `quantize_fp8_vocab_transposed` | `from qdlblocks.kernels import ...` ([`fused_parseval_ce.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/fused_parseval_ce.py)) | **CANONICAL (`Waves 28 & 34`)** | Unfused eager elementwise chunk steps or `float32` backward GEMMs |
+| **Fused Attention GPU Kernel** | `flash_born_attention`, `flash_purified_born_attention` (supports both `head_dim = 64` and non-pow2 `head_dim in {48, 80, 96, 112}` via `BLOCK_D = next_power_of_2(HEAD_DIM)`) | `from qdlblocks.kernels import ...` ([`flash_born_triton.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/flash_born_triton.py)) | **CANONICAL (`Wave 34`)** | Materialized $O(B \cdot H \cdot T^2)$ attention matrices at $d \ge 384$ or $T \ge 1024$ |
+| **Unit-Sphere & Product-of-Spheres Readout** | `parseval_mup_dyadic_chunked_ce`, `subspace_coincidence_dyadic_chunked_ce`, `subspace_l2_normalize` (pair-strided `(..., d//8, 4, 2)`), `strided_subspace_l2_normalize`, `SubspaceCoincidenceSpec` | `from qdlblocks.layers import ...` ([`parseval_mup_chunked_ce.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/parseval_mup_chunked_ce.py), [`subspace_coincidence_born.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/subspace_coincidence_born.py)) | **CANONICAL (`Waves 28–34`)** | `direct_chunked_two_beam_kboson_ce` + `ContextualBlochPurityGate` + `kboson_raw_k` + manual clamps (`26.8` / `44.0`) |
+| **Level-Separated Wavelets & 1D Conv Bank** | `WaveletScaleState` (pair-strided symplectic layout), `MultiRateWavefunctionConvBank` | `from qdlblocks.layers import WaveletScaleState, MultiRateWavefunctionConvBank` ([`multirate_wavefunction_conv.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/multirate_wavefunction_conv.py)) | **CANONICAL (`Waves 32–34`)** | Global L2 normalization over summed wavelet levels `l2_normalize(c3+c2+c1+c0)` that crushes fine leaves |
 | **SPD Metric Conditioning** | `BlockCholeskyLinear(d, max_block_size=32, fast_spd_bmm=True)` | `from qdlblocks.layers import BlockCholeskyLinear` ([`wavelet_cholesky_branch.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/wavelet_cholesky_branch.py)) | **CANONICAL (`2.55x` BMM)** | `fast_spd_bmm=False` sequential Python `for b in range(num_blocks)` loop |
 | **Multi-Scale Wavelet Branch** | `WaveletCholeskyMultiscaleBranch`, `WaveletCholeskyConfig` | `from qdlblocks.layers import WaveletCholeskyMultiscaleBranch` ([`wavelet_cholesky_branch.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/wavelet_cholesky_branch.py)) | **CANONICAL** | Single-scale Euclidean MLPs |
 | **Two-Beam Phase Interferometer** | `OvercompleteTwoBeamInterference` | `from qdlblocks.layers import OvercompleteTwoBeamInterference` ([`overcomplete_two_beam.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/overcomplete_two_beam.py)) | **CANONICAL** | Single-beam additive residuals without Mach-Zehnder phase gating |
 | **Dyadic $2^{16}$ Vocab Pyramid** | `Tied2Pow16WaveletCholeskyPyramid`, `build_dyadic_2pow16_spectral_tree` (with $d_{\text{mid}}=d/2, d_{\text{fine}}=d/4$, `num_fine_up_banks=1`) | `from qdlblocks.models import Tied2Pow16WaveletCholeskyPyramid` ([`wavelet_cholesky_2pow16_gpt.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/wavelet_cholesky_2pow16_gpt.py)) | **CANONICAL** | Fixed $(128, 64)$ ranks at $d > 256$ (rank-starved) or `16`-bank ambient synthesis |
-| **Flag-Free Language Models** | `ParsevalMuPNGramSpeedrunGPT` (`Wave 29` N-Gram + $V^{(0)}$ Speedrun) & `ParsevalMuPDyadicGPT` (`Wave 28` Base) | `from qdlblocks.models import ParsevalMuPNGramSpeedrunGPT, ParsevalMuPDyadicGPT` ([`parseval_mup_ngram_speedrun_gpt.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/parseval_mup_ngram_speedrun_gpt.py)) | **CANONICAL (`Waves 28–29`)** | `Radical2Pow16WaveletCholeskyGPT` (frozen `Waves 20–27` baseline) & `QuantumBornGPT` (`Waves 1–19`) |
+| **Flag-Free Language Models** | `LevelSeparatedWaveletConvGPT` (`Waves 32–34`), `ParsevalMuPSubspaceCoincidenceGPT` (`Wave 31`), `ParsevalMuPNGramSpeedrunGPT` (`Waves 29–30`), `ParsevalMuPDyadicGPT` (`Wave 28`) | `from qdlblocks.models import LevelSeparatedWaveletConvGPT, ParsevalMuPSubspaceCoincidenceGPT, ParsevalMuPNGramSpeedrunGPT, ParsevalMuPDyadicGPT` ([`level_separated_wavelet_conv_gpt.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/level_separated_wavelet_conv_gpt.py)) | **CANONICAL (`Waves 28–34`)** | `Radical2Pow16WaveletCholeskyGPT` (frozen `Waves 20–27` baseline) & `QuantumBornGPT` (`Waves 1–19`) |
 | **Fast-Loop Vision Ablation Lab** | `WaveletCholeskyVisionClassifier`, `TiedDyadicWaveletClassPyramid`, `load_or_download_imagenet1k_32x32` | `from qdlblocks.models import WaveletCholeskyVisionClassifier` ([`wavelet_cholesky_vision.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/wavelet_cholesky_vision.py)) | **CANONICAL (`~11s`/run)** | Slow multi-hour language runs for initial readout/layer screening |
-| **Riemannian Stiefel Optimizer** | `StiefelMuon` (`polar_express`, `stiefel_penalty=0.02`, `use_normuon=True`, `use_twin_rail=True`) | `from qdlblocks.optim import StiefelMuon` ([`muon.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/optim/muon.py)) | **CANONICAL** | Hard periodic QR snapping or routing `kraus_generators` to Euclidean `AdamW` |
+| **Riemannian Stiefel Optimizer** | `StiefelMuon` (`polar_express`, `stiefel_penalty=0.02`, `use_normuon=True`, `use_twin_rail=True`, routes both 3D `kraus_generators` and 2D backbone projections) | `from qdlblocks.optim import StiefelMuon` ([`muon.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/optim/muon.py)) | **CANONICAL (`Wave 34`)** | Hard periodic QR snapping or routing `kraus_generators` / 2D `qkv_proj` to Euclidean `AdamW` |
 | **Experiment Logger & WebUI Ingestor** | `StandardizedExperimentLogger`, `ExperimentIntentSpec`, `ingest_all_waves_and_verifications` | `from qdlblocks.benchmarks import StandardizedExperimentLogger, ExperimentIntentSpec` ([`experiment_logger.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/experiment_logger.py)) | **CANONICAL (`Plan 044`)** | Ad-hoc unparsed JSON dumps without `[EXPERIMENT_INTENT]` or `ModelCard v1.0` |
 
 ---
@@ -31,12 +32,15 @@
 
 Writing custom GPU kernels inside a single `examples/XX_*.py` script prevents reuse across waves. All custom Triton and `@torch.compile` (TorchInductor) + Tensor-Core kernels live in [`src/qdlblocks/kernels/`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/__init__.py) and are exported from `qdlblocks.kernels`.
 
-### 2.1 Fused Parseval Convex-Traceless Chunked CE Kernel ([`fused_parseval_ce.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/fused_parseval_ce.py))
-- **Purpose**: Fuses the entire per-chunk vocabulary readout ($V_{\text{chunk}} = 4,096$) into two Tensor-Core GEMMs (`FP8 E4M3` via `torch._scaled_mm` or `BF16`) plus a single TorchInductor `@torch.compile` kernel (`compiled_parseval_convex_traceless_chunk_step`) that computes centered sharp & diffuse observables, rectified-quadratic target peak boost $\gamma \max(\hat{c}_{t,v}, 0)^2$, chunk partition sums, and exact analytical gradients $(g_{\text{sharp}}, g_{\text{diff}})$ in one SRAM pass.
-- **Measured Speedup**: Doubles end-to-end training throughput from `11,116 tok/s` to **`24,658–25,270 tok/s`** at $d=256$ (`5.48 GB` VRAM) and **`18,335 tok/s`** at $d=384$ (`6.89 GB` VRAM) while avoiding `(N_tok, 50257)` `float32` logit materialization.
+### 2.1 Fused Parseval Convex-Traceless & 50,257-Way $M=4$ Coincidence Chunked CE Kernels ([`fused_parseval_ce.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/fused_parseval_ce.py))
+- **Purpose**:
+  - `compiled_parseval_convex_traceless_chunk_step` (`Wave 28`): Fuses the per-chunk $M=1$ vocabulary readout ($V_{\text{chunk}} = 4,096$) into two Tensor-Core GEMMs (`FP8 E4M3` via `torch._scaled_mm` or `BF16`) plus a single TorchInductor `@torch.compile` kernel that computes centered sharp & diffuse observables, rectified-quadratic target peak boost $\gamma \max(\hat{c}_{t,v}, 0)^2$, chunk partition sums, and exact analytical gradients $(g_{\text{sharp}}, g_{\text{diff}})$ in one SRAM pass.
+  - `compiled_m4_coincidence_chunk_step` (`Wave 34` / `EXPERIMENT_PLAN_049.md`): Evaluates true 50,257-way $M=4$ Product-of-Spheres coincidence $\widehat{O}_{t,v}^{(4)} = \bar{c} + \gamma \widehat{Q} + \gamma_c \widehat{G} - \lambda_{\text{var}} \widehat{V}_{\text{sub}}$ and exact analytical per-subspace backward pullback `grad_s_m` `(4, C, V_act)` from batched `torch.bmm(psi_m[:, start:end], m_s_m.transpose(1, 2))` with identical `2 * C * d * V_act` GEMM FLOPs to $M=1$.
+- **Measured Speedup**: Doubles end-to-end training throughput from `11,116 tok/s` to **`24,658–25,270 tok/s`** at $d=256$ (`2.86 GB` VRAM after `Wave 34` memory optimizations) while avoiding `(N_tok, 50257)` `float32` logit materialization.
 - **Usage**:
   ```python
   from qdlblocks.kernels import (
+      compiled_m4_coincidence_chunk_step,
       compiled_parseval_convex_traceless_chunk_step,
       fused_fp8_or_bf16_chunk_gemm,
       quantize_fp8_vocab_transposed,
@@ -44,7 +48,7 @@ Writing custom GPU kernels inside a single `examples/XX_*.py` script prevents re
   ```
 
 ### 2.2 Fused Triton Flash-Born Attention ([`flash_born_triton.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/flash_born_triton.py))
-- **Purpose**: Computes causal Born-rule attention $P(j \mid i) \propto \max(0, \beta_h \sqrt{d_h}\langle K_j \mid Q_i\rangle)^2$ and purified Born attention inside $64 \times 64$ GPU SRAM tiles with atomic-free backward passes (`dQ`, `dK`, `dV`), reducing attention VRAM by up to `94%` and accelerating $T \ge 1024$ or $d \ge 384$ runs by up to `4.39x`.
+- **Purpose**: Computes causal Born-rule attention $P(j \mid i) \propto \max(0, \beta_h \sqrt{d_h}\langle K_j \mid Q_i\rangle)^2$ and purified Born attention inside $64 \times 64$ GPU SRAM tiles with atomic-free backward passes (`dQ`, `dK`, `dV`). As of `Wave 34` (`EXPERIMENT_PLAN_049.md`), supports both canonical `head_dim = 64` (`num_heads = max(2, d // 64)`) and non-power-of-2 `head_dim in {48, 80, 96, 112}` via `BLOCK_D = triton.next_power_of_2(HEAD_DIM)` column masking, eliminating the `+2.75 GiB` PyTorch fallback across all widths $d \in \{256, 384, 512, 640, 768, 896, 1024\}$.
 - **Usage**:
   ```python
   from qdlblocks.kernels import flash_born_attention, flash_purified_born_attention
@@ -59,7 +63,7 @@ Writing custom GPU kernels inside a single `examples/XX_*.py` script prevents re
   On the unit sphere $\mathbb{S}^{d-1}$, a tight Parseval frame $\{m_v\}_{v=1}^V$ has background inner-product standard deviation $\sigma = 1/\sqrt{d}$ while a true aligned target has $\hat{c}_{t,y} = \mathcal{O}(1)$. Instead of a dynamic per-token `PurityGate` MLP, redundant `kboson_raw_k` mode counter, and manual temperature clamps (`26.8` / `44.0`), [`parseval_mup_dyadic_chunked_ce`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/parseval_mup_chunked_ce.py) uses the deterministic Parseval $\mu\text{P}$ scale $\beta_0(d) = c^*\sqrt{d}$ ($c^* = 1.48$) with the **Convex-Peak Traceless Born Observable** and **256-Root Dyadic Coarse-to-Fine Conditional Readout**:
   $$\widehat{O}_{t,v} = \hat{c}_{t,v} + \gamma\left(\max(\hat{c}_{t,v}, 0)^2 - \tau_{t,+}\right), \qquad \ell_{t,v} = \beta(\tau)\widehat{O}_{t,v} + \tilde{\lambda}_{\text{diff}}(\tau)\hat{f}_{\text{diff}, t, v} + b_v + w_{\text{coarse}}\ln P_{\text{coarse}}(g(v) \mid x_t)$$
 - **Post-Normalization Cholesky Temperature Absorption**:
-  Via `model.absorb_beta_into_readout_cholesky()`, the scale $\beta_0(d)^{1/2}$ can be absorbed directly into the positive-definite Cholesky factors $L \leftarrow \beta_0(d)^{1/4} L$ of `readout_chol` applied *after* unit-sphere normalization (exact equivalence `< 7.6e-6`).
+  Via `model.absorb_beta_into_readout_cholesky()`, the scale $\beta_0(d)^{1/2}$ can be absorbed directly into the positive-definite Cholesky factors $L \leftarrow \beta_0(d)^{1/4} L$ of `readout_chol` applied *after* unit-sphere/subspace normalization (exact equivalence `< 7.6e-6`).
 - **Usage**:
   ```python
   from qdlblocks.layers import (
@@ -89,12 +93,37 @@ Writing custom GPU kernels inside a single `examples/XX_*.py` script prevents re
 - **`OvercompleteTwoBeamInterference`**:
   Splits features into two coherent beams that interfere through learnable $2 \times 2$ unitary Mach-Zehnder beamsplitters $\begin{pmatrix}\cos\theta & \sin\theta \\ -\sin\theta & \cos\theta\end{pmatrix}$ and cosine relative-phase gates before re-normalizing onto $\mathbb{S}^{d-1}$. On genuine `ILSVRC ImageNet-1K` (`50,000` official validation images), ablating this layer degrades Validation Cross-Entropy by `+0.2025` nats (`8.49% -> 7.56%` Top-1).
 
+### 3.4 Product-of-Spheres $(\frac{1}{\sqrt{M}}\mathbb{S}^{d/M - 1})^M$ & Multi-Subspace Coincidence Born Readout (`subspace_coincidence_born.py` — `Waves 31–34` / `EXPERIMENT_PLAN_046.md` – `EXPERIMENT_PLAN_049.md`)
+- **When to Use It**: Whenever additive branches (`wav_256`, `readout_ngram`, or coarse-vs-fine wavelet levels) compete inside a single global L2 normalization and cause the sharp detector participation ratio $R_{\text{sharp}}$ to collapse (e.g. `77.52 -> 24.18` in `Wave 30`), or when single-subspace positive runner-up impostors ($Z_{\text{pos\_runnerup}}$) inflate Cross-Entropy at $V \gg d$.
+- **Why It Was Built (`EXPERIMENT_PLAN_046.md` – `EXPERIMENT_PLAN_049.md`)**:
+  - `subspace_l2_normalize(x, num_subspaces=M, partition_mode=...)` and `strided_subspace_l2_normalize(x, num_subspaces=M)` project states and detectors onto $\mathcal{M}_{d, M} = (\frac{1}{\sqrt{M}}\mathbb{S}^{d/M - 1})^M \subset \mathbb{S}^{d-1}$ using the canonical **pair-strided symplectic layout** `(*lead, d // (2 * M), M, 2)` (`Wave 34`), preserving both exact unit norm $\|x\|_2 = 1$ and exact even/odd `(a_self, b_orth)` symplectic pair orthogonality while locking equal $1/M$ energy in each subspace.
+  - `compute_coarse_cluster_centers` (`Wave 34`) forms root-consistent 256 coarse centroids from non-cancelling Subspace 0 (`COARSE_ROOT_SUBSPACE_BLEND = 0.85`), eliminating the `2.10`-nat detail-cancellation floor (`< 0.02` nats at $\alpha = 1.0$).
+  - `subspace_coincidence_dyadic_chunked_ce` and `eval_subspace_coincidence_full_logits` (`Wave 34`) support full 50,257-way $M=4$ fine coincidence via `compiled_m4_coincidence_chunk_step` (`use_fine_m4_chunked_coincidence=True`) with exact train/eval parity.
+- **Usage**:
+  ```python
+  from qdlblocks.layers import (
+      SubspaceCoincidenceSpec,
+      compute_multi_subspace_coincidence_observable,
+      eval_subspace_coincidence_full_logits,
+      strided_subspace_l2_normalize,
+      subspace_coincidence_dyadic_chunked_ce,
+      subspace_l2_normalize,
+  )
+  ```
+
+### 3.5 Explicit Level-Separated Wavelet Tensors (`WaveletScaleState`) & Pre-Attention Multi-Rate 1D Wavefunction Convolution Bank (`multirate_wavefunction_conv.py` — `Waves 32–34` / `EXPERIMENT_PLAN_047.md` – `EXPERIMENT_PLAN_049.md`)
+- **When to Use It**: Whenever synthesizing multi-scale wavelet representations (`coarse_256`, `mid_2048`, `sub_8192`, `fine_65536`) so that each wavelet level is kept as a distinct tensor in code (`WaveletScaleState`) normalized independently onto $\frac{1}{\sqrt{4}}\mathbb{S}^{d/4 - 1}$ (`25.0%` energy per level) and interleaved via pair-strided symplectic pairs `(*lead, d // 8, 4, 2)`, and when evolving token wavefunctions inside every backbone layer via causal 1D strided/dilated wavefunction convolutions (`MultiRateWavefunctionConvBank`, temporal dilations `(4, 2, 1, 1)`) *before* feeding into Quantum Born Attention.
+- **Usage**:
+  ```python
+  from qdlblocks.layers import MultiRateWavefunctionConvBank, WaveletScaleState
+  ```
+
 ---
 
 ## 4. Reference Architectures & Dyadic Pyramids (`src/qdlblocks/models/`)
 
-### 4.1 Flag-Free Parseval $\mu\text{P}$ Dyadic GPT (`parseval_mup_dyadic_gpt.py` — Current Canonical LM)
-- **What It Is**: The clean, flag-free `Wave 28` language model (`351` lines, zero `use_*`/`is_*` flags, zero `PurityGate`, zero `kboson_raw_k`, zero clamps).
+### 4.1 Flag-Free Parseval $\mu\text{P}$ Dyadic GPT (`parseval_mup_dyadic_gpt.py` — `Wave 28` / `EXPERIMENT_PLAN_043.md`)
+- **What It Is**: The clean, flag-free `Wave 28` language model (`zero` `use_*`/`is_*` flags, zero `PurityGate`, zero `kboson_raw_k`, zero clamps).
 - **Proportional Dyadic Wavelet Ranks (`Wave 27` & `Wave 28` Discovery)**:
   In `Tied2Pow16WaveletCholeskyPyramid`, vocabulary words ($V = 50,257 \subset N = 2^{16} = 65,536$) are synthesized coarse-to-fine from `wav_256`, `wav_2048`, `wav_8192`, and `wav_65536`. When scaling model width $d > 256$, **always scale wavelet detail ranks proportionally** ($d_{\text{mid}} = d // 2, d_{\text{fine}} = d // 4$, which `ParsevalMuPDyadicConfig` sets automatically) so the vocabulary frame's effective rank $R_{\text{eff}}(M)$ scales with $d$ rather than bottlenecking at $(128, 64)$.
 - **Minimal Usage**:
@@ -116,13 +145,45 @@ Writing custom GPU kernels inside a single `examples/XX_*.py` script prevents re
 - **What It Is**: `WaveletCholeskyVisionClassifier` + `TiedDyadicWaveletClassPyramid` on cached GPU tensors for `CIFAR-100` ($K=100, N=128$), `1,000-Class Fine-Grained` ($K=1,000, N=1,024$), and genuine `ILSVRC ImageNet-1K` ($K=1,000$ WordNet classes, `1,281,167` train / `50,000` val / `100,000` test across $32 \times 32$ and $64 \times 64$ multi-level 2D Sweldens wavelets).
 - **When to Use It**: Whenever you want to test a new quantum building block, interferometer, Kraus bath, or readout equation in **`10–12 seconds` per full training run** before committing to a multi-minute `FineWeb-Edu` language model run.
 
+### 4.3 Flag-Free Parseval $\mu\text{P}$ + Hashed N-Gram + Cross-Layer $V^{(0)}$ Speedrun GPT (`parseval_mup_ngram_speedrun_gpt.py` — `Waves 29–34` / `EXPERIMENT_PLAN_045.md` & `EXPERIMENT_PLAN_049.md`)
+- **What It Is**: Unifies `Wave 28`'s flag-free Parseval $\mu\text{P}$ $\beta_0(d) = 1.48\sqrt{d}$ + Convex-Peak Traceless Born + 256-Root Dyadic Hierarchy + FP8 fused readout with `HashedSurfaceNGramProjector` and Cross-Layer $V^{(0)}$ value residuals. As of `Wave 34` (`EXPERIMENT_PLAN_049.md`), `build_parseval_mup_ngram_optimizers` routes all 2D backbone matrices (`qkv_proj`, `out_proj`, `interferometer`) and 3D `kraus_generators` to `StiefelMuon` (`retract_every=2`), excludes `conv_bank.*.diag_raw/tril_raw` from weight decay (`_CHOL_KEYS`), and scales sparse fine wavelet tables (`wav_65536`, `wav_8192`) in `wavelet_fine_sparse` at `FINE_WAVELET_SPARSE_LR = 0.0156 * sqrt(256 / d)`.
+- **Minimal Usage**:
+  ```python
+  from qdlblocks.models import (
+      HashedSurfaceNGramProjector,
+      ParsevalMuPNGramSpeedrunConfig,
+      ParsevalMuPNGramSpeedrunGPT,
+      build_parseval_mup_ngram_optimizers,
+      initialize_parseval_mup_ngram_with_ppmi_svd,
+  )
+  ```
+
+### 4.4 Flag-Free Product-of-Spheres Multi-Subspace Coincidence GPT (`parseval_mup_subspace_coincidence_gpt.py` — `Wave 31` / `EXPERIMENT_PLAN_046.md`)
+- **What It Is**: Extends `ParsevalMuPNGramSpeedrunGPT` with Product-of-Spheres $\mathcal{M}_{d, M} = (\frac{1}{\sqrt{M}}\mathbb{S}^{d/M - 1})^M$ detector & pre-readout normalization (`partition_mode="contiguous"` or `"strided"`) and 256-root multi-subspace coincidence gating (`SubspaceCoincidenceSpec`).
+
+### 4.5 Flag-Free Level-Separated Wavelet + Per-Layer Pre-Attention 1D Wavefunction Convolution GPT (`level_separated_wavelet_conv_gpt.py` — `Waves 32–34` / `EXPERIMENT_PLAN_047.md` – `EXPERIMENT_PLAN_049.md`)
+- **What It Is**: Separates the 4 dyadic wavelet pyramid levels (`coarse_256`, `mid_2048`, `sub_8192`, `fine_65536`) into distinct tensors in `WaveletScaleState` using symplectic-pair-preserving folding (`_fold_to_level_dim`), evolves them inside **every backbone block (`PreAttnMultiRateWaveletConvBlock`)** via pre-attention `MultiRateWavefunctionConvBank` -> `SubspaceProjectorBornAttention` (with $V^{(0)}$ value residual and canonical `head_dim = 64`) -> post-attention `WaveletCholeskyMultiscaleBranch` + causal coarse shift + `OvercompleteTwoBeamInterference`, and checkpoints `synthesize_detectors()` during training so $d \in [256, 1024]$ fits cleanly in 16 GB VRAM.
+- **Minimal Usage**:
+  ```python
+  from qdlblocks.models import (
+      LevelSeparatedWaveletConvConfig,
+      LevelSeparatedWaveletConvGPT,
+      PreAttnMultiRateWaveletConvBlock,
+      build_level_separated_wavelet_conv_optimizers,
+      initialize_level_separated_wavelet_conv_with_ppmi_svd,
+      synthesize_level_separated_wavelet_state,
+  )
+  ```
+
 ---
 
 ## 5. Riemannian Stiefel Optimization & Learning-Rate Schedules (`src/qdlblocks/optim/`)
 
-### 5.1 `StiefelMuon` & Mandatory Routing for `kraus_generators`
-- **Critical Lesson (`Wave 22`)**: `pyramid.kraus_generators` has shape `(R, d, d)` (`ndim == 3`). Never let a substring filter route `kraus_generators` to Euclidean `AdamW(weight_decay=0.0)`, or its Stiefel error $\|K_r^\top K_r - I\|_F / \sqrt{d}$ will drift to `> 20.0`.
-- **Canonical Setup**: Route `kraus_generators` and 2D orthogonal projection matrices to `StiefelMuon(..., stiefel_penalty=0.02, polar_method="polar_express", use_normuon=True, use_twin_rail=True)` and call `model.retract_kraus_generators()` every 2 steps, which keeps `kraus_stiefel_err <= 0.015` smoothly with zero momentum shocks.
+### 5.1 `StiefelMuon` & Mandatory Routing for `kraus_generators` and 2D Backbone Projections
+- **Critical Lessons (`Wave 22` & `Wave 34`)**:
+  1. `pyramid.kraus_generators` has shape `(R, d, d)` (`ndim == 3`). Never let a substring filter route `kraus_generators` to Euclidean `AdamW(weight_decay=0.0)`, or its Stiefel error $\|K_r^\top K_r - I\|_F / \sqrt{d}$ will drift to `> 20.0`.
+  2. Never omit the 2D `p.ndim == 2 and min(p.shape) >= 32 and max(p.shape) <= 2048` branch when building `StiefelMuon` parameter groups (`Bug 1` in `EXPERIMENT_PLAN_049.md`), or `qkv_proj`, `out_proj`, and `interferometer` matrices fall into `AdamW` at `7.4x` lower LR without Polar Express orthogonalization.
+- **Canonical Setup**: Route both 3D `kraus_generators` and 2D orthogonal projection matrices to `StiefelMuon(..., stiefel_penalty=0.02, ortho_method="polar_express", retract_every=2, use_normuon=True, use_twin_rail=True)` and call `model.retract_kraus_generators()` every 2 steps, which keeps `kraus_stiefel_err <= 0.015` smoothly with zero momentum shocks.
 
 ### 5.2 Choosing Between NanoGPT `WSD` and Smith 2-Cycle `CLR` (`arXiv:1506.01186`)
 - **Fixed-Horizon Runs (`modded_nanogpt_wsd`)**: Best when the total token horizon $T_{\max}$ is fixed in advance and only the final checkpoint at $\tau = 1.00$ matters (`5.4372` at $d=256$, `4.7919` at $d=512$ / `29.49M` tokens). Warning: uncooled intermediate checkpoints at $\tau \in [0.04, 0.60]$ sit at peak LR $\eta_{\max}$ and appear `+0.15` nats worse until the cooldown branch is run (`scripts/isotoken_wsd_cooldown_branch_evaluator.py`).
@@ -136,7 +197,18 @@ Before writing any ad-hoc one-liner, check if one of our deterministic CLI tools
 
 | Script | Purpose & Example Invocation |
 | :--- | :--- |
-| [`scripts/ast_signature_and_length_linter.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/ast_signature_and_length_linter.py) | Enforces Rules 1–6 (`<= 1,000` soft / `<= 2,500` hard lines, `<= 8` args, zero semicolons, max nested function length). |
+| [`scripts/ast_signature_and_length_linter.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/ast_signature_and_length_linter.py) | Enforces Rules 1–8 (`<= 1,000` soft / `<= 2,500` hard comment-free SLOC lines, `<= 8` args, zero semicolons, max nested function SLOC). |
+| [`scripts/sync_waves_to_webui.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/sync_waves_to_webui.py) | Normalizes all `.cache/model_cards/` and `.cache/live_logs/` into `ModelCard v1.0`, syncs `.cache/benchmarks.db` across all 3 WebUI tabs, and reloads `http://127.0.0.1:8765`. |
+| [`scripts/subspace_energy_and_rank_drift_tracker.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/subspace_energy_and_rank_drift_tracker.py) | Audits per-subspace energy fractions `energy_coarse_256..energy_fine_65536`, per-subspace participation ratios `r_sharp_coarse_256..r_sharp_fine_65536`, global `sharp_eff_rank` (`centered_r_sharp`), effective temperature `mean_beta`, and `coincidence_gamma_eff` drift across milestones (`EXPERIMENT_PLAN_049.md`). |
+| [`scripts/factorized_256x256_hierarchical_softmax_bench.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/factorized_256x256_hierarchical_softmax_bench.py) | Computes the exact 4-shell (`S_sib,8`, `S_mid,32`, `S_coarse,256`, `S_bg`) dyadic CE floor $\mathcal{L}_{\text{CE}}^{\text{shell}}(d, M, \alpha)$, verifies Subspace-0 root-consistent coarse centroids (`2.10 -> < 0.01` nats), and benchmarks `factorized_256x256_coincidence_ce` (`512` dot products/token, `98.16x` fewer GEMM FLOPs) (`EXPERIMENT_PLAN_049.md`). |
+| [`scripts/max_width_vram_and_flash_born_profiler.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/max_width_vram_and_flash_born_profiler.py) | Profiles parameter budgets, Flash-Born support (`hd = 64` and `H = 8`), saved detector autograd memory (`MiB`), peak step VRAM (`MiB`), and throughput (`tok/s`) across $d \in \{256, 384, 512, 640, 768, 1024\}$ on the 16 GB GPU (`EXPERIMENT_PLAN_049.md`). |
+| [`scripts/multirate_wavefunction_conv_receptive_field_profiler.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/multirate_wavefunction_conv_receptive_field_profiler.py) | Profiles per-layer pre-attention temporal impulse response across lags `0..16`, strict causality (`max_future_leakage == 0`), and progress-ramped coincidence warmup (`coincidence_gamma(tau) = 0.22 * tau`) (`EXPERIMENT_PLAN_048.md`). |
+| [`scripts/subspace_specialization_mutual_information_probe.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/subspace_specialization_mutual_information_probe.py) | Audits cross-level L2 norm cannibalization (`1.44%` vs. `25.00%` fine `wav_65536` energy under `8x` coarse growth), contiguous vs. strided SVD variance skew (`304.66x` vs. `6.26x`), and pairwise cross-subspace Gaussian mutual information (`EXPERIMENT_PLAN_047.md`). |
+| [`scripts/multi_subspace_coincidence_margin_probe.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/multi_subspace_coincidence_margin_probe.py) | Audits Product-of-Spheres $R_{\text{sharp}}$ anti-collapse (`8.30x` at $d=512, M=4$) and single-subspace runner-up impostor CE tax suppression (`-1.3414` nats) (`EXPERIMENT_PLAN_046.md`). |
+| [`scripts/sub3p28_at_150m_and_900m_feasibility_analyzer.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/sub3p28_at_150m_and_900m_feasibility_analyzer.py) | Analyzes the 4 mathematical & engineering levers to reach `< 3.28` Val CE at `900M` and `150M` tokens. |
+| [`scripts/fineweb_150m_300m_900m_scaling_projector.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/fineweb_150m_300m_900m_scaling_projector.py) | Fits Chinchilla scaling laws across `Waves 11–17` (`900M` FineWeb) and `Waves 21–30` (`ParsevalMuPNGramSpeedrunGPT`) to evaluate `50M`, `100M`, `150M`, `300M`, `450M`, and `900M` token trajectories. |
+| [`scripts/sqlite_benchmark_query_cli.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/sqlite_benchmark_query_cli.py) | Queries `.cache/benchmarks.db` by `--domain`, `--wave`, `--horizon-m`, and `--pareto-only` to emit Markdown/JSON leaderboards. |
+| [`scripts/webui_static_html_exporter.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/webui_static_html_exporter.py) | Exports a self-contained offline HTML snapshot of the 3-tab QuantumDLBlocks WebUI into `.cache/webui_snapshot_export.html`. |
 | [`scripts/fineweb_convex_vs_concave_slope_tracker.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/fineweb_convex_vs_concave_slope_tracker.py) | Standardized **Iso-Token (`2.46M`, `7.37M`, `14.75M`, `29.49M`, `44.24M`) & Iso-FLOP (`6 N D`)** comparison table and joint Chinchilla scaling-law fitter across all waves (`w19..w28`). |
 | [`scripts/empirical_3p28_ceiling_and_wavelet_rank_probe.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/empirical_3p28_ceiling_and_wavelet_rank_probe.py) | Verifies empirically on real `FineWeb-Edu` sequences that the $N=2^{16}$ Wavelet-Cholesky pyramid breaks the `3.28` Val CE wall (`< 0.10` nats) and audits proportional vs. fixed wavelet ranks across $d \in \{256, 384, 512\}$. |
 | [`scripts/smith_clr_range_test_vs_wsd_profiler.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/smith_clr_range_test_vs_wsd_profiler.py) | Runs Leslie Smith's (`arXiv:1506.01186`) exponential LR Range Test on `ParsevalMuPDyadicGPT` and compares `modded_nanogpt_wsd`, `smith_triangular2`, and `smith_1cycle`. |
@@ -147,15 +219,18 @@ Before writing any ad-hoc one-liner, check if one of our deterministic CLI tools
 
 ---
 
-## 7. How to Contribute Back ("Promote-to-Primitive" Protocol)
+## 7. How to Contribute Back ("Promote-to-Primitive" Protocol & Rules 7–8)
 
-Whenever you complete an experiment wave or implement a new capability, follow this 4-step checklist to keep `QuantumDLBlocks` modular and discoverable for the next agent:
+Whenever you complete an experiment wave or implement a new capability, follow this 5-step checklist to keep `QuantumDLBlocks` modular, self-documenting, and discoverable for the next agent:
 
 1. **Extract Reusable Kernels & Layers Out of `examples/`**:
-   - If a custom `@torch.compile` function, Triton kernel, or `torch.autograd.Function` is useful beyond a single verification script, place it in [`src/qdlblocks/kernels/`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/__init__.py) or [`src/qdlblocks/layers/`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/__init__.py) (`<= 350` lines) and export it in `__all__`.
-2. **Keep Per-Wave Architectures Clean & Flag-Free (Rule 6)**:
+   - If a custom `@torch.compile` function, Triton kernel, or `torch.autograd.Function` is useful beyond a single verification script, place it in [`src/qdlblocks/kernels/`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/kernels/__init__.py) or [`src/qdlblocks/layers/`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/layers/__init__.py) and export it in `__all__`.
+2. **Define All Constants at the Top of the File & Sync with `EXPERIMENT_PLAN_0XX.md` (Rule 7)**:
+   - Never leave inline magic constants inside functions; define them in `UPPER_SNAKE_CASE` at the top of the file with a comment explaining their meaning and update the `EXPERIMENT_PLAN_0XX.md` Constants Ledger.
+3. **Comment Thoroughly with Experiment Provenance (Rule 8 — Comments Are Free of Line Limits!)**:
+   - Because [`scripts/ast_signature_and_length_linter.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/ast_signature_and_length_linter.py) excludes comments and docstrings from line limits, write detailed docstrings and inline comments explaining *when* the building block is useful, *why* it was built mathematically, and *which wave/plan (`Wave XX` / `EXPERIMENT_PLAN_0XX.md`)* validated it.
+4. **Keep Per-Wave Architectures Clean & Flag-Free (Rule 6)**:
    - Place new self-contained model formulations in `src/qdlblocks/models/` and export them in [`src/qdlblocks/models/__init__.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/__init__.py) without adding boolean toggle flags to earlier wave models.
-3. **Promote Repeatable Diagnostics to `scripts/`**:
-   - Any diagnostic or comparison run more than once belongs in `scripts/` (with `--json-out .cache/<name>.json`) and should be logged in [`scripts/TOOLING_BACKLOG.md`](file:///home/festivity/agy/QuantumDLBlocks/scripts/TOOLING_BACKLOG.md).
-4. **Update This Catalog (`docs/BUILDING_BLOCKS.md`) and `README.md`**:
+5. **Update This Catalog (`docs/BUILDING_BLOCKS.md`) and `README.md`**:
    - Add the new component to the Quick-Reference Status Matrix in Section 1 above (marking any superseded component as `FROZEN` or `LEGACY`) so the very next agent session knows immediately what state the building blocks are in.
+

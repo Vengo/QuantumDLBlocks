@@ -35,11 +35,12 @@ def get_flash_born_launch_meta(
 ) -> dict[str, int]:
     """Return architecture-tuned Triton launch parameters for CUDA (Wave32 warp) vs ROCm RDNA 4 (Wave32 EU)."""
     use_hip = IS_HIP if is_hip is None else bool(is_hip)
-    if head_dim >= 256:
+    eff_dim = triton.next_power_of_2(head_dim) if HAS_TRITON else (1 << (max(1, head_dim) - 1).bit_length())
+    if eff_dim >= 256:
         block_m = 16
         block_n = 16
         num_stages = 1
-    elif head_dim >= 128:
+    elif eff_dim >= 128:
         block_m = 32 if seq_len >= 32 else 16
         block_n = 32 if seq_len >= 32 else 16
         num_stages = 1
@@ -108,6 +109,7 @@ if HAS_TRITON:
         stride_doc_t,
         T: tl.constexpr,
         HEAD_DIM: tl.constexpr,
+        BLOCK_D: tl.constexpr,
         IS_CAUSAL: tl.constexpr,
         PER_HEAD_SCALE: tl.constexpr,
         WINDOW_SIZE: tl.constexpr,
@@ -122,7 +124,8 @@ if HAS_TRITON:
 
         start_m = pid_m * BLOCK_M
         offs_m = start_m + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, HEAD_DIM)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < HEAD_DIM
 
         q_base = Q_ptr + pid_b * stride_qb + pid_h * stride_qh
         k_base = K_ptr + pid_b * stride_kb + pid_h * stride_kh
@@ -137,13 +140,13 @@ if HAS_TRITON:
 
         q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
         mask_m = offs_m < T
-        q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+        q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
 
         if HAS_DOC_IDS:
             doc_base = DOC_IDS_ptr + pid_b * stride_doc_b
             doc_m = tl.load(doc_base + offs_m * stride_doc_t, mask=mask_m, other=-1)
 
-        o_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+        o_acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
         z_acc = tl.zeros([BLOCK_M], dtype=tl.float32)
 
         lo = 0 if WINDOW_SIZE <= 0 else tl.maximum(0, (start_m - WINDOW_SIZE + 1) & ~(BLOCK_N - 1))
@@ -157,8 +160,8 @@ if HAS_TRITON:
             k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
             v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
 
-            k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
-            v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+            k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+            v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
 
             s = tl.dot(q, tl.trans(k), allow_tf32=False) * scale
             a = tl.maximum(s, 0.0)
@@ -183,7 +186,7 @@ if HAS_TRITON:
         o_out = o_acc / z_denom[:, None]
 
         o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
-        tl.store(o_ptrs, o_out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None])
+        tl.store(o_ptrs, o_out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
         z_ptrs = z_base + offs_m * stride_zm
         tl.store(z_ptrs, z_denom, mask=mask_m)
@@ -212,6 +215,7 @@ if HAS_TRITON:
         stride_doc_t,
         T: tl.constexpr,
         HEAD_DIM: tl.constexpr,
+        BLOCK_D: tl.constexpr,
         IS_CAUSAL: tl.constexpr,
         PER_HEAD_SCALE: tl.constexpr,
         WINDOW_SIZE: tl.constexpr,
@@ -225,8 +229,9 @@ if HAS_TRITON:
 
         start_n = pid_n * BLOCK_N
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        offs_d = tl.arange(0, HEAD_DIM)
+        offs_d = tl.arange(0, BLOCK_D)
         mask_n = offs_n < T
+        mask_d = offs_d < HEAD_DIM
 
         q_base = Q_ptr + pid_b * stride_qb + pid_h * stride_qh
         k_base = K_ptr + pid_b * stride_qb + pid_h * stride_qh
@@ -245,15 +250,15 @@ if HAS_TRITON:
         k_ptrs = k_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
         v_ptrs = v_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
 
-        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+        k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+        v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
 
         if HAS_DOC_IDS:
             doc_base = DOC_IDS_ptr + pid_b * stride_doc_b
             doc_n = tl.load(doc_base + offs_n * stride_doc_t, mask=mask_n, other=-2)
 
-        dk_acc = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
-        dv_acc = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+        dk_acc = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+        dv_acc = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
         dscale_acc = 0.0
 
         start_m = start_n if IS_CAUSAL else 0
@@ -268,9 +273,9 @@ if HAS_TRITON:
             do_ptrs = do_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
             z_ptrs = z_base + offs_m * stride_zm
 
-            q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
-            o = tl.load(o_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
-            do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
+            q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+            o = tl.load(o_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+            do = tl.load(do_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
             do_f32 = do.to(tl.float32)
             z_denom = tl.load(z_ptrs, mask=mask_m, other=1.0).to(tl.float32)
 
@@ -308,8 +313,8 @@ if HAS_TRITON:
 
         dk_ptrs = dk_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
         dv_ptrs = dv_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        tl.store(dk_ptrs, dk_acc.to(dK_ptr.dtype.element_ty), mask=mask_n[:, None])
-        tl.store(dv_ptrs, dv_acc.to(dV_ptr.dtype.element_ty), mask=mask_n[:, None])
+        tl.store(dk_ptrs, dk_acc.to(dK_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+        tl.store(dv_ptrs, dv_acc.to(dV_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
 
         if PER_HEAD_SCALE:
             tl.atomic_add(dScale_ptr + pid_h, dscale_acc)
@@ -338,6 +343,7 @@ if HAS_TRITON:
         stride_doc_t,
         T: tl.constexpr,
         HEAD_DIM: tl.constexpr,
+        BLOCK_D: tl.constexpr,
         IS_CAUSAL: tl.constexpr,
         PER_HEAD_SCALE: tl.constexpr,
         WINDOW_SIZE: tl.constexpr,
@@ -351,8 +357,9 @@ if HAS_TRITON:
 
         start_m = pid_m * BLOCK_M
         offs_m = start_m + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, HEAD_DIM)
+        offs_d = tl.arange(0, BLOCK_D)
         mask_m = offs_m < T
+        mask_d = offs_d < HEAD_DIM
 
         q_base = Q_ptr + pid_b * stride_qb + pid_h * stride_qh
         k_base = K_ptr + pid_b * stride_qb + pid_h * stride_qh
@@ -372,9 +379,9 @@ if HAS_TRITON:
         do_ptrs = do_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
         z_ptrs = z_base + offs_m * stride_zm
 
-        q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
-        o = tl.load(o_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
-        do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
+        q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
+        o = tl.load(o_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
+        do = tl.load(do_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
         do_f32 = do.to(tl.float32)
         z_denom = tl.load(z_ptrs, mask=mask_m, other=1.0).to(tl.float32)
         delta_i = tl.sum(do_f32 * o, axis=1)
@@ -383,7 +390,7 @@ if HAS_TRITON:
             doc_base = DOC_IDS_ptr + pid_b * stride_doc_b
             doc_m = tl.load(doc_base + offs_m * stride_doc_t, mask=mask_m, other=-1)
 
-        dq_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+        dq_acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
         lo = 0 if WINDOW_SIZE <= 0 else tl.maximum(0, (start_m - WINDOW_SIZE + 1) & ~(BLOCK_N - 1))
         max_n = (pid_m + 1) * BLOCK_M if IS_CAUSAL else T
         max_n = tl.minimum(max_n, T)
@@ -395,8 +402,8 @@ if HAS_TRITON:
             k_ptrs = k_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
             v_ptrs = v_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
 
-            k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
-            v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+            k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+            v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
 
             s = tl.dot(q, tl.trans(k), allow_tf32=False) * scale
             a = tl.maximum(s, 0.0)
@@ -420,7 +427,7 @@ if HAS_TRITON:
             dq_acc += tl.dot(ds.to(k.dtype), k, allow_tf32=False) * scale
 
         dq_ptrs = dq_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        tl.store(dq_ptrs, dq_acc.to(dQ_ptr.dtype.element_ty), mask=mask_m[:, None])
+        tl.store(dq_ptrs, dq_acc.to(dQ_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
 
 class _FlashBornAttentionFn(torch.autograd.Function):
@@ -462,6 +469,7 @@ class _FlashBornAttentionFn(torch.autograd.Function):
 
         launch_meta = get_flash_born_launch_meta(T, head_dim=D)
         block_m = launch_meta["BLOCK_M"]
+        block_d = triton.next_power_of_2(D)
         grid = (triton.cdiv(T, block_m), B, H)
 
         _flash_born_fwd_kernel[grid](
@@ -495,6 +503,7 @@ class _FlashBornAttentionFn(torch.autograd.Function):
             stride_doc_t,
             T=T,
             HEAD_DIM=D,
+            BLOCK_D=block_d,
             IS_CAUSAL=is_causal,
             PER_HEAD_SCALE=per_head_scale,
             WINDOW_SIZE=int(window_size),
@@ -538,6 +547,7 @@ class _FlashBornAttentionFn(torch.autograd.Function):
         launch_meta = get_flash_born_launch_meta(T, head_dim=D)
         block_m = launch_meta["BLOCK_M"]
         block_n = launch_meta["BLOCK_N"]
+        block_d = triton.next_power_of_2(D)
         grid_n = (triton.cdiv(T, block_n), B, H)
         grid_m = (triton.cdiv(T, block_m), B, H)
 
@@ -564,6 +574,7 @@ class _FlashBornAttentionFn(torch.autograd.Function):
             stride_doc_t,
             T=T,
             HEAD_DIM=D,
+            BLOCK_D=block_d,
             IS_CAUSAL=ctx.is_causal,
             PER_HEAD_SCALE=ctx.per_head_scale,
             WINDOW_SIZE=ctx.window_size,
@@ -592,6 +603,7 @@ class _FlashBornAttentionFn(torch.autograd.Function):
             stride_doc_t,
             T=T,
             HEAD_DIM=D,
+            BLOCK_D=block_d,
             IS_CAUSAL=ctx.is_causal,
             PER_HEAD_SCALE=ctx.per_head_scale,
             WINDOW_SIZE=ctx.window_size,
@@ -652,18 +664,18 @@ def flash_born_attention(
 ) -> torch.Tensor:
     """Execute SRAM-tiled Flash-Born Attention via Triton on CUDA (or fallback on CPU).
 
-    Supports sliding-window tile skipping (`window_size > 0`) and document boundary
-    masking (`doc_ids` of shape `(B, T)`).
+    Supports sliding-window tile skipping (`window_size > 0`), document boundary
+    masking (`doc_ids` of shape `(B, T)`), and any `HEAD_DIM % 16 == 0` in `[16, 256]`.
     """
     D = q.shape[-1]
-    is_pow2_d = (D >= 16) and ((D & (D - 1)) == 0)
+    is_supported_d = (D >= 16) and (D <= 256) and (D % 16 == 0)
 
     if not isinstance(scale, torch.Tensor):
         scale_t = torch.tensor(float(scale), dtype=torch.float32, device=q.device)
     else:
         scale_t = scale
 
-    if HAS_TRITON and q.is_cuda and is_pow2_d:
+    if HAS_TRITON and q.is_cuda and is_supported_d:
         return _run_triton_flash_born(q, k, v, scale_t, is_causal, eps, window_size=window_size, doc_ids=doc_ids)
 
     s_v = scale_t.to(v.dtype)
@@ -713,6 +725,7 @@ if HAS_TRITON:
         stride_doc_t,
         T: tl.constexpr,
         HEAD_DIM: tl.constexpr,
+        BLOCK_D: tl.constexpr,
         IS_CAUSAL: tl.constexpr,
         PER_HEAD_SCALE: tl.constexpr,
         PER_HEAD_TAU: tl.constexpr,
@@ -729,7 +742,8 @@ if HAS_TRITON:
 
         start_m = pid_m * BLOCK_M
         offs_m = start_m + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, HEAD_DIM)
+        offs_d = tl.arange(0, BLOCK_D)
+        mask_d = offs_d < HEAD_DIM
 
         q_base = Q_ptr + pid_b * stride_qb + pid_h * stride_qh
         k_base = K_ptr + pid_b * stride_kb + pid_h * stride_kh
@@ -742,13 +756,13 @@ if HAS_TRITON:
 
         q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
         mask_m = offs_m < T
-        q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
+        q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
 
         if HAS_DOC_IDS:
             doc_base = DOC_IDS_ptr + pid_b * stride_doc_b
             doc_m = tl.load(doc_base + offs_m * stride_doc_t, mask=mask_m, other=-1)
 
-        o_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+        o_acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
         z_acc = tl.zeros([BLOCK_M], dtype=tl.float32)
 
         lo = 0 if WINDOW_SIZE <= 0 else tl.maximum(0, (start_m - WINDOW_SIZE + 1) & ~(BLOCK_N - 1))
@@ -762,8 +776,8 @@ if HAS_TRITON:
             k_ptrs = k_base + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
             v_ptrs = v_base + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
 
-            k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
-            v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+            k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+            v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
 
             raw_dot = tl.dot(q, tl.trans(k), allow_tf32=False)
             u = tl.maximum(scale * (raw_dot - tau), 0.0)
@@ -791,7 +805,7 @@ if HAS_TRITON:
         o_out = o_acc / z_denom[:, None]
 
         o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
-        tl.store(o_ptrs, o_out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None])
+        tl.store(o_ptrs, o_out.to(Out_ptr.dtype.element_ty), mask=mask_m[:, None] & mask_d[None, :])
 
         z_ptrs = z_base + offs_m * stride_zm
         tl.store(z_ptrs, z_denom, mask=mask_m)
@@ -822,6 +836,7 @@ if HAS_TRITON:
         stride_doc_t,
         T: tl.constexpr,
         HEAD_DIM: tl.constexpr,
+        BLOCK_D: tl.constexpr,
         IS_CAUSAL: tl.constexpr,
         PER_HEAD_SCALE: tl.constexpr,
         PER_HEAD_TAU: tl.constexpr,
@@ -837,8 +852,9 @@ if HAS_TRITON:
 
         start_n = pid_n * BLOCK_N
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        offs_d = tl.arange(0, HEAD_DIM)
+        offs_d = tl.arange(0, BLOCK_D)
         mask_n = offs_n < T
+        mask_d = offs_d < HEAD_DIM
 
         q_base = Q_ptr + pid_b * stride_qb + pid_h * stride_qh
         k_base = K_ptr + pid_b * stride_qb + pid_h * stride_qh
@@ -855,15 +871,15 @@ if HAS_TRITON:
         k_ptrs = k_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
         v_ptrs = v_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
 
-        k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+        k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+        v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
 
         if HAS_DOC_IDS:
             doc_base = DOC_IDS_ptr + pid_b * stride_doc_b
             doc_n = tl.load(doc_base + offs_n * stride_doc_t, mask=mask_n, other=-2)
 
-        dk_acc = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
-        dv_acc = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
+        dk_acc = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
+        dv_acc = tl.zeros([BLOCK_N, BLOCK_D], dtype=tl.float32)
         dscale_acc = 0.0
         dtau_acc = 0.0
 
@@ -873,15 +889,16 @@ if HAS_TRITON:
         for curr_m in range(start_m, end_m, BLOCK_M):
             offs_m = curr_m + tl.arange(0, BLOCK_M)
             mask_m = offs_m < T
+            mask_md = mask_m[:, None] & mask_d[None, :]
 
             q_ptrs = q_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
             o_ptrs = o_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
             do_ptrs = do_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
             z_ptrs = z_base + offs_m * stride_zm
 
-            q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
-            o = tl.load(o_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
-            do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
+            q = tl.load(q_ptrs, mask=mask_md, other=0.0)
+            o = tl.load(o_ptrs, mask=mask_md, other=0.0).to(tl.float32)
+            do = tl.load(do_ptrs, mask=mask_md, other=0.0)
             do_f32 = do.to(tl.float32)
             z_denom = tl.load(z_ptrs, mask=mask_m, other=1.0).to(tl.float32)
 
@@ -923,8 +940,8 @@ if HAS_TRITON:
 
         dk_ptrs = dk_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
         dv_ptrs = dv_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        tl.store(dk_ptrs, dk_acc.to(dK_ptr.dtype.element_ty), mask=mask_n[:, None])
-        tl.store(dv_ptrs, dv_acc.to(dV_ptr.dtype.element_ty), mask=mask_n[:, None])
+        tl.store(dk_ptrs, dk_acc.to(dK_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
+        tl.store(dv_ptrs, dv_acc.to(dV_ptr.dtype.element_ty), mask=mask_n[:, None] & mask_d[None, :])
 
         tl.atomic_add(dScale_ptr + pid_h if PER_HEAD_SCALE else dScale_ptr, dscale_acc)
         tl.atomic_add(dTau_ptr + pid_h if PER_HEAD_TAU else dTau_ptr, dtau_acc)
@@ -952,6 +969,7 @@ if HAS_TRITON:
         stride_doc_t,
         T: tl.constexpr,
         HEAD_DIM: tl.constexpr,
+        BLOCK_D: tl.constexpr,
         IS_CAUSAL: tl.constexpr,
         PER_HEAD_SCALE: tl.constexpr,
         PER_HEAD_TAU: tl.constexpr,
@@ -967,8 +985,10 @@ if HAS_TRITON:
 
         start_m = pid_m * BLOCK_M
         offs_m = start_m + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, HEAD_DIM)
+        offs_d = tl.arange(0, BLOCK_D)
         mask_m = offs_m < T
+        mask_d = offs_d < HEAD_DIM
+        mask_md = mask_m[:, None] & mask_d[None, :]
 
         q_base = Q_ptr + pid_b * stride_qb + pid_h * stride_qh
         k_base = K_ptr + pid_b * stride_qb + pid_h * stride_qh
@@ -986,9 +1006,9 @@ if HAS_TRITON:
         do_ptrs = do_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
         z_ptrs = z_base + offs_m * stride_zm
 
-        q = tl.load(q_ptrs, mask=mask_m[:, None], other=0.0)
-        o = tl.load(o_ptrs, mask=mask_m[:, None], other=0.0).to(tl.float32)
-        do = tl.load(do_ptrs, mask=mask_m[:, None], other=0.0)
+        q = tl.load(q_ptrs, mask=mask_md, other=0.0)
+        o = tl.load(o_ptrs, mask=mask_md, other=0.0).to(tl.float32)
+        do = tl.load(do_ptrs, mask=mask_md, other=0.0)
         do_f32 = do.to(tl.float32)
         z_denom = tl.load(z_ptrs, mask=mask_m, other=1.0).to(tl.float32)
         delta_i = tl.sum(do_f32 * o, axis=1)
@@ -997,7 +1017,7 @@ if HAS_TRITON:
             doc_base = DOC_IDS_ptr + pid_b * stride_doc_b
             doc_m = tl.load(doc_base + offs_m * stride_doc_t, mask=mask_m, other=-1)
 
-        dq_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+        dq_acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
         lo = 0 if WINDOW_SIZE <= 0 else tl.maximum(0, (start_m - WINDOW_SIZE + 1) & ~(BLOCK_N - 1))
         max_n = (pid_m + 1) * BLOCK_M if IS_CAUSAL else T
         max_n = tl.minimum(max_n, T)
@@ -1009,8 +1029,8 @@ if HAS_TRITON:
             k_ptrs = k_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
             v_ptrs = v_base + offs_n[:, None] * stride_qm + offs_d[None, :] * stride_qd
 
-            k = tl.load(k_ptrs, mask=mask_n[:, None], other=0.0)
-            v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+            k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
+            v = tl.load(v_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
 
             raw_dot = tl.dot(q, tl.trans(k), allow_tf32=False)
             u = tl.maximum(scale * (raw_dot - tau), 0.0)
@@ -1038,7 +1058,7 @@ if HAS_TRITON:
             dq_acc += tl.dot(d_raw_dot.to(k.dtype), k, allow_tf32=False)
 
         dq_ptrs = dq_base + offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd
-        tl.store(dq_ptrs, dq_acc.to(dQ_ptr.dtype.element_ty), mask=mask_m[:, None])
+        tl.store(dq_ptrs, dq_acc.to(dQ_ptr.dtype.element_ty), mask=mask_md)
 
 
 class _FlashPurifiedBornAttentionFn(torch.autograd.Function):
@@ -1084,6 +1104,7 @@ class _FlashPurifiedBornAttentionFn(torch.autograd.Function):
 
         launch_meta = get_flash_born_launch_meta(T, head_dim=D)
         block_m = launch_meta["BLOCK_M"]
+        block_d = triton.next_power_of_2(D)
         grid = (triton.cdiv(T, block_m), B, H)
 
         _flash_purified_born_fwd_kernel[grid](
@@ -1118,6 +1139,7 @@ class _FlashPurifiedBornAttentionFn(torch.autograd.Function):
             stride_doc_t,
             T=T,
             HEAD_DIM=D,
+            BLOCK_D=block_d,
             IS_CAUSAL=is_causal,
             PER_HEAD_SCALE=per_head_scale,
             PER_HEAD_TAU=per_head_tau,
@@ -1168,6 +1190,7 @@ class _FlashPurifiedBornAttentionFn(torch.autograd.Function):
         launch_meta = get_flash_born_launch_meta(T, head_dim=D)
         block_m = launch_meta["BLOCK_M"]
         block_n = launch_meta["BLOCK_N"]
+        block_d = triton.next_power_of_2(D)
         grid_n = (triton.cdiv(T, block_n), B, H)
         grid_m = (triton.cdiv(T, block_m), B, H)
 
@@ -1196,6 +1219,7 @@ class _FlashPurifiedBornAttentionFn(torch.autograd.Function):
             stride_doc_t,
             T=T,
             HEAD_DIM=D,
+            BLOCK_D=block_d,
             IS_CAUSAL=ctx.is_causal,
             PER_HEAD_SCALE=ctx.per_head_scale,
             PER_HEAD_TAU=ctx.per_head_tau,
@@ -1227,6 +1251,7 @@ class _FlashPurifiedBornAttentionFn(torch.autograd.Function):
             stride_doc_t,
             T=T,
             HEAD_DIM=D,
+            BLOCK_D=block_d,
             IS_CAUSAL=ctx.is_causal,
             PER_HEAD_SCALE=ctx.per_head_scale,
             PER_HEAD_TAU=ctx.per_head_tau,
@@ -1291,12 +1316,12 @@ def flash_purified_born_attention(
         is_causal = bool(causal)
 
     D = q.shape[-1]
-    is_pow2_d = (D >= 16) and ((D & (D - 1)) == 0)
+    is_supported_d = (D >= 16) and (D <= 256) and (D % 16 == 0)
 
     scale_t = scale if isinstance(scale, torch.Tensor) else torch.tensor(float(scale), dtype=torch.float32, device=q.device)
     tau_t = tau if isinstance(tau, torch.Tensor) else torch.tensor(float(tau), dtype=torch.float32, device=q.device)
 
-    if HAS_TRITON and q.is_cuda and is_pow2_d:
+    if HAS_TRITON and q.is_cuda and is_supported_d:
         return _run_triton_flash_purified_born(
             q, k, v, scale_t, tau_t, eps_base, is_causal, eps, window_size=window_size, doc_ids=doc_ids
         )

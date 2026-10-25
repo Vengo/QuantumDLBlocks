@@ -192,8 +192,8 @@ def classify_run_tier(
     if (
         task_domain == "fineweb_edu_local"
         or mc_tier == "fineweb_edu_local"
-        or rk_low.startswith(tuple(f"w{n}_" for n in range(18, 30)))
-        or wid_up in {f"W{n}" for n in range(18, 30)}
+        or rk_low.startswith(tuple(f"w{n}_" for n in range(18, 100)))
+        or wid_up in {f"W{n}" for n in range(18, 100)}
     ):
         return "fineweb_edu_local"
     if mc_tier == "micro_verification":
