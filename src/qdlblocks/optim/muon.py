@@ -1,16 +1,22 @@
-"""Stiefel-Manifold Muon Optimizers with Smooth Decay, Cautious Weight Decay, and Riemannian Retraction."""
+"""Stiefel-Manifold Muon Optimizers with Real & Joint-Complex Polar Express, NorMuon, and Parameter Classification."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 import math
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
 
 from ..functional import (
+    COMPLEX_POLAR_EXPRESS_QUINTIC_MAPS,
+    STATIONARY_NEWTON_SCHULZ_QUINTIC,
+    complex_polar_express_orth,
     normuon_equalize,
+    normuon_equalize_complex,
+    retract_complex_stiefel_pair,
     zeropower_via_newtonschulz5,
     zeropower_via_newtonschulz5_batched,
     zeropower_via_polarexpress5,
@@ -18,61 +24,211 @@ from ..functional import (
 )
 
 
+# ==============================================================================
+# Top-of-File Named Constants (Rule 7 of docs/SCRIPT_BEST_PRACTICES.md)
+# Synchronized with EXPERIMENT_PLAN_059.md (Wave 44 Tracks 1 & 2)
+# ==============================================================================
+DEFAULT_MUON_REFERENCE_BATCH_TOKENS: int = 8192
+REFERENCE_MUON_BATCH_TOKENS: int = DEFAULT_MUON_REFERENCE_BATCH_TOKENS
+MIN_MUON_LR_SCALE: float = 0.25
+MAX_MUON_LR_SCALE: float = 8.0
+DEFAULT_MUON_BATCH_LR_EXPONENT: float = 0.50
+MAX_MUON_BATCH_LR_MULTIPLIER: float = 3.0
+MIN_COMPLEX_MUON_MATRIX_DIM: int = 2
+MIN_KRONECKER_MUON_OPERATOR_DIM: int = MIN_COMPLEX_MUON_MATRIX_DIM
+DEFAULT_KRONECKER_STIEFEL_PENALTY: float = 0.01
+DEFAULT_KRONECKER_MUON_STIEFEL_PENALTY: float = DEFAULT_KRONECKER_STIEFEL_PENALTY
+_POLAR_EXPRESS_COEFFS_5: tuple[tuple[float, float, float], ...] = COMPLEX_POLAR_EXPRESS_QUINTIC_MAPS
+
+LOOKUP_TABLE_PARAM_SUFFIXES: tuple[str, ...] = (
+    "embed_re",
+    "embed_im",
+    "bi_ctx_wave_re",
+    "bi_ctx_wave_im",
+    "tri_ctx_wave_re",
+    "tri_ctx_wave_im",
+    "fourgram_ctx_wave_re",
+    "fourgram_ctx_wave_im",
+)
+POVM_SCALE_PARAM_SUFFIXES: tuple[str, ...] = ("povm_scale_logits",)
+NON_OPERATOR_GATE_PARAM_TOKENS: tuple[str, ...] = (
+    "branch_logits",
+    "ngram_branch_gates",
+    "router_w_re",
+    "router_w_im",
+    "router_kets_re",
+    "router_kets_im",
+    "branch_router_gain",
+    "branch_router_bias",
+    "echo_gate_logits",
+    "gram_eta",
+    "eta_g",
+    "krylov_eta",
+    "purity_gamma",
+    "norm_gain",
+    "resid_scale",
+    "v_embed_mix",
+    "v_mix_logit",
+    "smear_gate_logit",
+    "carrier_logit_bias",
+    "phase_gain",
+    "attn_gate",
+    "ffn_gate",
+    "mixer_gate",
+    "psi0_readout_gate",
+    "context_branch_bias",
+    "lag_gate",
+    "fourgram_gate",
+)
+COMPLEX_MATRIX_OPERATOR_BASENAMES: tuple[str, ...] = (
+    "w_q",
+    "w_k",
+    "w_v",
+    "w_out",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "out_proj",
+    "beam1",
+    "beam2",
+    "proj_down",
+    "meas_proj",
+    "factor_u",
+    "factor_mix",
+    "meaning_mix",
+    "out_factor_u",
+    "bi_factor_u",
+    "tri_factor_u",
+    "lag2_factor_u",
+    "lag3_factor_u",
+    "fourgram_factor_u",
+    "smear_u",
+    "stinespring_w",
+)
+
+
 DecayMode = Literal["smooth", "cautious", "none"]
 PolarMethod = Literal["newton_schulz", "polar_express", "polarexpress"]
 
 
-class StiefelMuon(torch.optim.Optimizer):
-    """Stiefel-Manifold Muon Optimizer for 2D Isometric & Unitary Weight Matrices.
+@dataclass(frozen=True)
+class StiefelMuonConfig:
+    """Grouped configuration for `StiefelMuon` (`<= 8` fields, Rule 2 of `docs/SCRIPT_BEST_PRACTICES.md`)."""
 
-    Computes orthogonalized momentum updates on the Stiefel manifold via quintic
-    Newton-Schulz or PolarExpress/ANVIL polar iterations, and supports:
-    1. **Smooth Weight Decay (`decay_mode="smooth"`)**:
-       Applies continuous multiplicative weight decay `W <- (1 - lr * wd) * W` before
-       stepping along the polar direction.
-    2. **Cautious Weight Decay (`decay_mode="cautious"`)**:
-       Applies weight decay only to coordinates where the parameter sign aligns with
-       the polar update direction `(W * U > 0)`.
-    3. **Continuous Riemannian Stiefel Penalty (`stiefel_penalty > 0`)**:
-       Applies a soft gradient step of the Stiefel manifold potential `1/4 ||W^T W - I||_F^2`.
-    4. **Muon Momentum Warmup (`momentum_warmup_steps > 0`)**:
-       Linearly ramps Nesterov momentum from `momentum_init` (e.g. `0.85`) to `momentum` (e.g. `0.95`).
-    5. **Batched 3D Newton-Schulz / PolarExpress (`batched_ns=True`)**:
-       Stacks same-shape 2D gradient updates into 3D `(K, M, N)` batches for single-call `torch.bmm` orthogonalization.
-    6. **NorMuon Second-Moment Equalization (`use_normuon=True`)**:
-       Equalizes per-lane RMS energy after polar orthogonalization.
-    7. **Twin-Rail Momentum (`use_twin_rail=True`)**:
-       Blends fast (`rail_fast_beta`) and slow (`rail_slow_beta`) EMA momentum rails before polar projection.
+    nesterov: bool = True
+    ns_steps: int = 5
+    polar_method: PolarMethod = "newton_schulz"
+    stiefel_penalty: float = 0.0
+    retract_every: int = 1
+    use_normuon: bool = False
+    normuon_beta2: float = 0.95
+    use_twin_rail: bool = False
+
+
+@dataclass(frozen=True)
+class _ComplexPairUpdateSpec:
+    """Per-slice update metadata for Joint-Complex `StiefelMuon` (`<= 8` fields, Rule 2)."""
+
+    p_re: torch.Tensor
+    p_im: torch.Tensor
+    g_re: torch.Tensor
+    g_im: torch.Tensor
+    state_re: dict[str, Any]
+    lane_key: str
+    step_num: int
+    group: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class KroneckerParameterPartition:
+    """Deterministic 4-group parameter partition for complex Kronecker GPT models (`Wave 44` Track 2)."""
+
+    muon_complex_pairs: list[nn.Parameter]
+    embed_params: list[nn.Parameter]
+    povm_params: list[nn.Parameter]
+    gate_params: list[nn.Parameter]
+
+    @property
+    def muon_pair_tuples(self) -> list[tuple[nn.Parameter, nn.Parameter]]:
+        """Return paired `(p_re, p_im)` 2-tuples from `muon_complex_pairs`."""
+        return [
+            (self.muon_complex_pairs[2 * i], self.muon_complex_pairs[2 * i + 1])
+            for i in range(len(self.muon_complex_pairs) // 2)
+        ]
+
+    @property
+    def muon_flat_params(self) -> list[nn.Parameter]:
+        """Return flat interleaved `[w1_re, w1_im, ...]` list for `group['params']`."""
+        return list(self.muon_complex_pairs)
+
+
+def _validate_complex_pair_group(group: dict[str, Any]) -> None:
+    """Validate that a complex pair parameter group has even length and matching 2D/3D `(p_re, p_im)` shapes."""
+    params = list(group.get("params", []))
+    if len(params) % 2 != 0:
+        raise ValueError(
+            f"Complex pair group in StiefelMuon requires an even number of parameters, got {len(params)}"
+        )
+    for idx in range(0, len(params), 2):
+        w_re = params[idx]
+        w_im = params[idx + 1]
+        if w_re.shape != w_im.shape or w_re.dtype != w_im.dtype:
+            raise ValueError(
+                f"Mismatched complex pair at index {idx // 2}: {tuple(w_re.shape)} ({w_re.dtype}) vs {tuple(w_im.shape)} ({w_im.dtype})"
+            )
+        if w_re.ndim not in (2, 3) or min(w_re.size(-2), w_re.size(-1)) < MIN_COMPLEX_MUON_MATRIX_DIM:
+            raise ValueError(
+                f"Complex pair at index {idx // 2} must be 2D or 3D with min(m, n) >= {MIN_COMPLEX_MUON_MATRIX_DIM}, got {tuple(w_re.shape)}"
+            )
+
+
+class StiefelMuon(torch.optim.Optimizer):
+    """Stiefel-Manifold Muon Optimizer for Real & Joint-Complex 2D/3D Isometric & Unitary Weight Matrices.
+
+    Supports both standard real parameter groups (`is_complex_pair_group=False`) and paired
+    complex matrix operator groups (`is_complex_pair_group=True`, `Wave 44` Track 1) where
+    consecutive `(W_re, W_im)` tensors are orthogonalized, NorMuon-equalized, weight-decayed,
+    and Stiefel-retracted jointly as `W = W_re + i W_im`.
     """
 
     def __init__(
         self,
-        params: Iterable[torch.Tensor],
+        params: Iterable[Any],
         lr: float = 0.02,
         momentum: float = 0.95,
-        nesterov: bool = True,
         weight_decay: float = 0.01,
         decay_mode: DecayMode = "smooth",
-        stiefel_penalty: float = 0.0,
-        ns_steps: int = 5,
         aspect_scale: bool = False,
-        retract_every: int = 1,
-        momentum_warmup_steps: int = 0,
-        momentum_init: float = 0.85,
-        batched_ns: bool = True,
-        ema_momentum: bool = False,
-        polar_method: PolarMethod = "newton_schulz",
-        use_normuon: bool = False,
-        normuon_beta2: float = 0.95,
-        use_twin_rail: bool = False,
-        rail_fast_beta: float = 0.85,
-        rail_slow_beta: float = 0.98,
-        rail_fast_weight: float = 0.4385,
-        rail_engage_step: int = 64,
-        *,
-        stiefel_strength: float | None = None,
-        cautious_wd: bool | None = None,
+        config: StiefelMuonConfig | None = None,
+        **kwargs: Any,
     ) -> None:
+        cfg = config if config is not None else StiefelMuonConfig()
+        nesterov = bool(kwargs.pop("nesterov", cfg.nesterov))
+        ns_steps = int(kwargs.pop("ns_steps", cfg.ns_steps))
+        polar_method = kwargs.pop("polar_method", cfg.polar_method)
+        stiefel_penalty = float(kwargs.pop("stiefel_penalty", cfg.stiefel_penalty))
+        retract_every = int(kwargs.pop("retract_every", cfg.retract_every))
+        use_normuon = bool(kwargs.pop("use_normuon", cfg.use_normuon))
+        normuon_beta2 = float(kwargs.pop("normuon_beta2", cfg.normuon_beta2))
+        use_twin_rail = bool(kwargs.pop("use_twin_rail", cfg.use_twin_rail))
+
+        momentum_warmup_steps = int(kwargs.pop("momentum_warmup_steps", 0))
+        momentum_init = float(kwargs.pop("momentum_init", 0.85))
+        batched_ns = bool(kwargs.pop("batched_ns", True))
+        ema_momentum = bool(kwargs.pop("ema_momentum", False))
+        rail_fast_beta = float(kwargs.pop("rail_fast_beta", 0.85))
+        slow_momentum = kwargs.pop("slow_momentum", 0.98)
+        rail_slow_beta = float(kwargs.pop("rail_slow_beta", slow_momentum))
+        slow_blend = kwargs.pop("slow_blend", None)
+        default_fast_w = (1.0 - float(slow_blend)) if slow_blend is not None else 0.4385
+        rail_fast_weight = float(kwargs.pop("rail_fast_weight", default_fast_w))
+        rail_engage_step = int(kwargs.pop("rail_engage_step", 64))
+        stiefel_strength = kwargs.pop("stiefel_strength", None)
+        cautious_wd = kwargs.pop("cautious_wd", None)
+        is_complex_pair_group = bool(kwargs.pop("is_complex_pair_group", False))
+        if kwargs:
+            raise TypeError(f"Unexpected keyword argument(s) for StiefelMuon: {sorted(kwargs.keys())}")
+
         if stiefel_strength is not None:
             stiefel_penalty = float(stiefel_strength)
         if cautious_wd is not None:
@@ -91,29 +247,49 @@ class StiefelMuon(torch.optim.Optimizer):
         defaults = dict(
             lr=lr,
             momentum=momentum,
-            nesterov=bool(nesterov),
+            nesterov=nesterov,
             weight_decay=weight_decay,
             decay_mode=decay_mode,
             stiefel_penalty=stiefel_penalty,
             ns_steps=ns_steps,
             aspect_scale=aspect_scale,
-            retract_every=max(1, int(retract_every)),
-            momentum_warmup_steps=max(0, int(momentum_warmup_steps)),
-            momentum_init=float(momentum_init),
-            batched_ns=bool(batched_ns),
-            ema_momentum=bool(ema_momentum),
+            retract_every=max(1, retract_every),
+            momentum_warmup_steps=max(0, momentum_warmup_steps),
+            momentum_init=momentum_init,
+            batched_ns=batched_ns,
+            ema_momentum=ema_momentum,
             polar_method=polar_method,
-            use_normuon=bool(use_normuon),
-            normuon_beta2=float(normuon_beta2),
-            use_twin_rail=bool(use_twin_rail),
-            rail_fast_beta=float(rail_fast_beta),
-            rail_slow_beta=float(rail_slow_beta),
-            rail_fast_weight=float(rail_fast_weight),
-            rail_engage_step=max(0, int(rail_engage_step)),
+            use_normuon=use_normuon,
+            normuon_beta2=normuon_beta2,
+            use_twin_rail=use_twin_rail,
+            rail_fast_beta=rail_fast_beta,
+            rail_slow_beta=rail_slow_beta,
+            rail_fast_weight=rail_fast_weight,
+            rail_engage_step=max(0, rail_engage_step),
+            is_complex_pair_group=is_complex_pair_group,
         )
-        super().__init__(params, defaults)
+        params_list = list(params)
+        if params_list and isinstance(params_list[0], (tuple, list)):
+            flat_params = [p for pair in params_list for p in pair]
+            params_list = [{"params": flat_params, "is_complex_pair_group": True}]
+        super().__init__(params_list, defaults)
 
-    def get_effective_momentum(self, step_num: int, group: dict | None = None) -> float:
+    def add_param_group(self, param_group: dict[str, Any]) -> None:
+        """Normalize complex pair parameter groups (`(w_re, w_im)` tuples or flat list) before registration."""
+        raw_params = param_group.get("params", [])
+        if not isinstance(raw_params, torch.Tensor):
+            raw_list = list(raw_params)
+            if raw_list and isinstance(raw_list[0], (tuple, list)):
+                param_group["complex_pairs"] = [( pair[0], pair[1] ) for pair in raw_list]
+                param_group["params"] = [p for pair in raw_list for p in pair]
+                param_group["is_complex_pair_group"] = True
+            else:
+                param_group["params"] = raw_list
+        super().add_param_group(param_group)
+        if param_group.get("is_complex_pair_group", False) and len(param_group["params"]) > 0:
+            _validate_complex_pair_group(param_group)
+
+    def get_effective_momentum(self, step_num: int, group: dict[str, Any] | None = None) -> float:
         """Compute effective Nesterov momentum at 1-indexed `step_num`."""
         grp = group if group is not None else self.param_groups[0]
         momentum: float = float(grp["momentum"])
@@ -123,6 +299,48 @@ class StiefelMuon(torch.optim.Optimizer):
         momentum_init: float = float(grp.get("momentum_init", 0.85))
         frac = min(1.0, max(0.0, float(step_num - 1) / float(max(1, warmup_steps - 1))))
         return momentum_init + (momentum - momentum_init) * frac
+
+    def _compute_momentum_update(
+        self,
+        g: torch.Tensor,
+        state: dict[str, Any],
+        group: dict[str, Any],
+    ) -> tuple[torch.Tensor, int]:
+        """Update momentum state (`momentum_buffer`, `slow_momentum_buffer`, `step`) and return `(g_in, step_num)`."""
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros_like(g)
+            state["step"] = 0
+        state["step"] = int(state.get("step", 0)) + 1
+        step_num: int = state["step"]
+        eff_momentum = self.get_effective_momentum(step_num, group)
+        state["effective_momentum"] = eff_momentum
+        group["last_effective_momentum"] = eff_momentum
+
+        nesterov = bool(group.get("nesterov", True))
+        use_twin_rail = bool(group.get("use_twin_rail", False))
+        ema_momentum = bool(group.get("ema_momentum", False))
+        buf: torch.Tensor = state["momentum_buffer"]
+
+        if use_twin_rail:
+            if "slow_momentum_buffer" not in state:
+                state["slow_momentum_buffer"] = torch.zeros_like(g)
+            slow_buf: torch.Tensor = state["slow_momentum_buffer"]
+            rail_fast_beta = float(group.get("rail_fast_beta", 0.85))
+            rail_slow_beta = float(group.get("rail_slow_beta", 0.98))
+            rail_fast_weight = float(group.get("rail_fast_weight", 0.4385))
+            rail_engage_step = int(group.get("rail_engage_step", 64))
+            buf.lerp_(g, 1.0 - rail_fast_beta)
+            slow_buf.lerp_(g, 1.0 - rail_slow_beta)
+            w_rail = 1.0 if step_num < rail_engage_step else rail_fast_weight
+            g_blend = w_rail * buf + (1.0 - w_rail) * slow_buf
+            g_in = g.lerp(g_blend, eff_momentum) if nesterov else g_blend
+        elif ema_momentum:
+            buf.lerp_(g, 1.0 - eff_momentum)
+            g_in = g.lerp(buf, eff_momentum) if nesterov else buf
+        else:
+            buf.mul_(eff_momentum).add_(g)
+            g_in = g.add(buf, alpha=eff_momentum) if nesterov else buf
+        return g_in, step_num
 
     def _polar_2d(self, g_in: torch.Tensor, ns_steps: int, polar_method: str) -> torch.Tensor:
         if polar_method in ("polar_express", "polarexpress"):
@@ -134,10 +352,38 @@ class StiefelMuon(torch.optim.Optimizer):
             return zeropower_via_polarexpress5_batched(g_stack, steps=ns_steps)
         return zeropower_via_newtonschulz5_batched(g_stack, steps=ns_steps)
 
+    def _polar_complex_2d(
+        self,
+        g_re: torch.Tensor,
+        g_im: torch.Tensor,
+        ns_steps: int,
+        polar_method: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sched = (
+            COMPLEX_POLAR_EXPRESS_QUINTIC_MAPS
+            if polar_method in ("polar_express", "polarexpress")
+            else (STATIONARY_NEWTON_SCHULZ_QUINTIC,) * max(1, int(ns_steps))
+        )
+        return complex_polar_express_orth(g_re, g_im, steps=ns_steps, quintic_schedule=sched)
+
+    def _polar_complex_batched(
+        self,
+        g_re_b: torch.Tensor,
+        g_im_b: torch.Tensor,
+        ns_steps: int,
+        polar_method: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        sched = (
+            COMPLEX_POLAR_EXPRESS_QUINTIC_MAPS
+            if polar_method in ("polar_express", "polarexpress")
+            else (STATIONARY_NEWTON_SCHULZ_QUINTIC,) * max(1, int(ns_steps))
+        )
+        return complex_polar_express_orth(g_re_b, g_im_b, steps=ns_steps, quintic_schedule=sched)
+
     def _maybe_normuon(
         self,
         u: torch.Tensor,
-        state: dict,
+        state: dict[str, Any],
         state_key: str,
         use_normuon: bool,
         normuon_beta2: float,
@@ -148,26 +394,26 @@ class StiefelMuon(torch.optim.Optimizer):
         state[state_key] = v_next
         return u_eq
 
-
     def _apply_param_update(
         self,
         p: torch.Tensor,
         u: torch.Tensor,
+        group: dict[str, Any],
         step_num: int,
-        lr: float,
-        wd: float,
-        decay_mode: DecayMode,
-        stiefel_penalty: float,
-        aspect_scale: bool,
-        retract_every: int,
     ) -> None:
+        lr = float(group["lr"])
+        wd = float(group["weight_decay"])
+        decay_mode: DecayMode = group["decay_mode"]
+        stiefel_penalty = float(group["stiefel_penalty"])
+        aspect_scale = bool(group["aspect_scale"])
+        retract_every = max(1, int(group.get("retract_every", 1)))
+
         if aspect_scale:
             scale = math.sqrt(max(1.0, p.shape[0] / p.shape[1]))
             update = u * scale
         else:
             update = u
 
-        # 1. Weight decay (smooth or cautious)
         if wd > 0.0:
             if decay_mode == "smooth":
                 p.mul_(1.0 - lr * wd)
@@ -175,57 +421,176 @@ class StiefelMuon(torch.optim.Optimizer):
                 cwd_mask = (p * update) > 0.0
                 p.add_(p * cwd_mask, alpha=-lr * wd)
 
-        # 2. Continuous Riemannian Stiefel retraction penalty
         if stiefel_penalty > 0.0 and (step_num % retract_every == 0):
             work_dtype = torch.bfloat16 if p.is_cuda else torch.float32
-            W_f = p.to(work_dtype)
-            if W_f.size(0) >= W_f.size(1):
-                gram = W_f.t() @ W_f
+            w_f = p.to(work_dtype)
+            if w_f.size(0) >= w_f.size(1):
+                gram = w_f.t() @ w_f
                 ident = torch.eye(gram.size(0), device=p.device, dtype=work_dtype)
                 diff = gram - ident
                 denom = 1.0 + (torch.norm(diff.float(), p="fro") / math.sqrt(diff.size(0)))
-                stiefel_grad = (W_f @ (diff / denom)).type_as(p)
+                stiefel_grad = (w_f @ (diff / denom)).type_as(p)
             else:
-                gram = W_f @ W_f.t()
+                gram = w_f @ w_f.t()
                 ident = torch.eye(gram.size(0), device=p.device, dtype=work_dtype)
                 diff = gram - ident
                 denom = 1.0 + (torch.norm(diff.float(), p="fro") / math.sqrt(diff.size(0)))
-                stiefel_grad = ((diff / denom) @ W_f).type_as(p)
+                stiefel_grad = ((diff / denom) @ w_f).type_as(p)
             p.add_(stiefel_grad, alpha=-stiefel_penalty * retract_every)
 
-        # 3. Apply Newton-Schulz / PolarExpress polar gradient step
         p.add_(update, alpha=-lr)
 
+    def _apply_complex_pair_orth_step(
+        self,
+        spec: _ComplexPairUpdateSpec,
+        q_re: torch.Tensor,
+        q_im: torch.Tensor,
+    ) -> None:
+        """Apply Joint-Complex NorMuon equalization, weight decay, step, and complex Stiefel retraction."""
+        if bool(spec.group.get("use_normuon", False)):
+            beta2 = float(spec.group.get("normuon_beta2", 0.95))
+            q_re, q_im, v_joint = normuon_equalize_complex(
+                q_re,
+                q_im,
+                spec.state_re.get(spec.lane_key),
+                beta2=beta2,
+            )
+            spec.state_re[spec.lane_key] = v_joint
+            if spec.lane_key == "lane_energy":
+                spec.state_re["v_joint"] = v_joint
+
+        self._apply_complex_param_update(
+            spec.p_re,
+            spec.p_im,
+            q_re,
+            q_im,
+            spec.group,
+            spec.step_num,
+        )
+
+    def _apply_complex_param_update(
+        self,
+        w_re: torch.Tensor,
+        w_im: torch.Tensor,
+        u_re: torch.Tensor,
+        u_im: torch.Tensor,
+        group: dict[str, Any],
+        step_num: int,
+    ) -> None:
+        """Apply weight decay, orthogonalized step, and complex Stiefel retraction on 2D pair `(w_re, w_im)`."""
+        lr = float(group["lr"])
+        wd = float(group["weight_decay"])
+        decay_mode = group["decay_mode"]
+        aspect_scale = bool(group.get("aspect_scale", False))
+        stiefel_penalty = float(group.get("stiefel_penalty", 0.0))
+        retract_every = max(1, int(group.get("retract_every", 1)))
+
+        m, n = w_re.size(0), w_re.size(1)
+        scale = math.sqrt(max(1.0, float(m) / float(n))) if aspect_scale else 1.0
+        step_scale = lr * scale
+
+        if wd > 0.0 and decay_mode != "none":
+            if decay_mode == "cautious":
+                mask = ((w_re * u_re + w_im * u_im) > 0.0).to(dtype=w_re.dtype)
+                w_re.sub_(w_re * mask, alpha=lr * wd)
+                w_im.sub_(w_im * mask, alpha=lr * wd)
+            else:
+                w_re.mul_(1.0 - lr * wd)
+                w_im.mul_(1.0 - lr * wd)
+
+        w_re.add_(u_re.to(dtype=w_re.dtype), alpha=-step_scale)
+        w_im.add_(u_im.to(dtype=w_im.dtype), alpha=-step_scale)
+
+        if stiefel_penalty > 0.0 and (step_num % retract_every == 0):
+            retract_complex_stiefel_pair(w_re, w_im, penalty=stiefel_penalty * float(retract_every))
+
+    def _step_joint_complex_pairs(self, group: dict[str, Any]) -> None:
+        """Execute Joint-Complex `StiefelMuon` step over paired `(w_re, w_im)` 2D and 3D parameters."""
+        _validate_complex_pair_group(group)
+        ns_steps = int(group["ns_steps"])
+        polar_method = str(group.get("polar_method", "polar_express"))
+        batched_ns = bool(group.get("batched_ns", True))
+        params = group["params"]
+
+        shape_buckets: dict[
+            tuple[tuple[int, ...], torch.device, torch.dtype],
+            list[_ComplexPairUpdateSpec],
+        ] = {}
+
+        for idx in range(0, len(params), 2):
+            p_re = params[idx]
+            p_im = params[idx + 1]
+            if p_re.grad is None and p_im.grad is None:
+                continue
+            if (p_re.grad is None) != (p_im.grad is None):
+                raise ValueError("Mismatched None grad in complex pair")
+
+            state_re = self.state[p_re]
+            state_im = self.state[p_im]
+            g_re, step_num = self._compute_momentum_update(p_re.grad, state_re, group)
+            g_im, _ = self._compute_momentum_update(p_im.grad, state_im, group)
+
+            if p_re.ndim == 2:
+                specs = [_ComplexPairUpdateSpec(p_re, p_im, g_re, g_im, state_re, "lane_energy", step_num, group)]
+            else:
+                specs = [
+                    _ComplexPairUpdateSpec(
+                        p_re[s],
+                        p_im[s],
+                        g_re[s],
+                        g_im[s],
+                        state_re,
+                        f"lane_energy_{s}",
+                        step_num,
+                        group,
+                    )
+                    for s in range(p_re.size(0))
+                ]
+
+            for spec in specs:
+                if batched_ns:
+                    key = (tuple(spec.p_re.shape), spec.p_re.device, spec.g_re.dtype)
+                    shape_buckets.setdefault(key, []).append(spec)
+                else:
+                    q_re, q_im = self._polar_complex_2d(spec.g_re, spec.g_im, ns_steps, polar_method)
+                    self._apply_complex_pair_orth_step(spec, q_re, q_im)
+
+        if batched_ns:
+            for bucket in shape_buckets.values():
+                if len(bucket) == 1:
+                    spec = bucket[0]
+                    q_re, q_im = self._polar_complex_2d(spec.g_re, spec.g_im, ns_steps, polar_method)
+                    self._apply_complex_pair_orth_step(spec, q_re, q_im)
+                else:
+                    g_re_b = torch.stack([s.g_re for s in bucket], dim=0)
+                    g_im_b = torch.stack([s.g_im for s in bucket], dim=0)
+                    q_re_b, q_im_b = self._polar_complex_batched(g_re_b, g_im_b, ns_steps, polar_method)
+                    for idx_b, spec in enumerate(bucket):
+                        self._apply_complex_pair_orth_step(spec, q_re_b[idx_b], q_im_b[idx_b])
+
+    _step_complex_pair_group = _step_joint_complex_pairs
+
     @torch.no_grad()
-    def step(self, closure=None):
+    def step(self, closure: Any = None) -> Any:
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
 
         for group in self.param_groups:
-            lr: float = group["lr"]
-            nesterov: bool = group.get("nesterov", True)
-            wd: float = group["weight_decay"]
-            decay_mode: DecayMode = group["decay_mode"]
-            stiefel_penalty: float = group["stiefel_penalty"]
+            if group.get("is_complex_pair_group", False):
+                self._step_joint_complex_pairs(group)
+                continue
+
             ns_steps: int = group["ns_steps"]
-            aspect_scale: bool = group["aspect_scale"]
-            retract_every: int = group.get("retract_every", 1)
             batched_ns: bool = group.get("batched_ns", True)
-            ema_momentum: bool = group.get("ema_momentum", False)
             polar_method: str = group.get("polar_method", "newton_schulz")
             use_normuon: bool = group.get("use_normuon", False)
             normuon_beta2: float = group.get("normuon_beta2", 0.95)
-            use_twin_rail: bool = group.get("use_twin_rail", False)
-            rail_fast_beta: float = group.get("rail_fast_beta", 0.80)
-            rail_slow_beta: float = group.get("rail_slow_beta", 0.98)
-            rail_fast_weight: float = group.get("rail_fast_weight", 0.35)
-            rail_engage_step: int = group.get("rail_engage_step", 0)
 
             shape_buckets: dict[
                 tuple[tuple[int, ...], torch.device, torch.dtype],
-                list[tuple[torch.Tensor, torch.Tensor, int, dict, str]],
+                list[tuple[torch.Tensor, torch.Tensor, int, dict[str, Any], str]],
             ] = {}
 
             for p in group["params"]:
@@ -236,33 +601,8 @@ class StiefelMuon(torch.optim.Optimizer):
                         f"StiefelMuon only supports 2D or 3D batched weight tensors, got shape {tuple(p.shape)}"
                     )
 
-                g = p.grad
                 state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                    state["step"] = 0
-                state["step"] = state.get("step", 0) + 1
-                step_num: int = state["step"]
-                eff_momentum = self.get_effective_momentum(step_num, group)
-                state["effective_momentum"] = eff_momentum
-                group["last_effective_momentum"] = eff_momentum
-
-                buf: torch.Tensor = state["momentum_buffer"]
-                if use_twin_rail:
-                    if "slow_momentum_buffer" not in state:
-                        state["slow_momentum_buffer"] = torch.zeros_like(g)
-                    slow_buf: torch.Tensor = state["slow_momentum_buffer"]
-                    buf.lerp_(g, 1.0 - rail_fast_beta)
-                    slow_buf.lerp_(g, 1.0 - rail_slow_beta)
-                    w_rail = 1.0 if step_num < rail_engage_step else rail_fast_weight
-                    g_blend = w_rail * buf + (1.0 - w_rail) * slow_buf
-                    g_in = g.lerp(g_blend, eff_momentum) if nesterov else g_blend
-                elif ema_momentum:
-                    buf.lerp_(g, 1.0 - eff_momentum)
-                    g_in = g.lerp(buf, eff_momentum) if nesterov else buf
-                else:
-                    buf.mul_(eff_momentum).add_(g)
-                    g_in = g.add(buf, alpha=eff_momentum) if nesterov else buf
+                g_in, step_num = self._compute_momentum_update(p.grad, state, group)
 
                 if p.ndim == 3:
                     for c_idx in range(p.size(0)):
@@ -275,12 +615,7 @@ class StiefelMuon(torch.optim.Optimizer):
                         else:
                             u_c = self._polar_2d(g_c, ns_steps, polar_method)
                             u_c = self._maybe_normuon(u_c, state, s_key, use_normuon, normuon_beta2)
-                            self._apply_param_update(
-                                p_c, u_c, step_num, lr, wd, decay_mode, stiefel_penalty, aspect_scale, retract_every
-                            )
-                # If p is a fused QKV projection of shape (3 * D, D), treat its 3 (D, D)
-                # Q/K/V slices as independent square Stiefel matrices so each retains
-                # unit spectral norm and merges into the (K, D, D) 3D Newton-Schulz batch.
+                            self._apply_param_update(p_c, u_c, group, step_num)
                 elif p.size(0) == 3 * p.size(1) and p.size(1) > 0:
                     d_sq = p.size(1)
                     p_slices = p.view(3, d_sq, d_sq)
@@ -295,19 +630,14 @@ class StiefelMuon(torch.optim.Optimizer):
                         else:
                             u_c = self._polar_2d(g_c, ns_steps, polar_method)
                             u_c = self._maybe_normuon(u_c, state, s_key, use_normuon, normuon_beta2)
-                            self._apply_param_update(
-                                p_c, u_c, step_num, lr, wd, decay_mode, stiefel_penalty, aspect_scale, retract_every
-                            )
+                            self._apply_param_update(p_c, u_c, group, step_num)
                 elif batched_ns:
                     key = (tuple(p.shape), p.device, g_in.dtype)
                     shape_buckets.setdefault(key, []).append((p, g_in, step_num, state, "lane_energy"))
                 else:
                     u = self._polar_2d(g_in, ns_steps, polar_method)
                     u = self._maybe_normuon(u, state, "lane_energy", use_normuon, normuon_beta2)
-                    self._apply_param_update(
-                        p, u, step_num, lr, wd, decay_mode, stiefel_penalty, aspect_scale, retract_every
-                    )
-
+                    self._apply_param_update(p, u, group, step_num)
 
             if batched_ns:
                 for bucket in shape_buckets.values():
@@ -315,9 +645,7 @@ class StiefelMuon(torch.optim.Optimizer):
                         p, g_in, step_num, state, s_key = bucket[0]
                         u = self._polar_2d(g_in, ns_steps, polar_method)
                         u = self._maybe_normuon(u, state, s_key, use_normuon, normuon_beta2)
-                        self._apply_param_update(
-                            p, u, step_num, lr, wd, decay_mode, stiefel_penalty, aspect_scale, retract_every
-                        )
+                        self._apply_param_update(p, u, group, step_num)
                     else:
                         g_stack = torch.stack([item[1] for item in bucket], dim=0)
                         u_stack = self._polar_batched(g_stack, ns_steps, polar_method)
@@ -325,20 +653,163 @@ class StiefelMuon(torch.optim.Optimizer):
                             u_b = self._maybe_normuon(
                                 u_stack[idx_b], state, s_key, use_normuon, normuon_beta2
                             )
-                            self._apply_param_update(
-                                p,
-                                u_b,
-                                step_num,
-                                lr,
-                                wd,
-                                decay_mode,
-                                stiefel_penalty,
-                                aspect_scale,
-                                retract_every,
-                            )
+                            self._apply_param_update(p, u_b, group, step_num)
 
         return loss
 
+
+@torch.no_grad()
+def retract_complex_kraus_generators(
+    k_re_or_model: torch.Tensor | nn.Module,
+    k_im: torch.Tensor | None = None,
+    alpha: float = 0.5,
+    *,
+    stiefel_penalty: float | None = None,
+) -> int:
+    """Retract 2D/3D complex Kraus/unitary generators `(k_re, k_im)` or all 3D pairs in `model` in-place."""
+    eff_alpha = float(stiefel_penalty) if stiefel_penalty is not None else float(alpha)
+    if isinstance(k_re_or_model, nn.Module):
+        pairs, _ = collect_named_complex_muon_pairs(k_re_or_model)
+        count = 0
+        for p_re, p_im in pairs:
+            if p_re.ndim == 3:
+                retract_complex_stiefel_pair(p_re, p_im, penalty=eff_alpha)
+                count += 1
+        return count
+    if k_im is None:
+        raise ValueError("k_im must be provided when k_re_or_model is a Tensor")
+    retract_complex_stiefel_pair(k_re_or_model, k_im, penalty=eff_alpha)
+    return 1
+
+
+def compute_large_batch_muon_lr_scale(
+    batch_tokens: int,
+    ref_batch_tokens: int = DEFAULT_MUON_REFERENCE_BATCH_TOKENS,
+    exponent: float = DEFAULT_MUON_BATCH_LR_EXPONENT,
+    max_multiplier: float = MAX_MUON_LR_SCALE,
+    min_multiplier: float = MIN_MUON_LR_SCALE,
+) -> float:
+    """Compute square-root batch-size learning-rate scale `(B_tok / B_ref)^0.50` clamped to `[0.25, 8.0]`."""
+    ratio = float(max(1, int(batch_tokens))) / float(max(1, int(ref_batch_tokens)))
+    raw = ratio ** float(exponent)
+    return float(min(float(max_multiplier), max(float(min_multiplier), raw)))
+
+
+def collect_named_complex_muon_pairs(
+    model: nn.Module,
+    min_dim: int = MIN_COMPLEX_MUON_MATRIX_DIM,
+    max_dim: int = 4096,
+    *,
+    min_matrix_dim: int | None = None,
+    as_tuples: bool = True,
+) -> tuple[list[Any], set[int]]:
+    """Collect paired `(w_re, w_im)` 2D/3D complex matrix operators and their parameter `id()` set.
+
+    Excludes token/context lookup tables (`embed_re/im`, `bi_ctx_wave_re/im`, `tri_ctx_wave_re/im`)
+    and non-operator gate/router parameters (`branch_logits`, `ngram_branch_gates`, `echo_gate_logits`, `router_w`).
+    """
+    eff_min_dim = int(min_matrix_dim) if min_matrix_dim is not None else int(min_dim)
+    eff_max_dim = int(max_dim)
+    param_dict = {name: p for name, p in model.named_parameters() if p.requires_grad}
+    pairs: list[Any] = []
+    assigned_ids: set[int] = set()
+    excluded_tokens = ("branch_logits", "ngram_branch_gates", "echo_gate_logits", "router_w", "router_kets")
+
+    for name, p in param_dict.items():
+        if not name.endswith("_re") or "embed_" in name or name.endswith(LOOKUP_TABLE_PARAM_SUFFIXES):
+            continue
+        low_name = name.lower()
+        if any(tok in low_name for tok in excluded_tokens):
+            continue
+        if (
+            p.ndim in (2, 3)
+            and min(p.size(-2), p.size(-1)) >= eff_min_dim
+            and max(p.size(-2), p.size(-1)) <= eff_max_dim
+        ):
+            im_name = name[:-3] + "_im"
+            if im_name not in param_dict:
+                raise ValueError(f"Missing _im partner for complex matrix parameter {name}")
+            p_im = param_dict[im_name]
+            if p.shape != p_im.shape:
+                raise ValueError(
+                    f"Shape mismatch for complex pair {name} {tuple(p.shape)} vs {im_name} {tuple(p_im.shape)}"
+                )
+            if as_tuples:
+                pairs.append((p, p_im))
+            else:
+                pairs.extend([p, p_im])
+            assigned_ids.add(id(p))
+            assigned_ids.add(id(p_im))
+
+    return pairs, assigned_ids
+
+
+def classify_kronecker_model_parameters(
+    model: nn.Module,
+    min_operator_dim: int = MIN_COMPLEX_MUON_MATRIX_DIM,
+) -> KroneckerParameterPartition:
+    """Deterministically partition 100% of a Kronecker model's trainable parameters by mathematical role (`Track 2`).
+
+    Categories:
+    1. `embed_params`: Lookup tables (`embed_re/im`, `bi_ctx_wave_re/im`, `tri_ctx_wave_re/im`, `fourgram_ctx_wave_re/im`).
+    2. `povm_params`: Per-token POVM scale logits (`povm_scale_logits`).
+    3. `gate_params`: Non-operator gates (`branch_logits`, `ngram_branch_gates`, `router_w_re/im`, `echo_gate_logits`,
+       `gram_eta`, `meaning_mix_re/im` and `stinespring_w_re/im` when `R == 1`, plus all 1D/0D parameters).
+    4. `muon_complex_pairs`: Flat interleaved `[w1_re, w1_im, ...]` of paired 2D/3D complex matrix operators
+       with `min(m, n) >= min_operator_dim` (`>= 2`), ready for Joint-Complex `StiefelMuon(is_complex_pair_group=True)`.
+    """
+    param_dict = {name: p for name, p in model.named_parameters() if p.requires_grad}
+    muon_complex_pairs: list[nn.Parameter] = []
+    embed_params: list[nn.Parameter] = []
+    povm_params: list[nn.Parameter] = []
+    gate_params: list[nn.Parameter] = []
+    assigned_ids: set[int] = set()
+
+    for name, p in param_dict.items():
+        if id(p) in assigned_ids:
+            continue
+        low_name = name.lower()
+        if name.endswith(LOOKUP_TABLE_PARAM_SUFFIXES):
+            embed_params.append(p)
+            assigned_ids.add(id(p))
+        elif name.endswith(POVM_SCALE_PARAM_SUFFIXES):
+            povm_params.append(p)
+            assigned_ids.add(id(p))
+        elif p.ndim <= 1 or any(tok in low_name for tok in NON_OPERATOR_GATE_PARAM_TOKENS):
+            gate_params.append(p)
+            assigned_ids.add(id(p))
+        elif name.endswith("_re") and any(base in low_name for base in COMPLEX_MATRIX_OPERATOR_BASENAMES):
+            im_name = name[:-3] + "_im"
+            if im_name not in param_dict:
+                raise ValueError(f"Missing _im partner for {name}")
+            p_im = param_dict[im_name]
+            if p.shape != p_im.shape or p.ndim not in (2, 3):
+                raise ValueError(
+                    f"Invalid complex matrix operator pair {name} {tuple(p.shape)} vs {im_name} {tuple(p_im.shape)}"
+                )
+            if min(p.size(-2), p.size(-1)) >= int(min_operator_dim):
+                muon_complex_pairs.extend([p, p_im])
+            else:
+                gate_params.extend([p, p_im])
+            assigned_ids.add(id(p))
+            assigned_ids.add(id(p_im))
+        elif name.endswith("_im") and (name[:-3] + "_re") in param_dict:
+            continue
+        else:
+            raise ValueError(
+                f"Unclassified parameter in classify_kronecker_model_parameters: {name} shape={tuple(p.shape)}"
+            )
+
+    if len(assigned_ids) != len(param_dict) or len(muon_complex_pairs) % 2 != 0:
+        raise ValueError(
+            f"Incomplete Kronecker parameter partition: assigned {len(assigned_ids)} / {len(param_dict)}"
+        )
+    return KroneckerParameterPartition(
+        muon_complex_pairs=muon_complex_pairs,
+        embed_params=embed_params,
+        povm_params=povm_params,
+        gate_params=gate_params,
+    )
 
 
 @torch.no_grad()
@@ -377,14 +848,7 @@ def polar_snap_weights(
     *,
     polar_method: str = "newton_schulz",
 ) -> None:
-    """Hard polar retraction snapping 2D/3D weight matrices directly onto the Stiefel manifold.
-
-    Warning:
-        Executing hard periodic polar snaps mid-training abruptly resets all singular
-        values to 1.0 simultaneously, which can cause severe validation loss spikes
-        (representational shock). Prefer continuous regularization via
-        `StiefelMuon(..., stiefel_penalty=0.005)` during training.
-    """
+    """Hard polar retraction snapping 2D/3D weight matrices directly onto the Stiefel manifold."""
     use_pe = polar_method in ("polar_express", "polarexpress")
     skip_odd_qubit_snap = bool(
         getattr(model, "use_last_layer_softmax", False)
@@ -450,19 +914,7 @@ def split_muon_adamw_params(
     ),
     muon_3d_name_patterns: tuple[str, ...] = ("higher_interaction", "higher_sub_unitary"),
 ) -> tuple[list[nn.Parameter], list[nn.Parameter]]:
-    """Partition model parameters into 2D/3D Stiefel isometries (for Muon) and other params (for AdamW).
-
-    Args:
-        model: PyTorch model to partition.
-        adamw_name_patterns: Substrings identifying lookup tables or readout frames
-            that should be optimized by AdamW rather than Muon.
-        muon_3d_name_patterns: Substrings identifying 3D batched orthogonal operators
-            (e.g. `higher_interaction` `(16, 256, 256)` and `higher_sub_unitary` `(16, 32, 32)`)
-            that should be optimized by `StiefelMuon`.
-
-    Returns:
-        Tuple `(muon_params, adamw_params)`.
-    """
+    """Partition model parameters into 2D/3D Stiefel isometries (for Muon) and other params (for AdamW)."""
     muon_params: list[nn.Parameter] = []
     adamw_params: list[nn.Parameter] = []
     for name, p in model.named_parameters():
@@ -475,5 +927,6 @@ def split_muon_adamw_params(
         else:
             adamw_params.append(p)
     return muon_params, adamw_params
+
 
 

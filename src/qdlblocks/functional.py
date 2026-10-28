@@ -2,15 +2,31 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn.functional as F
 
 
 # =====================================================================
 # Top-of-File Named Constants (Rule 7 of docs/SCRIPT_BEST_PRACTICES.md)
-# Documented in EXPERIMENT_PLAN_049.md (Wave 34 Constants & Calibration Ledger)
+# Documented in EXPERIMENT_PLAN_049.md & EXPERIMENT_PLAN_059.md (Wave 44 Track 1)
 # =====================================================================
 CUSTOM_L2_NORM_MIN_NUMEL: int = 262144
+DEFAULT_COMPLEX_POLAR_ITERS: int = 5
+COMPLEX_POLAR_NORM_EPS: float = 1e-6
+DEFAULT_POLAR_FROBENIUS_MARGIN: float = 1.05
+DEFAULT_POLAR_NORM_EPS: float = COMPLEX_POLAR_NORM_EPS
+DEFAULT_NORMUON_BETA2: float = 0.95
+DEFAULT_NORMUON_EPS: float = 1e-7
+DEFAULT_COMPLEX_STIEFEL_PENALTY: float = 0.01
+STATIONARY_NEWTON_SCHULZ_QUINTIC: tuple[float, float, float] = (3.4445, -4.7750, 2.0315)
+COMPLEX_POLAR_EXPRESS_QUINTIC_MAPS: tuple[tuple[float, float, float], ...] = (
+    (4.0848, -6.8946, 2.9270),
+    (3.9505, -6.3029, 2.6377),
+    (3.7418, -5.5913, 2.3037),
+    (2.8769, -3.1427, 1.2046),
+    (1.828185, -1.149170, 0.321586),
+)
 
 
 # =====================================================================
@@ -212,8 +228,9 @@ def zeropower_via_polarexpress5(
         X = X.mT
         transposed = True
     n_steps = max(1, int(steps))
+    sched = COMPLEX_POLAR_EXPRESS_QUINTIC_MAPS if n_steps <= 5 else ANVIL_QUINTIC_MAPS
     for t in range(n_steps):
-        a, b, c = ANVIL_QUINTIC_MAPS[min(t, len(ANVIL_QUINTIC_MAPS) - 1)]
+        a, b, c = sched[min(t, len(sched) - 1)]
         A = X @ X.mT
         B = b * A + c * (A @ A)
         X = a * X + B @ X
@@ -241,8 +258,9 @@ def zeropower_via_polarexpress5_batched(
         X = X.mT
         transposed = True
     n_steps = max(1, int(steps))
+    sched = COMPLEX_POLAR_EXPRESS_QUINTIC_MAPS if n_steps <= 5 else ANVIL_QUINTIC_MAPS
     for t in range(n_steps):
-        a, b, c = ANVIL_QUINTIC_MAPS[min(t, len(ANVIL_QUINTIC_MAPS) - 1)]
+        a, b, c = sched[min(t, len(sched) - 1)]
         A = torch.bmm(X, X.mT)
         B = b * A + c * torch.bmm(A, A)
         X = a * X + torch.bmm(B, X)
@@ -270,6 +288,220 @@ def normuon_equalize(
     post_norm = ((lane_power * lane_len) * lane_gain.square()).sum(dim=(-2, -1), keepdim=True).sqrt()
     eq_scale = lane_gain * (pre_norm / post_norm.clamp_min(eps))
     return (U * eq_scale.type_as(U)), lane_energy
+
+
+def complex_polar_express_orth(
+    g_re: torch.Tensor,
+    g_im: torch.Tensor,
+    steps: int = DEFAULT_COMPLEX_POLAR_ITERS,
+    eps: float = COMPLEX_POLAR_NORM_EPS,
+    frobenius_margin: float = DEFAULT_POLAR_FROBENIUS_MARGIN,
+    quintic_schedule: tuple[tuple[float, float, float], ...] | None = None,
+    *,
+    iters: int | None = None,
+    compute_dtype: torch.dtype | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute the joint-complex semi-unitary polar factor `U = U_re + i U_im` via 5-step quintic Polar Express.
+
+    When to Use This Building Block (`Wave 44` / `EXPERIMENT_PLAN_059.md` Track 1):
+    - Use whenever orthogonalizing a 2D `(m, n)` or 3D batched `(B, m, n)` complex matrix
+      gradient/momentum pair `(g_re, g_im)` on the complex Stiefel manifold `U^H U = I_n`
+      (for `m >= n`) or `U U^H = I_m` (for `m < n`).
+
+    Why It Was Built (Mathematical Rationale):
+    - Applying real Polar Express independently to `g_re` and `g_im` produces `U_re U_re^T + U_im U_im^T = 2 I`
+      with non-zero skew-symmetric imaginary cross-terms, breaks `U(1)` phase equivariance
+      `Polar_C(e^{i theta} G) = e^{i theta} Polar_C(G)`, and amplifies tiny imaginary noise near
+      real initialization up to unit spectral norm.
+    - Joint-Complex Polar Express pre-normalizes by the joint complex Frobenius norm
+      `sqrt(||G_re||_F^2 + ||G_im||_F^2)`, conjugate-transposes tall matrices (`Z = G^H = G_re^T - i G_im^T`),
+      and iterates the Hermitian Gram polynomial `A = Z Z^H` in real-paired Tensor-Core arithmetic,
+      preserving caller `dtype` (`bfloat16` or `float32`).
+    """
+    if g_re.ndim not in (2, 3) or g_re.shape != g_im.shape:
+        raise ValueError(
+            f"complex_polar_express_orth expects matching 2D or 3D tensors, got {tuple(g_re.shape)} vs {tuple(g_im.shape)}"
+        )
+    if eps > 0.1 and frobenius_margin < 0.1:
+        eps, frobenius_margin = frobenius_margin, eps
+    if iters is not None:
+        steps = int(iters)
+    if compute_dtype is not None:
+        work_dtype = compute_dtype
+    else:
+        work_dtype = torch.bfloat16 if g_re.dtype in (torch.float16, torch.bfloat16) else torch.float32
+    x_re = g_re.to(dtype=work_dtype)
+    x_im = g_im.to(dtype=work_dtype)
+
+    frob_c = torch.sqrt(
+        g_re.float().square().sum(dim=(-2, -1), keepdim=True)
+        + g_im.float().square().sum(dim=(-2, -1), keepdim=True)
+    )
+    denom = float(frobenius_margin) * frob_c + float(eps)
+    x_re = (g_re.float() / denom).to(dtype=work_dtype)
+    x_im = (g_im.float() / denom).to(dtype=work_dtype)
+
+    transposed = g_re.size(-2) > g_re.size(-1)
+    if transposed:
+        x_re = x_re.mT
+        x_im = -x_im.mT
+
+    sched = quintic_schedule if quintic_schedule is not None else COMPLEX_POLAR_EXPRESS_QUINTIC_MAPS
+    n_steps = max(1, int(steps))
+    if sched is ANVIL_QUINTIC_MAPS and n_steps <= 5:
+        sched = COMPLEX_POLAR_EXPRESS_QUINTIC_MAPS
+
+    for step_idx in range(n_steps):
+        a, b, c = sched[min(step_idx, len(sched) - 1)]
+        a_re_f = (x_re @ x_re.mT).float() + (x_im @ x_im.mT).float()
+        a_im_f = (x_im @ x_re.mT).float() - (x_re @ x_im.mT).float()
+        a_re = a_re_f.to(dtype=work_dtype)
+        a_im = a_im_f.to(dtype=work_dtype)
+        a2_re_f = (a_re @ a_re).float() - (a_im @ a_im).float()
+        a2_im_f = (a_re @ a_im).float() + (a_im @ a_re).float()
+        b_re = (b * a_re_f + c * a2_re_f).to(dtype=work_dtype)
+        b_im = (b * a_im_f + c * a2_im_f).to(dtype=work_dtype)
+        x_next_re = a * x_re.float() + (b_re @ x_re).float() - (b_im @ x_im).float()
+        x_next_im = a * x_im.float() + (b_re @ x_im).float() + (b_im @ x_re).float()
+        x_re = x_next_re.to(dtype=work_dtype)
+        x_im = x_next_im.to(dtype=work_dtype)
+
+    if transposed:
+        x_re = x_re.mT
+        x_im = -x_im.mT
+
+    return x_re.to(dtype=g_re.dtype), x_im.to(dtype=g_im.dtype)
+
+
+def zeropower_via_polarexpress5_complex_2d(
+    g_re: torch.Tensor,
+    g_im: torch.Tensor,
+    steps: int = DEFAULT_COMPLEX_POLAR_ITERS,
+    eps: float = DEFAULT_POLAR_NORM_EPS,
+    frobenius_margin: float = DEFAULT_POLAR_FROBENIUS_MARGIN,
+    quintic_schedule: tuple[tuple[float, float, float], ...] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """2D Joint-Complex Polar Express orthogonalization (`Wave 44` / `EXPERIMENT_PLAN_059.md` Track 1)."""
+    if g_re.ndim != 2 or g_re.shape != g_im.shape:
+        raise ValueError(
+            f"zeropower_via_polarexpress5_complex_2d expects matching 2D tensors, got {tuple(g_re.shape)} vs {tuple(g_im.shape)}"
+        )
+    return complex_polar_express_orth(
+        g_re,
+        g_im,
+        steps=steps,
+        eps=eps,
+        frobenius_margin=frobenius_margin,
+        quintic_schedule=quintic_schedule,
+    )
+
+
+def zeropower_via_polarexpress5_complex_batched(
+    g_re: torch.Tensor,
+    g_im: torch.Tensor,
+    steps: int = DEFAULT_COMPLEX_POLAR_ITERS,
+    eps: float = DEFAULT_POLAR_NORM_EPS,
+    frobenius_margin: float = DEFAULT_POLAR_FROBENIUS_MARGIN,
+    quintic_schedule: tuple[tuple[float, float, float], ...] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batched 3D/2D Joint-Complex Polar Express orthogonalization (`Wave 44` / `EXPERIMENT_PLAN_059.md` Track 1)."""
+    if g_re.ndim not in (2, 3) or g_re.shape != g_im.shape:
+        raise ValueError(
+            f"zeropower_via_polarexpress5_complex_batched expects matching 2D/3D tensors, got {tuple(g_re.shape)} vs {tuple(g_im.shape)}"
+        )
+    return complex_polar_express_orth(
+        g_re,
+        g_im,
+        steps=steps,
+        eps=eps,
+        frobenius_margin=frobenius_margin,
+        quintic_schedule=quintic_schedule,
+    )
+
+
+def normuon_equalize_complex(
+    u_re: torch.Tensor,
+    u_im: torch.Tensor,
+    lane_energy: torch.Tensor | None = None,
+    beta2: float = DEFAULT_NORMUON_BETA2,
+    eps: float = DEFAULT_NORMUON_EPS,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Joint-Complex NorMuon lane-energy equalization preserving `U(1)` phase equivariance (`Wave 44` Track 1)."""
+    red_dim = -2 if u_re.size(-2) >= u_re.size(-1) else -1
+    u_re_f = u_re.float()
+    u_im_f = u_im.float()
+    lane_power = (u_re_f.square() + u_im_f.square()).mean(dim=red_dim, keepdim=True)
+    if lane_energy is None or lane_energy.shape != lane_power.shape:
+        lane_energy = lane_power.clone()
+    else:
+        lane_energy = lane_energy.float().mul(float(beta2)).add_(lane_power, alpha=1.0 - float(beta2))
+    lane_gain = torch.rsqrt(lane_energy.clamp_min(float(eps)))
+    pre_norm = torch.sqrt((u_re_f.square() + u_im_f.square()).sum(dim=(-2, -1), keepdim=True))
+    u_eq_re = u_re_f * lane_gain
+    u_eq_im = u_im_f * lane_gain
+    post_norm = torch.sqrt((u_eq_re.square() + u_eq_im.square()).sum(dim=(-2, -1), keepdim=True)).clamp_min(float(eps))
+    scale = pre_norm / post_norm
+    return (u_eq_re * scale).to(dtype=u_re.dtype), (u_eq_im * scale).to(dtype=u_im.dtype), lane_energy
+
+
+@torch.no_grad()
+def retract_complex_stiefel_pair(
+    w_re: torch.Tensor,
+    w_im: torch.Tensor,
+    penalty: float = DEFAULT_COMPLEX_STIEFEL_PENALTY,
+    *,
+    alpha: float | None = None,
+    strength: float | None = None,
+    eps: float = COMPLEX_POLAR_NORM_EPS,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply a damped complex Stiefel retraction step `W <- W - penalty * W (W^H W - I_n) / denom` in-place.
+
+    Supports both 2D `(m, n)` and 3D `(B, m, n)` complex matrix pairs `(w_re, w_im)` across square,
+    tall (`m >= n`, enforcing `W^H W = I_n`), and wide (`m < n`, enforcing `W W^H = I_m`) shapes.
+    Mutates `w_re` and `w_im` in-place and returns `(w_re, w_im)`.
+    """
+    if w_re.ndim not in (2, 3) or w_re.shape != w_im.shape:
+        raise ValueError(
+            f"retract_complex_stiefel_pair expects matching 2D or 3D tensors, got {tuple(w_re.shape)} vs {tuple(w_im.shape)}"
+        )
+    if alpha is not None:
+        penalty = float(alpha)
+    if strength is not None:
+        penalty = float(strength)
+    alpha_ret = float(penalty)
+    if alpha_ret <= 0.0:
+        return w_re, w_im
+
+    w_re_f = w_re.float()
+    w_im_f = w_im.float()
+    m, n = w_re.size(-2), w_re.size(-1)
+    if m >= n:
+        eye = torch.eye(n, device=w_re.device, dtype=torch.float32)
+        delta_re = w_re_f.mT @ w_re_f + w_im_f.mT @ w_im_f - eye
+        delta_im = w_re_f.mT @ w_im_f - w_im_f.mT @ w_re_f
+        frob_d = torch.sqrt(
+            delta_re.square().sum(dim=(-2, -1), keepdim=True)
+            + delta_im.square().sum(dim=(-2, -1), keepdim=True)
+        )
+        denom = 1.0 + frob_d / math.sqrt(float(n)) + float(eps)
+        step_re = ((w_re_f @ delta_re - w_im_f @ delta_im) / denom).to(dtype=w_re.dtype)
+        step_im = ((w_re_f @ delta_im + w_im_f @ delta_re) / denom).to(dtype=w_im.dtype)
+    else:
+        eye = torch.eye(m, device=w_re.device, dtype=torch.float32)
+        delta_re = w_re_f @ w_re_f.mT + w_im_f @ w_im_f.mT - eye
+        delta_im = w_im_f @ w_re_f.mT - w_re_f @ w_im_f.mT
+        frob_d = torch.sqrt(
+            delta_re.square().sum(dim=(-2, -1), keepdim=True)
+            + delta_im.square().sum(dim=(-2, -1), keepdim=True)
+        )
+        denom = 1.0 + frob_d / math.sqrt(float(m)) + float(eps)
+        step_re = ((delta_re @ w_re_f - delta_im @ w_im_f) / denom).to(dtype=w_re.dtype)
+        step_im = ((delta_re @ w_im_f + delta_im @ w_re_f) / denom).to(dtype=w_im.dtype)
+
+    w_re.add_(step_re, alpha=-alpha_ret)
+    w_im.add_(step_im, alpha=-alpha_ret)
+    return w_re, w_im
+
 
 
 

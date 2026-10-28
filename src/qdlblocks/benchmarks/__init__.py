@@ -91,6 +91,27 @@ from .wave_ingestor import (
     ingest_all_waves_and_verifications,
     normalize_raw_result_to_model_card,
 )
+from .autograd_efficiency_auditor import (
+    DEFAULT_FORBIDDEN_POLYNOMIAL_OPS,
+    DEFAULT_MAX_BWD_TO_FWD_BMM_RATIO,
+    DEFAULT_MAX_BWD_TO_FWD_EXP_RATIO,
+    DEFAULT_MAX_BWD_TO_FWD_POW_RATIO,
+    AutogradEfficiencyReport,
+    OpCountingDispatchMode,
+    audit_chunked_nll_autograd_efficiency,
+)
+from .kronecker_diagnostic_utils import (
+    DiagnosticModelSpec,
+    KroneckerProbeConfig,
+    build_or_load_kronecker_probe_model,
+    compute_complex_factor_gram_spectrum,
+    compute_fineweb_10_frequency_deciles,
+    compute_pairwise_complex_branch_overlap,
+    load_fineweb_eval_slice,
+    load_kronecker_probe_batch,
+    load_or_build_calibrated_kronecker_model,
+    write_standardized_probe_json,
+)
 
 __all__ = [
     "RANK_BUCKETS",
@@ -167,5 +188,22 @@ __all__ = [
     "build_fast_classical_softmax_synth_lm",
     "run_collinear_radial_lag_attention_probe",
     "run_synthetic_fineweb_overfit_suite",
+    "DEFAULT_MAX_BWD_TO_FWD_BMM_RATIO",
+    "DEFAULT_MAX_BWD_TO_FWD_POW_RATIO",
+    "DEFAULT_MAX_BWD_TO_FWD_EXP_RATIO",
+    "DEFAULT_FORBIDDEN_POLYNOMIAL_OPS",
+    "AutogradEfficiencyReport",
+    "OpCountingDispatchMode",
+    "audit_chunked_nll_autograd_efficiency",
+    "DiagnosticModelSpec",
+    "KroneckerProbeConfig",
+    "build_or_load_kronecker_probe_model",
+    "compute_complex_factor_gram_spectrum",
+    "compute_fineweb_10_frequency_deciles",
+    "compute_pairwise_complex_branch_overlap",
+    "load_fineweb_eval_slice",
+    "load_kronecker_probe_batch",
+    "load_or_build_calibrated_kronecker_model",
+    "write_standardized_probe_json",
 ]
 

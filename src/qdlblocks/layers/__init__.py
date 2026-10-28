@@ -172,6 +172,18 @@ from .packed_complex_register_density_attn import (
     pack_hermitian_outer_product_and_ket,
     unpack_hermitian_matrix,
 )
+from .multihead_superposition_mixed_state_attn import (
+    MultiHeadStinespringSuperpositionAttention,
+    MultiHeadSuperpositionAttentionConfig,
+    MultiHeadSuperpositionAttnConfig,
+    MultiHeadSuperpositionMixedStateAttention,
+    apply_stinespring_subhead_to_branch_coupling,
+    causal_born_p2_complex_attn,
+    compute_cross_head_hermitian_gram_step,
+    compute_normalized_cross_head_gram,
+    compute_subhead_purity_telemetry,
+    count_attention_matmul_calls,
+)
 
 __all__ = [
     "ComplexLinear",
@@ -184,6 +196,16 @@ __all__ = [
     "pack_hermitian_outer_product",
     "pack_hermitian_outer_product_and_ket",
     "unpack_hermitian_matrix",
+    "MultiHeadSuperpositionAttnConfig",
+    "MultiHeadSuperpositionAttentionConfig",
+    "MultiHeadSuperpositionMixedStateAttention",
+    "MultiHeadStinespringSuperpositionAttention",
+    "causal_born_p2_complex_attn",
+    "compute_normalized_cross_head_gram",
+    "compute_cross_head_hermitian_gram_step",
+    "apply_stinespring_subhead_to_branch_coupling",
+    "compute_subhead_purity_telemetry",
+    "count_attention_matmul_calls",
     "MultiHeadComplexProjection",
     "PureQuantumAttention",
     "ComplexSuperpositionAttention",
@@ -306,6 +328,7 @@ __all__ = [
     "SPAMNoise",
     "DepolarizingNoise",
 ]
+
 
 
 

@@ -15,11 +15,11 @@ An engineering audit of the repository identified three anti-patterns that accum
      1. `examples/42_*.py` routed `value_embeds`, `unigram_qubits`, and `higher_states` into the **Gentle `2x` Zero-Weight-Decay Qubit Embedding `AdamW` group (`lr = 0.006, weight_decay = 0.0`)**, whereas `examples/11_*.py` omitted `value_embeds` (letting it fall into `weight_decay = 0.01`) and set `sparse_lr = 0.010` (`2.5 * 0.004`).
      2. `examples/42_*.py` initialized `model.povm_log_prior` via **Bose-saturated empirical log-unigram frequencies (`alpha = 0.62`, top-16 knee saturation)**, whereas `examples/11_*.py` did not call `initialize_povm_log_prior`.
 
-To prevent these failure modes permanently, all new and refactored code in `QuantumDLBlocks` MUST obey **Rules 1–8** and the **Graceful Experiment Wrap-Up Protocol** below.
+To prevent these failure modes permanently, all new and refactored code in `QuantumDLBlocks` MUST obey **Rules 1–9** and the **Graceful Experiment Wrap-Up Protocol** below.
 
 ---
 
-## 2. The Eight Mandatory Engineering Rules
+## 2. The Nine Mandatory Engineering Rules
 
 ### Rule 1: Comment-Free Code-Length Budget (`<= 1,000` SLOC Soft Warning Limit, `<= 2,500` SLOC Hard Limit, Comments & Docstrings Are Free)
 - **Comments & Docstrings Do NOT Count Against Line Limits**: [`scripts/ast_signature_and_length_linter.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/ast_signature_and_length_linter.py) (`count_code_and_doc_lines`) strips all `#` comments, module/class/function docstrings (`"""..."""`), and blank lines before evaluating file and nested-function line limits. **Never skimp on comments or docstrings to save lines.**
@@ -51,6 +51,7 @@ To prevent these failure modes permanently, all new and refactored code in `Quan
   - [`build_quantum_born_optimizers`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/config_models.py#L230-L328): Canonical `StiefelMuon` + 4-group `AdamW` builder (`body`, `qubit_embed` at `lr=0.006, wd=0.0` including `unigram_qubits`, `higher_states`, and `value_embeds`, `readout_head` at `lr=0.012, wd=0.0`, and `ngram` at `lr=0.025, wd=0.0`).
   - [`compute_wsd_lr_multiplier`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/config_models.py#L331-L345): Warmup-Stable-Decay multiplier.
   - [`compute_calibration_rank_decomposition`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/calibration_probe.py#L36-L211) & [`compute_layerwise_dynamics_profile`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/calibration_probe.py#L260-L372).
+  - [`load_or_build_calibrated_kronecker_model`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/kronecker_diagnostic_utils.py) & [`build_or_load_kronecker_probe_model`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/kronecker_diagnostic_utils.py): Shared Kronecker Born model/checkpoint loader, `10`-decile Zipfian Partitioner, and FineWeb evaluation slice loader for diagnostic CLI probes.
 
 ### Rule 5: No Giant Closure-Capturing Nested Functions
 - **Rule**: Do not define nested helper functions (`def _eval(): ...`, `def _step(): ...`) inside a `500+`-line outer function that implicitly capture 30 local variables from the enclosing scope.
@@ -75,6 +76,12 @@ To prevent these failure modes permanently, all new and refactored code in `Quan
   1. **When to Use It**: The specific regime or bottleneck where the building block is useful (e.g., $V \gg d$ vocabulary readout, multi-scale channel conditioning, or $M$-subspace anti-collapse).
   2. **Why It Was Built (Mathematical Rationale)**: The failure mode it resolves and the governing equation or invariance law it enforces.
   3. **Experiment Provenance (`Wave XX` / `EXPERIMENT_PLAN_0XX.md`)**: Explicit citation of the experiment plan and wave that created and validated the building block, along with its key quantitative finding.
+
+### Rule 9: Custom Autograd Efficiency & Single-Pass Backward Gate (`Wave 44` / `Track 5`)
+- **Rule**: Every custom `torch.autograd.Function` chunked readout or attention kernel in `src/qdlblocks/` MUST compute all input gradients (`grad_psi`, `grad_w`, `grad_povm`, etc.) inside a **single vocabulary-chunk backward loop** without re-running the chunk loop or duplicating transcendental/power calls (`torch.pow`, `torch.bmm`).
+- **How to Verify (`Layer 1` Runtime `TorchDispatchMode` + `FlopCounterMode` & `Layer 2` Static AST Gate)**:
+  - Layer 1 (Runtime Dispatch Gate via `src/qdlblocks/benchmarks/autograd_efficiency_auditor.py`): Wraps forward and backward passes in `TorchDispatchMode` + `FlopCounterMode` and enforces `bwd_pow / fwd_pow <= 1.0`, `bwd_bmm / fwd_bmm <= 3.0`, and `bwd_flops / fwd_flops <= 3.5`.
+  - Layer 2 (Static AST Gate): Flags `torch.autograd.Function` subclasses whose `backward()` method contains more than one loop over `range(0, v_eff, chunk_size)` or calls both a `_bwd_step` helper and an inline `torch.pow` recomputation.
 
 ---
 

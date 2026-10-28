@@ -39,10 +39,16 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from ..functional import l2_normalize
+from ..kernels.flash_complex_krylov_triton import (
+    TRITON_COMPLEX_MAX_DIM,
+    TRITON_COMPLEX_MIN_DIM,
+    flash_complex_krylov_attention,
+    fused_complex_norm_rope_triton,
+)
 
 # ==============================================================================
 # Top-of-File Named Constants (Rule 7 of docs/SCRIPT_BEST_PRACTICES.md)
-# Documented in EXPERIMENT_PLAN_052.md (Section 6.1)
+# Documented in EXPERIMENT_PLAN_052.md & EXPERIMENT_PLAN_053.md
 # ==============================================================================
 DEFAULT_COMPLEX_ROPE_BASE: float = 10000.0
 DEFAULT_COMPLEX_REGISTER_DIM: int = 32
@@ -59,10 +65,22 @@ def complex_l2_normalize(
     dim: int = -1,
     eps: float = DEFAULT_COMPLEX_NORM_EPS,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Normalize a complex tensor pair `(x_re, x_im)` to unit complex L2 norm along `dim`."""
+    """Normalize a complex tensor pair `(x_re, x_im)` to unit complex L2 norm along `dim` (`bfloat16`-aware)."""
+    if (
+        (dim == -1 or dim == x_re.ndim - 1)
+        and x_re.is_cuda
+        and TRITON_COMPLEX_MIN_DIM <= x_re.size(-1) <= TRITON_COMPLEX_MAX_DIM
+    ):
+        return fused_complex_norm_rope_triton(x_re, x_im, cos_theta=None, sin_theta=None, eps=eps)
+
+    out_dtype = (
+        torch.get_autocast_gpu_dtype()
+        if (x_re.is_cuda and torch.is_autocast_enabled())
+        else x_re.dtype
+    )
     norm_sq = x_re.float().square().sum(dim=dim, keepdim=True) + x_im.float().square().sum(dim=dim, keepdim=True)
-    inv_norm = torch.rsqrt(norm_sq + eps).to(dtype=x_re.dtype)
-    return x_re * inv_norm, x_im * inv_norm
+    inv_norm = torch.rsqrt(norm_sq + eps)
+    return (x_re.float() * inv_norm).to(dtype=out_dtype), (x_im.float() * inv_norm).to(dtype=out_dtype)
 
 
 class ComplexRoPE(nn.Module):
@@ -86,16 +104,94 @@ class ComplexRoPE(nn.Module):
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
+    def get_cos_sin(self, seq_t: int, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return `(cos_theta, sin_theta)` of shape `(seq_t, d_register)` for fused Triton norm + RoPE."""
+        positions = torch.arange(seq_t, device=device, dtype=self.inv_freq.dtype)
+        angles = torch.outer(positions, self.inv_freq)
+        return torch.cos(angles).to(dtype=dtype), torch.sin(angles).to(dtype=dtype)
+
     def forward(self, z_re: torch.Tensor, z_im: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Rotate `(z_re, z_im)` of shape `(B, H, T, d_h)` by `e^(i * t * omega_a)`."""
         seq_t = z_re.size(2)
-        positions = torch.arange(seq_t, device=z_re.device, dtype=self.inv_freq.dtype)
-        angles = torch.outer(positions, self.inv_freq)
-        cos_theta = torch.cos(angles).unsqueeze(0).unsqueeze(0).to(dtype=z_re.dtype)
-        sin_theta = torch.sin(angles).unsqueeze(0).unsqueeze(0).to(dtype=z_re.dtype)
-        rot_re = z_re * cos_theta - z_im * sin_theta
-        rot_im = z_re * sin_theta + z_im * cos_theta
+        out_dtype = (
+            torch.get_autocast_gpu_dtype()
+            if (z_re.is_cuda and torch.is_autocast_enabled())
+            else z_re.dtype
+        )
+        cos_2d, sin_2d = self.get_cos_sin(seq_t, z_re.device, out_dtype)
+        cos_theta = cos_2d.unsqueeze(0).unsqueeze(0)
+        sin_theta = sin_2d.unsqueeze(0).unsqueeze(0)
+        zr = z_re.to(dtype=out_dtype)
+        zi = z_im.to(dtype=out_dtype)
+        rot_re = zr * cos_theta - zi * sin_theta
+        rot_im = zr * sin_theta + zi * cos_theta
         return rot_re, rot_im
+
+
+class _ComplexLinearFn(torch.autograd.Function):
+    """CuBLAS epilogue-accumulated ComplexLinear autograd function (`addmm_` with `beta=1.0, alpha=+-1.0`)."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x_re: torch.Tensor,
+        x_im: torch.Tensor,
+        weight_re: torch.Tensor,
+        weight_im: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        compute_dtype = (
+            torch.get_autocast_gpu_dtype()
+            if (x_re.is_cuda and torch.is_autocast_enabled())
+            else x_re.dtype
+        )
+        orig_shape = x_re.shape
+        in_features = orig_shape[-1]
+        out_features = weight_re.size(0)
+        out_shape = (*orig_shape[:-1], out_features)
+
+        xr_2d = x_re.to(dtype=compute_dtype).reshape(-1, in_features).contiguous()
+        xi_2d = x_im.to(dtype=compute_dtype).reshape(-1, in_features).contiguous()
+        wr = weight_re.to(dtype=compute_dtype)
+        wi = weight_im.to(dtype=compute_dtype)
+
+        out_re = torch.mm(xr_2d, wr.t())
+        out_re.addmm_(xi_2d, wi.t(), beta=1.0, alpha=-1.0)
+        out_im = torch.mm(xr_2d, wi.t())
+        out_im.addmm_(xi_2d, wr.t(), beta=1.0, alpha=1.0)
+
+        ctx.save_for_backward(xr_2d, xi_2d, weight_re, weight_im)
+        ctx.orig_shape = orig_shape
+        ctx.in_dtype = x_re.dtype
+        ctx.compute_dtype = compute_dtype
+        return out_re.view(out_shape), out_im.view(out_shape)
+
+    @staticmethod
+    def backward(ctx, grad_out_re: torch.Tensor, grad_out_im: torch.Tensor):
+        xr_2d, xi_2d, weight_re, weight_im = ctx.saved_tensors
+        compute_dtype = ctx.compute_dtype
+        in_features = xr_2d.size(-1)
+        out_features = weight_re.size(0)
+
+        gor_2d = grad_out_re.to(dtype=compute_dtype).reshape(-1, out_features).contiguous()
+        goi_2d = grad_out_im.to(dtype=compute_dtype).reshape(-1, out_features).contiguous()
+        wr = weight_re.to(dtype=compute_dtype)
+        wi = weight_im.to(dtype=compute_dtype)
+
+        # grad_x_re = gor @ wr + goi @ wi, grad_x_im = goi @ wr - gor @ wi
+        gxr_2d = torch.mm(gor_2d, wr)
+        gxr_2d.addmm_(goi_2d, wi, beta=1.0, alpha=1.0)
+        gxi_2d = torch.mm(goi_2d, wr)
+        gxi_2d.addmm_(gor_2d, wi, beta=1.0, alpha=-1.0)
+
+        # grad_w_re = gor^T @ xr + goi^T @ xi, grad_w_im = goi^T @ xr - gor^T @ xi
+        gwr = torch.mm(gor_2d.t(), xr_2d)
+        gwr.addmm_(goi_2d.t(), xi_2d, beta=1.0, alpha=1.0)
+        gwi = torch.mm(goi_2d.t(), xr_2d)
+        gwi.addmm_(gor_2d.t(), xi_2d, beta=1.0, alpha=-1.0)
+
+        grad_x_re = gxr_2d.view(ctx.orig_shape).to(dtype=ctx.in_dtype)
+        grad_x_im = gxi_2d.view(ctx.orig_shape).to(dtype=ctx.in_dtype)
+        return grad_x_re, grad_x_im, gwr.to(dtype=weight_re.dtype), gwi.to(dtype=weight_im.dtype)
 
 
 class ComplexLinear(nn.Module):
@@ -129,12 +225,22 @@ class ComplexLinear(nn.Module):
             self.weight_im.copy_(q.imag)
 
     def forward(self, x_re: torch.Tensor, x_im: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply `(W_re + i * W_im)(x_re + i * x_im)`."""
-        w_re = self.weight_re.to(dtype=x_re.dtype)
-        w_im = self.weight_im.to(dtype=x_re.dtype)
-        out_re = F.linear(x_re, w_re) - F.linear(x_im, w_im)
-        out_im = F.linear(x_re, w_im) + F.linear(x_im, w_re)
+        """Apply `(W_re + i * W_im)(x_re + i * x_im)` via cuBLAS epilogue-accumulated `_ComplexLinearFn`."""
+        if not torch.compiler.is_compiling():
+            return _ComplexLinearFn.apply(x_re, x_im, self.weight_re, self.weight_im)
+        compute_dtype = (
+            torch.get_autocast_gpu_dtype()
+            if (x_re.is_cuda and torch.is_autocast_enabled())
+            else x_re.dtype
+        )
+        xr = x_re.to(dtype=compute_dtype)
+        xi = x_im.to(dtype=compute_dtype)
+        w_re = self.weight_re.to(dtype=compute_dtype)
+        w_im = self.weight_im.to(dtype=compute_dtype)
+        out_re = F.linear(xr, w_re) - F.linear(xi, w_im)
+        out_im = F.linear(xr, w_im) + F.linear(xi, w_re)
         return out_re, out_im
+
 
 
 def pack_hermitian_outer_product(v_re: torch.Tensor, v_im: torch.Tensor) -> torch.Tensor:
@@ -384,43 +490,60 @@ class PackedComplexRegisterDensityAttention(nn.Module):
             v_re = (1.0 - alpha) * v_re + alpha * v0_re.to(dtype=v_re.dtype)
             v_im = (1.0 - alpha) * v_im + alpha * v0_im.to(dtype=v_im.dtype)
 
-        q_re, q_im = complex_l2_normalize(q_re, q_im, dim=-1, eps=eps)
-        k_re, k_im = complex_l2_normalize(k_re, k_im, dim=-1, eps=eps)
-        v_re, v_im = complex_l2_normalize(v_re, v_im, dim=-1, eps=eps)
+        if TRITON_COMPLEX_MIN_DIM <= dh <= TRITON_COMPLEX_MAX_DIM and q_re.is_cuda:
+            cos_2d, sin_2d = self.rope.get_cos_sin(seq_t, q_re.device, torch.float32)
+            q_rot_re, q_rot_im = fused_complex_norm_rope_triton(q_re, q_im, cos_2d, sin_2d, eps=eps)
+            k_rot_re, k_rot_im = fused_complex_norm_rope_triton(k_re, k_im, cos_2d, sin_2d, eps=eps)
+            v_re, v_im = fused_complex_norm_rope_triton(v_re, v_im, None, None, eps=eps)
+        else:
+            q_re, q_im = complex_l2_normalize(q_re, q_im, dim=-1, eps=eps)
+            k_re, k_im = complex_l2_normalize(k_re, k_im, dim=-1, eps=eps)
+            v_re, v_im = complex_l2_normalize(v_re, v_im, dim=-1, eps=eps)
+            q_rot_re, q_rot_im = self.rope(q_re, q_im)
+            k_rot_re, k_rot_im = self.rope(k_re, k_im)
 
-        # Refinement 1: Apply ComplexRoPE strictly to Q and K (V stays un-rotated in content space)
-        q_rot_re, q_rot_im = self.rope(q_re, q_im)
-        k_rot_re, k_rot_im = self.rope(k_re, k_im)
-
-        # Softmax-free p-Boson Born weights w_ts >= 0, sum_{s<=t} w_ts = 1 (zero gamma_coh)
-        w_born = self._compute_born_weights(
-            q_rot_re, q_rot_im, k_rot_re, k_rot_im, window_size=window_size, doc_ids=doc_ids, eps=eps
-        )
-        use_vkrylov = self.probe_mode == "v_krylov"
-
-        if self.training and torch.is_grad_enabled() and not torch.compiler.is_compiling():
-            u_raw_re, u_raw_im, tr_mean, unorm_mean = checkpoint(
-                _mix_and_krylov_probe_step,
-                w_born,
-                v_re,
-                v_im,
+        used_fast_norm = False
+        if window_size == 0 and doc_ids is None and int(self.p_boson) == 2:
+            eff_mode = f"{self.probe_mode}_norm" if self.normalize_krylov_ket else self.probe_mode
+            used_fast_norm = bool(self.normalize_krylov_ket)
+            u_raw_re, u_raw_im, tr_mean, unorm_mean = flash_complex_krylov_attention(
                 q_rot_re,
                 q_rot_im,
-                dh,
-                use_vkrylov,
-                eps,
-                use_reentrant=False,
+                k_rot_re,
+                k_rot_im,
+                v_re,
+                v_im,
+                probe_mode=eff_mode,
+                eps=eps,
             )
         else:
-            u_raw_re, u_raw_im, tr_mean, unorm_mean = _mix_and_krylov_probe_step(
-                w_born, v_re, v_im, q_rot_re, q_rot_im, dh, use_vkrylov, eps
+            w_born = self._compute_born_weights(
+                q_rot_re, q_rot_im, k_rot_re, k_rot_im, window_size=window_size, doc_ids=doc_ids, eps=eps
             )
+            use_vkrylov = self.probe_mode == "v_krylov"
+            if self.training and torch.is_grad_enabled() and not torch.compiler.is_compiling():
+                u_raw_re, u_raw_im, tr_mean, unorm_mean = checkpoint(
+                    _mix_and_krylov_probe_step,
+                    w_born,
+                    v_re,
+                    v_im,
+                    q_rot_re,
+                    q_rot_im,
+                    dh,
+                    use_vkrylov,
+                    eps,
+                    use_reentrant=False,
+                )
+            else:
+                u_raw_re, u_raw_im, tr_mean, unorm_mean = _mix_and_krylov_probe_step(
+                    w_born, v_re, v_im, q_rot_re, q_rot_im, dh, use_vkrylov, eps
+                )
 
         if not torch.compiler.is_compiling():
             self.last_purity_mean = float(tr_mean.detach().item())
             self.last_probe_norm_mean = float(unorm_mean.detach().item())
 
-        if self.normalize_krylov_ket:
+        if self.normalize_krylov_ket and not used_fast_norm:
             u_re, u_im = complex_l2_normalize(u_raw_re, u_raw_im, dim=-1, eps=eps)
         else:
             u_re, u_im = u_raw_re, u_raw_im
