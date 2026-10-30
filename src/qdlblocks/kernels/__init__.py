@@ -20,6 +20,18 @@ from .flash_complex_krylov_triton import (
     fused_causal_pboson_born_triton,
     fused_complex_norm_rope_triton,
 )
+from .fused_kronecker_mixed_state_kernels import (
+    HAS_FUSED_KRONECKER_TRITON,
+    TRITON_FLASH_ATTN_BLOCK_M,
+    TRITON_FLASH_ATTN_BLOCK_N,
+    TRITON_READOUT_BLOCK_N,
+    TRITON_READOUT_BLOCK_V,
+    flash_causal_pboson_complex_attn_triton,
+    fused_cross_head_gram_stinespring_step,
+    fused_kronecker_16x4_unitary_mixer_step,
+    fused_mixed_state_kronecker_chunk_bwd_triton,
+    fused_mixed_state_kronecker_chunk_fwd_triton,
+)
 from .fused_parseval_ce import (
     M4_GEOM_EPS_OFFSET,
     M4_GEOM_EPS_SQ,
@@ -34,6 +46,7 @@ __all__ = [
     "DEFAULT_COMPLEX_KERNEL_EPS",
     "DEFAULT_KRYLOV_HEAD_CHUNK",
     "HAS_COMPLEX_TRITON",
+    "HAS_FUSED_KRONECKER_TRITON",
     "HAS_TRITON",
     "IS_HIP",
     "M4_GEOM_EPS_OFFSET",
@@ -42,19 +55,25 @@ __all__ = [
     "TRITON_COMPLEX_BLOCK_M",
     "TRITON_COMPLEX_BLOCK_N",
     "TRITON_COMPLEX_REG_DIM",
+    "TRITON_FLASH_ATTN_BLOCK_M",
+    "TRITON_FLASH_ATTN_BLOCK_N",
+    "TRITON_READOUT_BLOCK_N",
+    "TRITON_READOUT_BLOCK_V",
     "compiled_m4_coincidence_chunk_step",
     "compiled_parseval_convex_traceless_chunk_step",
     "factored_complex_krylov_step",
     "flash_born_attention",
+    "flash_causal_pboson_complex_attn_triton",
     "flash_complex_krylov_attention",
     "flash_purified_born_attention",
     "fused_causal_pboson_born_triton",
     "fused_complex_norm_rope_triton",
+    "fused_cross_head_gram_stinespring_step",
     "fused_fp8_or_bf16_chunk_gemm",
+    "fused_kronecker_16x4_unitary_mixer_step",
+    "fused_mixed_state_kronecker_chunk_bwd_triton",
+    "fused_mixed_state_kronecker_chunk_fwd_triton",
     "get_flash_born_launch_meta",
     "get_rdna4_autotune_configs",
     "quantize_fp8_vocab_transposed",
 ]
-
-
-

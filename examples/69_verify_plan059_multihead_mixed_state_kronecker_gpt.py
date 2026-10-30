@@ -113,6 +113,10 @@ DEFAULT_EVAL_TOKENS_FAST: int = 65_536
 DEFAULT_WSD_WARMUP_FRAC: float = 0.05
 DEFAULT_WSD_COOLDOWN_FRAC: float = 0.15
 DEFAULT_MIN_LR_RATIO: float = 0.10
+DEFAULT_LR_SCHEDULE: str = "constant"
+VALID_LR_SCHEDULES: tuple[str, ...] = ("constant", "wsd")
+DEFAULT_LR_MULT: float = 1.0
+DEFAULT_LR_SWEEP_JSON: str = "/home/festivity/agy/QuantumDLBlocks/.cache/w44_r2_l2_constant_lr_sweep.json"
 DEFAULT_GRAD_CLIP_NORM: float = 1.0
 DEFAULT_LOG_INTERVAL: int = 25
 DEFAULT_EVAL_INTERVAL: int = 50
@@ -133,7 +137,7 @@ class VerificationRunSpec:
 
 @dataclass(frozen=True)
 class FineWebFlagshipSpec:
-    """Configuration for the 10-minute (600s) Wave 44 9-shard FineWeb flagship run (`<= 8` fields)."""
+    """Configuration for Wave 44 9-shard FineWeb flagship & compact convergence runs."""
 
     run_key: str = DEFAULT_FINEWEB_RUN_KEY
     wall_s: float = DEFAULT_FINEWEB_WALL_S
@@ -143,6 +147,12 @@ class FineWebFlagshipSpec:
     grad_accum_steps: int = 1
     alpha_rare: float = 0.0
     eval_10m_at_end: bool = True
+    num_layers: int = DEFAULT_FINEWEB_LAYERS
+    num_meanings: int = 2
+    vocab_chunk_size: int = 0
+    penalty_every: int = 1
+    lr_schedule: str = DEFAULT_LR_SCHEDULE
+    lr_mult: float = DEFAULT_LR_MULT
 
 
 def verify_track3_self_echo_invariants(device: torch.device) -> dict[str, float]:
@@ -562,15 +572,16 @@ def execute_fineweb_flagship_run(
 
     val_shard_path = data_dir / "fineweb_val_000000.bin"
     shard_paths = [data_dir / f"fineweb_train_{idx:06d}.bin" for idx in range(1, DEFAULT_NUM_SHARDS + 1)]
+    eff_chunk = int(spec.vocab_chunk_size) if int(spec.vocab_chunk_size) > 0 else (2048 if int(spec.num_meanings) == 1 else (1024 if spec.batch_size >= 32 else 2048))
     cfg = MultiHeadMixedStateKroneckerConfig(
-        num_meanings=2,
+        num_meanings=int(spec.num_meanings),
         num_factors=4,
         factor_dim=16,
-        num_layers=DEFAULT_FINEWEB_LAYERS,
+        num_layers=int(spec.num_layers),
         block_size=spec.seq_len,
         max_seq_len=max(1024, spec.seq_len),
         ngram_mode="trigram",
-        vocab_chunk_size=1024 if spec.batch_size >= 32 else 2048,
+        vocab_chunk_size=eff_chunk,
         checkpoint_blocks=False,
     )
     calib_data = build_or_load_900m_ngram_calibration_cache(
@@ -690,6 +701,13 @@ def execute_fineweb_flagship_run(
     best_val_ce = float(eval0["val_ce"])
     best_top1_acc = float(eval0["top1_acc"])
     last_ce_loss = float(eval0["val_ce"])
+    eval_history: list[dict[str, float]] = [
+        {"step": 0.0, "tokens_M": 0.0, "val_ce": float(eval0["val_ce"]), "val_ppl": float(eval0["val_ppl"]), "top1_acc": float(eval0["top1_acc"])}
+    ]
+    eff_base_muon_lr = float(opt_muon.param_groups[0]["base_lr"]) * float(spec.lr_mult)
+    eff_base_embed_lr = float(opt_adam.param_groups[0]["base_lr"]) * float(spec.lr_mult)
+    eff_base_povm_lr = float(opt_adam.param_groups[1]["base_lr"]) * float(spec.lr_mult)
+    eff_base_gate_lr = float(opt_adam.param_groups[2]["base_lr"]) * float(spec.lr_mult)
 
     while step < spec.max_steps:
         elapsed_s = time.perf_counter() - t_train_start
@@ -697,32 +715,35 @@ def execute_fineweb_flagship_run(
             break
 
         step += 1
-        if spec.wall_s > 0.0:
-            progress = min(1.0, max(step / float(spec.max_steps), elapsed_s / float(spec.wall_s)))
-        else:
-            progress = min(1.0, step / float(spec.max_steps))
-
+        progress = (
+            min(1.0, max(step / float(spec.max_steps), elapsed_s / float(spec.wall_s)))
+            if spec.wall_s > 0.0 else min(1.0, step / float(spec.max_steps))
+        )
         model.set_training_progress(progress)
-        lr_mult = _compute_wsd_lr_multiplier(progress)
+        lr_mult = float(spec.lr_mult) if spec.lr_schedule == "constant" else float(spec.lr_mult) * _compute_wsd_lr_multiplier(progress)
         _apply_lr_multiplier(opt_muon, opt_adam, lr_mult)
 
         opt_muon.zero_grad(set_to_none=True)
         opt_adam.zero_grad(set_to_none=True)
 
-        accum_ce = 0.0
+        should_log = (step % DEFAULT_LOG_INTERVAL == 0) or (step in (1, 10))
+        should_eval = step % DEFAULT_EVAL_INTERVAL == 0
+        need_stats = should_log or should_eval
+
+        pen_every = max(1, int(spec.penalty_every))
+        run_pen = (step % pen_every == 0) or need_stats or (step == 1)
+        accum_ce_t = torch.zeros((), device=device, dtype=torch.float32)
+        pen_stats: dict[str, float] = {}
         for micro_idx in range(grad_accum):
             x_b, y_b, w_b = sampler.sample_batch(
-                batch_size=spec.batch_size,
-                seq_len=spec.seq_len,
-                step_seed=step * grad_accum + micro_idx,
-                device=device,
+                batch_size=spec.batch_size, seq_len=spec.seq_len, step_seed=step * grad_accum + micro_idx, device=device,
             )
             with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
                 _, ce_loss = model(x_b, y_b, token_weights=w_b)
             assert ce_loss is not None
-            accum_ce += float(ce_loss.detach().item()) / float(grad_accum)
-            if micro_idx == grad_accum - 1:
-                pen_loss, pen_stats = compute_multihead_mixed_state_kronecker_penalties(model)
+            accum_ce_t = accum_ce_t + ce_loss.detach().float() / float(grad_accum)
+            if micro_idx == grad_accum - 1 and run_pen:
+                pen_loss, pen_stats = compute_multihead_mixed_state_kronecker_penalties(model, include_stats=need_stats)
                 total_loss = (ce_loss / float(grad_accum)) + pen_loss
             else:
                 total_loss = ce_loss / float(grad_accum)
@@ -732,19 +753,16 @@ def execute_fineweb_flagship_run(
         opt_muon.step()
         opt_adam.step()
 
-        last_ce_loss = accum_ce
         tokens_m = (step * tokens_per_step) / 1e6
         compute_tflops = (6.0 * num_params * step * tokens_per_step) / 1e12
         wall_now = max(1e-3, time.perf_counter() - t_train_start)
         tok_per_s = (step * tokens_per_step) / wall_now
 
-        if step % DEFAULT_LOG_INTERVAL == 0 or step in (1, 10):
+        if should_log:
+            last_ce_loss = float(accum_ce_t.item())
             logger.log_step(
-                step=step,
-                train_ce=round(last_ce_loss, 4),
-                tok_per_s=round(tok_per_s, 1),
-                lr_mult=round(lr_mult, 4),
-                elapsed_min=round(wall_now / 60.0, 4),
+                step=step, train_ce=round(last_ce_loss, 4), tok_per_s=round(tok_per_s, 1),
+                lr_mult=round(lr_mult, 4), elapsed_min=round(wall_now / 60.0, 4),
             )
             print(
                 f"[STEP {step:4d}] elapsed={wall_now:6.1f}s | train_ce={last_ce_loss:.4f} | "
@@ -752,26 +770,22 @@ def execute_fineweb_flagship_run(
                 flush=True,
             )
 
-        if step % DEFAULT_EVAL_INTERVAL == 0:
+        if should_eval:
             ev = evaluate_modded_nanogpt_validation(
-                model=model,
-                val_tokens=val_shard_path,
-                max_eval_tokens=DEFAULT_EVAL_TOKENS_FAST,
-                batch_size=spec.batch_size,
-                seq_len=spec.seq_len,
+                model=model, val_tokens=val_shard_path, max_eval_tokens=DEFAULT_EVAL_TOKENS_FAST,
+                batch_size=spec.batch_size, seq_len=spec.seq_len,
             )
             best_val_ce = min(best_val_ce, float(ev["val_ce"]))
             best_top1_acc = max(best_top1_acc, float(ev["top1_acc"]))
+            eval_history.append(
+                {"step": float(step), "tokens_M": round(tokens_m, 4), "val_ce": float(ev["val_ce"]), "val_ppl": float(ev["val_ppl"]), "top1_acc": float(ev["top1_acc"])}
+            )
             logger.log_eval(
                 step,
                 {
-                    "tokens_M": round(tokens_m, 4),
-                    "compute_tflops": round(compute_tflops, 4),
-                    "tau_progress": round(progress, 4),
-                    "val_ce": ev["val_ce"],
-                    "val_ppl": ev["val_ppl"],
-                    "top1_acc": ev["top1_acc"],
-                    "sharp_eff_rank": ev["sharp_eff_rank"],
+                    "tokens_M": round(tokens_m, 4), "compute_tflops": round(compute_tflops, 4),
+                    "tau_progress": round(progress, 4), "val_ce": ev["val_ce"], "val_ppl": ev["val_ppl"],
+                    "top1_acc": ev["top1_acc"], "sharp_eff_rank": ev["sharp_eff_rank"],
                     "kraus_stiefel_err": round(pen_stats["unitary_pen"], 6),
                 },
             )
@@ -796,12 +810,8 @@ def execute_fineweb_flagship_run(
         torch.cuda.empty_cache()
 
     eval_final_65k = evaluate_modded_nanogpt_validation(
-        model=model,
-        val_tokens=val_shard_path,
-        max_eval_tokens=DEFAULT_EVAL_TOKENS_FAST,
-        batch_size=spec.batch_size,
-        seq_len=spec.seq_len,
-        compute_top50=True,
+        model=model, val_tokens=val_shard_path, max_eval_tokens=DEFAULT_EVAL_TOKENS_FAST,
+        batch_size=spec.batch_size, seq_len=spec.seq_len, compute_top50=True,
     )
     best_val_ce = min(best_val_ce, float(eval_final_65k["val_ce"]))
     best_top1_acc = max(best_top1_acc, float(eval_final_65k["top1_acc"]))
@@ -810,14 +820,9 @@ def execute_fineweb_flagship_run(
     logger.log_eval(
         step,
         {
-            "tokens_M": round(final_tokens_m, 4),
-            "compute_tflops": round(final_tflops, 4),
-            "tau_progress": 1.0,
-            "val_ce": eval_final_65k["val_ce"],
-            "val_ppl": eval_final_65k["val_ppl"],
-            "top1_acc": eval_final_65k["top1_acc"],
-            "sharp_eff_rank": eval_final_65k["sharp_eff_rank"],
-            "kraus_stiefel_err": round(unitary_err_final, 6),
+            "tokens_M": round(final_tokens_m, 4), "compute_tflops": round(final_tflops, 4), "tau_progress": 1.0,
+            "val_ce": eval_final_65k["val_ce"], "val_ppl": eval_final_65k["val_ppl"], "top1_acc": eval_final_65k["top1_acc"],
+            "sharp_eff_rank": eval_final_65k["sharp_eff_rank"], "kraus_stiefel_err": round(unitary_err_final, 6),
         },
     )
     print(
@@ -835,12 +840,8 @@ def execute_fineweb_flagship_run(
         print("=== Running Official 10,485,760-Token Modded-NanoGPT Validation Benchmark ===", flush=True)
         t_10m = time.perf_counter()
         eval_10m = evaluate_modded_nanogpt_validation(
-            model=model,
-            val_tokens=val_shard_path,
-            max_eval_tokens=DEFAULT_MODDED_VAL_TOKENS,
-            batch_size=32,
-            seq_len=spec.seq_len,
-            compute_top50=False,
+            model=model, val_tokens=val_shard_path, max_eval_tokens=DEFAULT_MODDED_VAL_TOKENS,
+            batch_size=32, seq_len=spec.seq_len, compute_top50=False,
         )
         eval_10m["eval_wall_s"] = round(time.perf_counter() - t_10m, 2)
         print(
@@ -851,41 +852,24 @@ def execute_fineweb_flagship_run(
         )
 
     out: dict[str, Any] = {
-        "run_key": spec.run_key,
-        "wave_id": WAVE_ID,
-        "plan_id": PLAN_ID,
-        "ngram_mode": "trigram",
-        "num_shards": DEFAULT_NUM_SHARDS,
-        "alpha_rare": spec.alpha_rare,
-        "grad_accum_steps": grad_accum,
-        "effective_batch_tokens": tokens_per_step,
-        "muon_lr_scale": round(lr_scale, 4),
-        "steps_completed": step,
-        "tokens_M": round(final_tokens_m, 4),
-        "train_wall_s": round(train_wall_s, 2),
-        "avg_tok_per_s": round(avg_tok_per_s, 1),
-        "num_params": num_params,
-        "step0_val_ce_65k": eval0["val_ce"],
-        "step0_val_ppl_65k": eval0["val_ppl"],
-        "step0_top1_acc_65k": eval0["top1_acc"],
-        "final_val_ce_65k": eval_final_65k["val_ce"],
-        "final_val_ppl_65k": eval_final_65k["val_ppl"],
-        "final_top1_acc_65k": eval_final_65k["top1_acc"],
-        "final_top50_acc_65k": eval_final_65k.get("top50_acc", 0.0),
-        "final_rep_val_ce_65k": eval_final_65k.get("rep_val_ce", 0.0),
-        "final_non_rep_val_ce_65k": eval_final_65k.get("non_rep_val_ce", 0.0),
+        "run_key": spec.run_key, "wave_id": WAVE_ID, "plan_id": PLAN_ID, "ngram_mode": "trigram",
+        "num_shards": DEFAULT_NUM_SHARDS, "alpha_rare": spec.alpha_rare, "grad_accum_steps": grad_accum,
+        "effective_batch_tokens": tokens_per_step, "lr_schedule": spec.lr_schedule, "lr_mult": round(float(spec.lr_mult), 4),
+        "muon_lr_scale": round(lr_scale, 4), "effective_muon_lr": round(eff_base_muon_lr, 6),
+        "effective_embed_lr": round(eff_base_embed_lr, 6), "effective_povm_lr": round(eff_base_povm_lr, 6),
+        "effective_gate_lr": round(eff_base_gate_lr, 6), "steps_completed": step, "tokens_M": round(final_tokens_m, 4),
+        "train_wall_s": round(train_wall_s, 2), "avg_tok_per_s": round(avg_tok_per_s, 1), "num_params": num_params,
+        "step0_val_ce_65k": eval0["val_ce"], "step0_val_ppl_65k": eval0["val_ppl"], "step0_top1_acc_65k": eval0["top1_acc"],
+        "final_val_ce_65k": eval_final_65k["val_ce"], "final_val_ppl_65k": eval_final_65k["val_ppl"],
+        "final_top1_acc_65k": eval_final_65k["top1_acc"], "final_top50_acc_65k": eval_final_65k.get("top50_acc", 0.0),
+        "final_rep_val_ce_65k": eval_final_65k.get("rep_val_ce", 0.0), "final_non_rep_val_ce_65k": eval_final_65k.get("non_rep_val_ce", 0.0),
         "final_mean_self_echo_prob_65k": eval_final_65k.get("mean_self_echo_prob", 0.0),
         "final_rep_top1_acc_65k": eval_final_65k.get("rep_top1_acc", 0.0),
-        "best_val_ce_65k": best_val_ce,
-        "best_top1_acc_65k": best_top1_acc,
-        "sharp_eff_rank": eval_final_65k["sharp_eff_rank"],
-        "mean_factor_rank": eval_final_65k["mean_factor_rank"],
-        "cross_branch_overlap": eval_final_65k["cross_branch_overlap"],
-        "povm_drift_std": eval_final_65k["povm_drift_std"],
-        "unitary_frobenius_err": round(unitary_err_final, 6),
-        "subhead_purity_telemetry": purity_tel,
-        "branch_routing_telemetry": branch_tel,
-        "official_10m_validation": eval_10m,
+        "best_val_ce_65k": best_val_ce, "best_top1_acc_65k": best_top1_acc,
+        "sharp_eff_rank": eval_final_65k["sharp_eff_rank"], "mean_factor_rank": eval_final_65k["mean_factor_rank"],
+        "cross_branch_overlap": eval_final_65k["cross_branch_overlap"], "povm_drift_std": eval_final_65k["povm_drift_std"],
+        "unitary_frobenius_err": round(unitary_err_final, 6), "eval_history": eval_history,
+        "subhead_purity_telemetry": purity_tel, "branch_routing_telemetry": branch_tel, "official_10m_validation": eval_10m,
     }
     logger.finalize(extra_summary=out)
     del model
@@ -895,93 +879,69 @@ def execute_fineweb_flagship_run(
     return out
 
 
+def execute_constant_lr_sweep(
+    base_spec: FineWebFlagshipSpec, lr_mults: list[float], data_dir: Path, cache_path: Path, device: torch.device, out_json: Path,
+) -> dict[str, Any]:
+    """Run a head-to-head constant-LR comparison sweep across `lr_mults` and save JSON summary (`<= 8` args)."""
+    results: dict[str, Any] = {}
+    if out_json.exists():
+        try:
+            results = dict(json.loads(out_json.read_text(encoding="utf-8")).get("runs", {}))
+        except Exception:
+            results = {}
+    for mult in lr_mults:
+        tag = str(round(mult, 3)).replace(".", "p")
+        rk = f"w44_compact_r{base_spec.num_meanings}_l{base_spec.num_layers}_b{base_spec.batch_size}_{base_spec.lr_schedule}_lr_{tag}x"
+        print(f"\n=== [LR SWEEP] Starting {rk} (lr_schedule={base_spec.lr_schedule}, lr_mult={mult:.2f}x) ===", flush=True)
+        run_spec = FineWebFlagshipSpec(
+            run_key=rk, wall_s=base_spec.wall_s, max_steps=base_spec.max_steps, batch_size=base_spec.batch_size,
+            seq_len=base_spec.seq_len, grad_accum_steps=base_spec.grad_accum_steps, alpha_rare=base_spec.alpha_rare,
+            eval_10m_at_end=base_spec.eval_10m_at_end, num_layers=base_spec.num_layers, num_meanings=base_spec.num_meanings,
+            vocab_chunk_size=base_spec.vocab_chunk_size, penalty_every=base_spec.penalty_every,
+            lr_schedule=base_spec.lr_schedule, lr_mult=float(mult),
+        )
+        results[f"{mult:.2f}x"] = execute_fineweb_flagship_run(run_spec, data_dir=data_dir, cache_path=cache_path, device=device)
+
+    results = dict(sorted(results.items(), key=lambda kv: float(kv[1].get("lr_mult", 0.0))))
+    best_key = min(results, key=lambda k: float(results[k]["best_val_ce_65k"]))
+    summary = {
+        "wave_id": WAVE_ID, "plan_id": PLAN_ID, "lr_schedule": base_spec.lr_schedule,
+        "num_meanings": base_spec.num_meanings, "num_layers": base_spec.num_layers, "batch_size": base_spec.batch_size,
+        "max_steps": base_spec.max_steps, "best_lr_mult_key": best_key,
+        "best_val_ce_65k": results[best_key]["best_val_ce_65k"], "runs": results,
+    }
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(f"\n=== [LR SWEEP COMPLETE] Best LR: {best_key} (best_val_ce_65k={summary['best_val_ce_65k']:.4f}) | Saved to {out_json} ===", flush=True)
+    return summary
+
+
 def parse_args() -> argparse.Namespace:
     """Parse CLI arguments for `69_verify_plan059_multihead_mixed_state_kronecker_gpt.py`."""
     parser = argparse.ArgumentParser(
-        description="Verify Plan 059 / Wave 44 MultiHeadMixedStateKroneckerGPT tracks and 600s FineWeb flagship."
+        description="Verify Plan 059 / Wave 44 MultiHeadMixedStateKroneckerGPT tracks and FineWeb runs."
     )
-    parser.add_argument(
-        "--smoke",
-        action="store_true",
-        help="Run fast smoke verification across Track 3, Track 4, Track 6, and training loop.",
-    )
-    parser.add_argument(
-        "--fineweb-600s",
-        action="store_true",
-        help="Execute the 10-minute (600s) 9-shard FineWeb flagship run + official 10.49M-token validation.",
-    )
-    parser.add_argument(
-        "--wall-s",
-        type=float,
-        default=DEFAULT_FINEWEB_WALL_S,
-        help="Wall-clock training budget in seconds for --fineweb-600s (default: 600.0).",
-    )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=DEFAULT_FINEWEB_MAX_STEPS,
-        help="Maximum optimization steps for --fineweb-600s.",
-    )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=DEFAULT_FINEWEB_BATCH_SIZE,
-        help="Micro-batch size B for --fineweb-600s (default: 16; use 32 for 16,384 tok/step).",
-    )
-    parser.add_argument(
-        "--grad-accum-steps",
-        type=int,
-        default=1,
-        help="Gradient accumulation micro-steps per optimizer step for --fineweb-600s.",
-    )
-    parser.add_argument(
-        "--alpha-rare",
-        type=float,
-        default=0.0,
-        help="Rare-token importance sampling exponent for --fineweb-600s (default: 0.0 uniform).",
-    )
-    parser.add_argument(
-        "--no-eval-10m",
-        action="store_true",
-        help="Skip the 10.49M-token validation at the end of --fineweb-600s.",
-    )
-    parser.add_argument(
-        "--run-key",
-        type=str,
-        default=DEFAULT_FINEWEB_RUN_KEY,
-        help="Run key for StandardizedExperimentLogger in --fineweb-600s mode.",
-    )
-    parser.add_argument(
-        "--out-json",
-        type=str,
-        default=DEFAULT_OUT_JSON,
-        help="Path to write JSON summary report for --fineweb-600s.",
-    )
-    parser.add_argument(
-        "--ablation",
-        type=str,
-        default=DEFAULT_ABLATION_CHOICE,
-        choices=VALID_ABLATION_CHOICES,
-        help="Which ablation track to execute.",
-    )
-    parser.add_argument(
-        "--steps",
-        type=int,
-        default=DEFAULT_VERIFY_STEPS,
-        help="Number of optimization steps per verification run.",
-    )
-    parser.add_argument(
-        "--seq-len",
-        type=int,
-        default=DEFAULT_VERIFY_SEQ_LEN,
-        help="Sequence length T.",
-    )
-    parser.add_argument(
-        "--batch-tokens",
-        type=int,
-        default=DEFAULT_VERIFY_BATCH_TOKENS,
-        help="Total tokens per microbatch (B * T).",
-    )
+    parser.add_argument("--smoke", action="store_true", help="Run fast smoke verification across Track 3, Track 4, Track 6, and training loop.")
+    parser.add_argument("--fineweb-600s", action="store_true", help="Execute 9-shard FineWeb run + official 10.49M-token validation.")
+    parser.add_argument("--wall-s", type=float, default=DEFAULT_FINEWEB_WALL_S, help="Wall-clock training budget in seconds (default: 600.0).")
+    parser.add_argument("--max-steps", type=int, default=DEFAULT_FINEWEB_MAX_STEPS, help="Maximum optimization steps.")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_FINEWEB_BATCH_SIZE, help="Micro-batch size B (default: 16; use 32 for 16,384 tok/step).")
+    parser.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation micro-steps per optimizer step.")
+    parser.add_argument("--num-layers", type=int, default=DEFAULT_FINEWEB_LAYERS, help="Number of transformer layers L (default: 6; use 2 or 3 for compact nets).")
+    parser.add_argument("--num-meanings", type=int, default=2, help="Polysemy branch rank R (default: 2; use 1 for d_complex=64 compact net).")
+    parser.add_argument("--vocab-chunk-size", type=int, default=0, help="Override readout vocabulary chunk size (0 = auto).")
+    parser.add_argument("--penalty-every", type=int, default=1, help="Cadence for full-vocab manifold/isotropy regularizer (default: 1).")
+    parser.add_argument("--lr-schedule", type=str, default=DEFAULT_LR_SCHEDULE, choices=VALID_LR_SCHEDULES, help="Learning rate schedule ('constant' or 'wsd').")
+    parser.add_argument("--lr-mult", type=float, default=DEFAULT_LR_MULT, help="Constant learning-rate multiplier across all 4 optimizer groups (default: 1.0).")
+    parser.add_argument("--lr-sweep", type=str, default="", help="Comma-separated LR multipliers to sweep (e.g. '0.5,1.0,1.5,2.0,3.0').")
+    parser.add_argument("--alpha-rare", type=float, default=0.0, help="Rare-token importance sampling exponent (default: 0.0 uniform).")
+    parser.add_argument("--no-eval-10m", action="store_true", help="Skip the 10.49M-token validation at the end of --fineweb-600s.")
+    parser.add_argument("--run-key", type=str, default=DEFAULT_FINEWEB_RUN_KEY, help="Run key for StandardizedExperimentLogger.")
+    parser.add_argument("--out-json", type=str, default=DEFAULT_OUT_JSON, help="Path to write JSON summary report.")
+    parser.add_argument("--ablation", type=str, default=DEFAULT_ABLATION_CHOICE, choices=VALID_ABLATION_CHOICES, help="Which ablation track to execute.")
+    parser.add_argument("--steps", type=int, default=DEFAULT_VERIFY_STEPS, help="Number of optimization steps per verification run.")
+    parser.add_argument("--seq-len", type=int, default=DEFAULT_VERIFY_SEQ_LEN, help="Sequence length T.")
+    parser.add_argument("--batch-tokens", type=int, default=DEFAULT_VERIFY_BATCH_TOKENS, help="Total tokens per microbatch (B * T).")
     return parser.parse_args()
 
 
@@ -1025,7 +985,20 @@ def main() -> None:
             grad_accum_steps=int(args.grad_accum_steps),
             alpha_rare=float(args.alpha_rare),
             eval_10m_at_end=not bool(args.no_eval_10m),
+            num_layers=int(args.num_layers),
+            num_meanings=int(args.num_meanings),
+            vocab_chunk_size=int(args.vocab_chunk_size),
+            penalty_every=int(args.penalty_every),
+            lr_schedule=str(args.lr_schedule),
+            lr_mult=float(args.lr_mult),
         )
+        if str(args.lr_sweep).strip():
+            mults = [float(x.strip()) for x in str(args.lr_sweep).split(",") if x.strip()]
+            execute_constant_lr_sweep(
+                base_spec=fw_spec, lr_mults=mults, data_dir=Path(DEFAULT_DATA_DIR),
+                cache_path=Path(DEFAULT_CACHE_PATH), device=device, out_json=Path(DEFAULT_LR_SWEEP_JSON),
+            )
+            return
         fw_res = execute_fineweb_flagship_run(
             spec=fw_spec,
             data_dir=Path(DEFAULT_DATA_DIR),

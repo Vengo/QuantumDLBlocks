@@ -4339,12 +4339,17 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             )
           ),
 
-          // Top 5-Tab Navigation Bar
+          // Top 6-Tab Navigation Bar
           h("div", { className: "nav-tabs" },
             h("button", {
               className: "tab-btn" + (activeTab === "main" ? " active" : ""),
               onClick: () => setActiveTab("main")
             }, `🏆 Full FineWeb Speedrun (${catalog.length} Runs • ${paretoCount} Pareto)`),
+            h("button", {
+              className: "tab-btn" + (activeTab === "architecture" ? " active" : ""),
+              onClick: () => setActiveTab("architecture"),
+              style: activeTab === "architecture" ? { borderColor: "#10b981", color: "#34d399" } : { color: "#34d399" }
+            }, "🧬 Block Architecture Visualizer (w44_compact_r2_d128c_L2_b32)"),
             h("button", {
               className: "tab-btn" + (activeTab === "fineweb_edu" ? " active" : ""),
               onClick: () => setActiveTab("fineweb_edu")
@@ -4364,6 +4369,41 @@ def render_html_dashboard(snap: dict[str, Any]) -> str:
             h("span", { style: { marginLeft: "auto", fontSize: 11.5, color: "#8b949e", paddingRight: 6 } },
               `🗄️ SQLite WAL: ${catalog.length} speedrun / ${finewebEduCatalog.length} edu / ${microCatalog.length} micro / ${sessionQueue.length} queue`
             )
+          ),
+
+          // TAB: Block Architecture Visualizer (architecture_visualizer.html)
+          activeTab === "architecture" && h("div", null,
+            h("div", { className: "insight-banner", style: { marginBottom: 10, borderLeftColor: "#10b981" } },
+              h("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 } },
+                h("div", null,
+                  h("div", { style: { fontWeight: 700, color: "#34d399", fontSize: 13.5 } },
+                    "🧬 MultiHeadMixedStateKroneckerGPT — Interactive Block Architecture & Signal-Highway Visualizer (w44_compact_r2_d128c_L2_b32)"
+                  ),
+                  h("div", { style: { color: "#c9d1d9", marginTop: 3 } },
+                    "Inspect every strung-together macro stage and micro sub-block, intermediate complex tensor shapes, (C^16)^(⊗4) = C^65,536 Hilbert-space manifolds, Layer-0 |ψ_0⟩ & V^(0) skip highways, 900M N-gram H_⊥ channels, Joint-Complex StiefelMuon routing, and fused Triton kernels."
+                  )
+                ),
+                h("a", {
+                  href: "/architecture",
+                  target: "_blank",
+                  rel: "noopener noreferrer",
+                  className: "btn active",
+                  style: { textDecoration: "none", fontWeight: 700, borderColor: "#10b981", color: "#34d399" }
+                }, "↗ Open Standalone Fullscreen (/architecture)")
+              )
+            ),
+            h("iframe", {
+              src: "/architecture",
+              title: "QuantumDLBlocks Interactive Block Architecture Visualizer (w44_compact_r2_d128c_L2_b32)",
+              style: {
+                width: "100%",
+                height: "calc(100vh - 175px)",
+                minHeight: "920px",
+                border: "1px solid #30363d",
+                borderRadius: "10px",
+                background: "#070b14"
+              }
+            })
           ),
 
           // TAB 5: Interactive Geometric & Bloch-Sphere Playground (visualizer.html)
@@ -5532,6 +5572,26 @@ def create_benchmark_http_server(
                     snap_ref = state["latest_snap"]
                 body = (format_terminal_report(snap_ref) + "\n").encode("utf-8")
                 self._send_bytes(200, "text/plain; charset=utf-8", body)
+                return
+
+            if path == "/api/architecture-graph":
+                from qdlblocks.benchmarks.model_block_visualizer import build_architecture_visualizer_payload
+
+                payload = build_architecture_visualizer_payload(live_logs_dir=live_logs_dir)
+                self._send_json(200, payload)
+                return
+
+            if path in ("/architecture", "/architecture/", "/architecture_visualizer.html", "/blocks"):
+                arch_file = ROOT / "architecture_visualizer.html"
+                if arch_file.exists():
+                    body = arch_file.read_bytes()
+                else:
+                    from scripts.export_model_block_visualizer import render_architecture_visualizer_html
+                    from qdlblocks.benchmarks.model_block_visualizer import build_architecture_visualizer_payload
+
+                    payload = build_architecture_visualizer_payload(live_logs_dir=live_logs_dir)
+                    body = render_architecture_visualizer_html(payload).encode("utf-8")
+                self._send_bytes(200, "text/html; charset=utf-8", body)
                 return
 
             if path in ("/visualizer", "/visualizer/", "/visualizer.html", "/playground"):

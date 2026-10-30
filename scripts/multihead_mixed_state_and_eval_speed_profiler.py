@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+import gc
 import json
 from pathlib import Path
+import subprocess
 import tempfile
+import threading
 import time
 from typing import Any
 from unittest.mock import patch
@@ -38,6 +41,8 @@ from qdlblocks.models.multihead_mixed_state_kronecker_gpt import (
     MixedStateKroneckerBornChunkedNLLFn,
     MultiHeadMixedStateKroneckerConfig,
     MultiHeadMixedStateKroneckerGPT,
+    build_multihead_mixed_state_kronecker_optimizers,
+    compute_multihead_mixed_state_kronecker_penalties,
 )
 from qdlblocks.models.ngram_calibrated_kronecker_born_gpt import (
     evaluate_modded_nanogpt_validation,
@@ -61,6 +66,35 @@ SMOKE_SEQ_LEN: int = 64
 SMOKE_VAL_TOKENS: int = 2048
 PROFILE_VAL_TOKENS: int = 8192
 FLOPS_TO_TFLOPS: float = 1e-12
+FULL_GPT2_VOCAB_SIZE: int = 50_257
+FULL_BENCH_LAYERS: int = 6
+FULL_BENCH_VOCAB_CHUNK: int = 2048
+DEFAULT_MULTI_SIZE_SPECS: tuple[tuple[int, int, int], ...] = (
+    (8, 256, 2),
+    (16, 512, 2),
+    (32, 512, 2),
+    (8, 1024, 2),
+    (8, 512, 4),
+)
+
+
+@dataclass(frozen=True)
+class FusedMultiSizeBenchRecord:
+    """Telemetry record comparing unfused vs. fused custom kernels across `(B, T, R)` sizes."""
+
+    batch_size: int
+    seq_len: int
+    polysemy_rank: int
+    batch_tokens: int
+    unfused_ms_per_step: float
+    fused_ms_per_step: float
+    unfused_tok_per_s: float
+    fused_tok_per_s: float
+    speedup_x: float
+    unfused_mean_power_w: float
+    fused_mean_power_w: float
+    fused_max_power_w: float
+    peak_vram_gib: float
 
 
 @dataclass(frozen=True)
@@ -331,6 +365,171 @@ def profile_validation_throughput(
     }
 
 
+def _poll_nvidia_smi_power_watts(stop_event: threading.Event, samples: list[float]) -> None:
+    """Poll `nvidia-smi` power draw in Watts at ~100ms intervals until `stop_event` is set."""
+    while not stop_event.is_set():
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+                text=True,
+                timeout=1.0,
+            ).strip()
+            if out:
+                samples.append(float(out.splitlines()[0].strip()))
+        except Exception:
+            pass
+        time.sleep(0.08)
+
+
+def _run_timed_training_steps(
+    model: MultiHeadMixedStateKroneckerGPT,
+    x_b: torch.Tensor,
+    y_b: torch.Tensor,
+    use_fused: bool,
+    warmup_steps: int,
+    bench_steps: int,
+) -> tuple[float, float, float]:
+    """Execute `warmup_steps` + `bench_steps` full training steps and return `(ms_per_step, mean_w, max_w)`."""
+    device = x_b.device
+    model.set_fused_kernels(use_fused)
+    opt_muon, opt_adam = build_multihead_mixed_state_kronecker_optimizers(model)
+
+    for _ in range(warmup_steps):
+        opt_muon.zero_grad(set_to_none=True)
+        opt_adam.zero_grad(set_to_none=True)
+        with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            _, ce_loss = model(x_b, y_b)
+        assert ce_loss is not None
+        if not use_fused:
+            _ = float(ce_loss.detach().item())
+            _ = model.compute_subhead_purity_telemetry()
+        pen_loss, _ = compute_multihead_mixed_state_kronecker_penalties(
+            model, include_stats=(not use_fused)
+        )
+        (ce_loss + pen_loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt_muon.step()
+        opt_adam.step()
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+    power_samples: list[float] = []
+    stop_evt = threading.Event()
+    poller = threading.Thread(target=_poll_nvidia_smi_power_watts, args=(stop_evt, power_samples), daemon=True)
+    poller.start()
+
+    t0 = time.perf_counter()
+    for _ in range(bench_steps):
+        opt_muon.zero_grad(set_to_none=True)
+        opt_adam.zero_grad(set_to_none=True)
+        with torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+            _, ce_loss = model(x_b, y_b)
+        assert ce_loss is not None
+        if not use_fused:
+            _ = float(ce_loss.detach().item())
+            _ = model.compute_subhead_purity_telemetry()
+        pen_loss, _ = compute_multihead_mixed_state_kronecker_penalties(
+            model, include_stats=(not use_fused)
+        )
+        (ce_loss + pen_loss).backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt_muon.step()
+        opt_adam.step()
+
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elapsed_s = max(time.perf_counter() - t0, 1e-9)
+    stop_evt.set()
+    poller.join(timeout=1.0)
+
+    opt_muon.zero_grad(set_to_none=True)
+    opt_adam.zero_grad(set_to_none=True)
+    model._last_phi_factors = None
+    model._last_branch_beta = None
+    del opt_muon, opt_adam
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    ms_per_step = (elapsed_s * 1000.0) / float(bench_steps)
+    mean_w = float(sum(power_samples) / len(power_samples)) if power_samples else 0.0
+    max_w = float(max(power_samples)) if power_samples else 0.0
+    return ms_per_step, mean_w, max_w
+
+
+def profile_multi_size_fused_training_loop(
+    device: torch.device,
+    warmup_steps: int = 2,
+    bench_steps: int = 5,
+) -> list[FusedMultiSizeBenchRecord]:
+    """Benchmark full `MultiHeadMixedStateKroneckerGPT` training steps across `(B, T, R)` sizes."""
+    records: list[FusedMultiSizeBenchRecord] = []
+    for b_sz, seq_t, r_rank in DEFAULT_MULTI_SIZE_SPECS:
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+        cfg = MultiHeadMixedStateKroneckerConfig(
+            vocab_size=FULL_GPT2_VOCAB_SIZE,
+            valid_vocab_size=FULL_GPT2_VOCAB_SIZE,
+            num_meanings=r_rank,
+            num_factors=4,
+            factor_dim=16,
+            num_layers=FULL_BENCH_LAYERS,
+            n_subheads_per_factor=2,
+            max_seq_len=max(seq_t, 512),
+            vocab_chunk_size=FULL_BENCH_VOCAB_CHUNK,
+            use_fused_kernels=False,
+        )
+        model = MultiHeadMixedStateKroneckerGPT(cfg).to(device)
+        model.train()
+        x_b = torch.randint(0, FULL_GPT2_VOCAB_SIZE, (b_sz, seq_t), device=device)
+        y_b = torch.randint(0, FULL_GPT2_VOCAB_SIZE, (b_sz, seq_t), device=device)
+        batch_tok = b_sz * seq_t
+
+        unfused_ms, unfused_w, _ = _run_timed_training_steps(
+            model, x_b, y_b, use_fused=False, warmup_steps=warmup_steps, bench_steps=bench_steps
+        )
+        fused_ms, fused_w, fused_max_w = _run_timed_training_steps(
+            model, x_b, y_b, use_fused=True, warmup_steps=warmup_steps, bench_steps=bench_steps
+        )
+        peak_gib = (
+            float(torch.cuda.max_memory_allocated(device)) / float(1024**3)
+            if device.type == "cuda"
+            else 0.0
+        )
+        unfused_tps = (batch_tok * 1000.0) / max(unfused_ms, 1e-6)
+        fused_tps = (batch_tok * 1000.0) / max(fused_ms, 1e-6)
+        speedup = unfused_ms / max(fused_ms, 1e-6)
+
+        rec = FusedMultiSizeBenchRecord(
+            batch_size=b_sz,
+            seq_len=seq_t,
+            polysemy_rank=r_rank,
+            batch_tokens=batch_tok,
+            unfused_ms_per_step=round(unfused_ms, 2),
+            fused_ms_per_step=round(fused_ms, 2),
+            unfused_tok_per_s=round(unfused_tps, 1),
+            fused_tok_per_s=round(fused_tps, 1),
+            speedup_x=round(speedup, 3),
+            unfused_mean_power_w=round(unfused_w, 1),
+            fused_mean_power_w=round(fused_w, 1),
+            fused_max_power_w=round(fused_max_w, 1),
+            peak_vram_gib=round(peak_gib, 2),
+        )
+        records.append(rec)
+        print(
+            f"[MULTI-SIZE B={b_sz:2d} T={seq_t:4d} R={r_rank}] "
+            f"unfused={rec.unfused_ms_per_step:7.1f}ms ({rec.unfused_tok_per_s:7.1f} tok/s, {rec.unfused_mean_power_w:5.1f}W) -> "
+            f"fused={rec.fused_ms_per_step:7.1f}ms ({rec.fused_tok_per_s:7.1f} tok/s, {rec.fused_mean_power_w:5.1f}W / peak {rec.fused_max_power_w:5.1f}W) | "
+            f"speedup={rec.speedup_x:.2f}x | vram={rec.peak_vram_gib:.2f}GiB",
+            flush=True,
+        )
+        del model, x_b, y_b
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    return records
+
+
 def parse_args() -> argparse.Namespace:
     """Parse CLI flags for the Multi-Head Mixed-State & Eval Speed Profiler."""
     parser = argparse.ArgumentParser(
@@ -373,6 +572,11 @@ def parse_args() -> argparse.Namespace:
         help="Timed benchmark iterations per configuration.",
     )
     parser.add_argument(
+        "--multi-size-fused-bench",
+        action="store_true",
+        help="Run full-model unfused vs. fused custom-kernel training benchmark across (B, T, R) sizes.",
+    )
+    parser.add_argument(
         "--smoke",
         action="store_true",
         help="Run a fast smoke profile at small T.",
@@ -390,6 +594,23 @@ def main() -> None:
     """Run the attention, readout backward, and validation speed benchmarks."""
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.multi_size_fused_bench:
+        ms_records = profile_multi_size_fused_training_loop(
+            device=device,
+            warmup_steps=args.warmup_steps,
+            bench_steps=args.bench_steps,
+        )
+        payload: dict[str, Any] = {
+            "device": str(device),
+            "multi_size_fused_benchmarks": [asdict(r) for r in ms_records],
+        }
+        if args.json_out:
+            out_path = Path(args.json_out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            print(f"[SAVED] Wrote JSON profile summary to {out_path}")
+        return
 
     if args.smoke:
         seq_lens = [SMOKE_SEQ_LEN]

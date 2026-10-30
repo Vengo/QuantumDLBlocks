@@ -112,6 +112,17 @@ from .kronecker_diagnostic_utils import (
     load_or_build_calibrated_kronecker_model,
     write_standardized_probe_json,
 )
+from .model_block_visualizer import (
+    MacroStageSpec,
+    ModelBlockGraphSpec,
+    ParameterTensorSpec,
+    SignalHighwaySpec,
+    SubBlockNodeSpec,
+    build_architecture_visualizer_payload,
+    build_w44_architecture_presets,
+    build_w44_preset_graph,
+    load_w44_empirical_telemetry_summary,
+)
 
 __all__ = [
     "RANK_BUCKETS",
@@ -205,5 +216,14 @@ __all__ = [
     "load_kronecker_probe_batch",
     "load_or_build_calibrated_kronecker_model",
     "write_standardized_probe_json",
+    "MacroStageSpec",
+    "ModelBlockGraphSpec",
+    "ParameterTensorSpec",
+    "SignalHighwaySpec",
+    "SubBlockNodeSpec",
+    "build_architecture_visualizer_payload",
+    "build_w44_architecture_presets",
+    "build_w44_preset_graph",
+    "load_w44_empirical_telemetry_summary",
 ]
 

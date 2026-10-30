@@ -42,6 +42,12 @@ from ..kernels.flash_complex_krylov_triton import (
     fused_causal_pboson_born_triton,
     fused_complex_norm_rope_triton,
 )
+from ..kernels.fused_kronecker_mixed_state_kernels import (
+    HAS_FUSED_KRONECKER_TRITON,
+    TRITON_FLASH_MIN_SEQ_LEN,
+    flash_causal_pboson_complex_attn_triton,
+    fused_cross_head_gram_stinespring_step,
+)
 from .packed_complex_register_density_attn import (
     ComplexLinear,
     ComplexRoPE,
@@ -93,6 +99,7 @@ class MultiHeadSuperpositionAttnConfig:
     boson_p: int = DEFAULT_P_BOSON_POWER
     gram_eta_init: float = DEFAULT_GRAM_COUPLING_ETA_INIT
     value_residual_mixing: bool = True
+    use_fused_kernels: bool = True
     subheads_per_factor: int | None = None
     factor_dim: int | None = None
     attn_variant: str | None = None
@@ -389,6 +396,7 @@ class MultiHeadSuperpositionMixedStateAttention(nn.Module):
         self.p_boson = int(self.cfg.boson_p)
         self.attn_evolution_mode = str(self.cfg.attn_evolution_mode)
         self.value_residual_mixing = bool(self.cfg.value_residual_mixing and (self.layer_idx > 0))
+        self.use_fused_kernels: bool = bool(self.cfg.use_fused_kernels)
 
         self.rope = ComplexRoPE(d_register=self.dh)
         self.w_q = ComplexLinear(self.d_complex, self.d_attn)
@@ -433,6 +441,9 @@ class MultiHeadSuperpositionMixedStateAttention(nn.Module):
         self.last_renyi2_entropy_mean: float = math.log(float(max(1, self.subheads_per_factor)))
         self.last_gram_trace_err: float = 0.0
         self.last_branch_nu_mean: float = 1.0
+        self._last_purity_tm: torch.Tensor | None = None
+        self._last_nu_tr: torch.Tensor | None = None
+        self._telemetry_dirty: bool = False
         self._last_telemetry_dict: dict[str, float] = {
             "subhead_gram_purity_mean": self.last_purity_mean,
             "head_purity_mean": self.last_purity_mean,
@@ -502,6 +513,38 @@ class MultiHeadSuperpositionMixedStateAttention(nn.Module):
             self.stinespring_w_im.data[m].copy_(q_mat.imag.to(dtype=self.stinespring_w_im.dtype))
 
     @torch.no_grad()
+    def _sync_cached_telemetry(self, eps: float = SUBHEAD_KET_NORM_EPS) -> None:
+        """Lazily synchronize cached GPU purity & interference tensors to CPU floats (`<= 8` args)."""
+        if not self._telemetry_dirty or self._last_purity_tm is None or self._last_nu_tr is None:
+            return
+        p_clamped = self._last_purity_tm.float().clamp(min=float(eps), max=1.0)
+        p_mean = float(p_clamped.mean().item())
+        r_mean = float((1.0 / p_clamped).mean().item())
+        s2_mean = float((-torch.log(p_clamped)).mean().item())
+        nu_mean = float(self._last_nu_tr.float().mean().item())
+        self.last_purity_mean = p_mean
+        self.last_mixed_rank_mean = r_mean
+        self.last_renyi2_entropy_mean = s2_mean
+        self.last_gram_trace_err = 0.0
+        self.last_branch_nu_mean = nu_mean
+        self._last_telemetry_dict = {
+            "subhead_gram_purity_mean": p_mean,
+            "head_purity_mean": p_mean,
+            "purity_mean": p_mean,
+            "reduced_density_purity_mean": p_mean,
+            "purity_min": float(p_clamped.min().item()),
+            "purity_max": float(p_clamped.max().item()),
+            "subhead_gram_trace_mean": 1.0,
+            "gram_trace_err": 0.0,
+            "subhead_renyi2_entropy": s2_mean,
+            "renyi2_entropy_nats": s2_mean,
+            "subhead_effective_rank": r_mean,
+            "mixed_rank_mean": r_mean,
+            "branch_interference_nu_mean": nu_mean,
+        }
+        self._telemetry_dirty = False
+
+    @torch.no_grad()
     def compute_subhead_purity_telemetry(
         self,
         phi_re: torch.Tensor | None = None,
@@ -510,6 +553,7 @@ class MultiHeadSuperpositionMixedStateAttention(nn.Module):
         """Return cross-head Gram purity, trace error, Rényi-2 entropy, and effective rank (`<= 8` args)."""
         if phi_re is not None and phi_im is not None:
             return compute_subhead_purity_telemetry(phi_re, phi_im, eps=SUBHEAD_KET_NORM_EPS)
+        self._sync_cached_telemetry()
         return dict(self._last_telemetry_dict)
 
     def _normalize_and_apply_rope(
@@ -592,6 +636,9 @@ class MultiHeadSuperpositionMixedStateAttention(nn.Module):
             q_re, q_im, k_re, k_im, v_re, v_im, eps=float(eps)
         )
 
+        use_fused = bool(
+            self.use_fused_kernels and psi_re.is_cuda and not torch.compiler.is_compiling()
+        )
         if self.attn_evolution_mode in ("legacy_krylov_11mm", "legacy_krylov"):
             phi_h_re, phi_h_im, _, _ = factored_complex_krylov_step(
                 q_rot_re,
@@ -601,6 +648,21 @@ class MultiHeadSuperpositionMixedStateAttention(nn.Module):
                 v_n_re,
                 v_n_im,
                 use_vkrylov="v_krylov_norm",
+                eps=float(eps),
+            )
+        elif (
+            use_fused
+            and HAS_FUSED_KRONECKER_TRITON
+            and self.p_boson == 2
+            and seq_t >= TRITON_FLASH_MIN_SEQ_LEN
+        ):
+            phi_h_re, phi_h_im = flash_causal_pboson_complex_attn_triton(
+                q_rot_re,
+                q_rot_im,
+                k_rot_re,
+                k_rot_im,
+                v_n_re,
+                v_n_im,
                 eps=float(eps),
             )
         else:
@@ -618,48 +680,35 @@ class MultiHeadSuperpositionMixedStateAttention(nn.Module):
         phi_re = phi_h_re.transpose(1, 2).contiguous().view(b_sz, seq_t, m_fac, k_sub, dh)
         phi_im = phi_h_im.transpose(1, 2).contiguous().view(b_sz, seq_t, m_fac, k_sub, dh)
 
-        tilde_re, tilde_im, purity_tm = compute_cross_head_hermitian_gram_step(
-            phi_re,
-            phi_im,
-            self.gram_eta,
-            attn_evolution_mode=self.attn_evolution_mode,
-            purity_gamma=self.purity_gamma,
-        )
-        branch_re, branch_im, nu_tr = apply_stinespring_subhead_to_branch_coupling(
-            tilde_re,
-            tilde_im,
-            self.stinespring_w_re,
-            self.stinespring_w_im,
-            eps=float(eps),
-        )
+        if use_fused and self.attn_evolution_mode != "adhoc_poly_gamma":
+            branch_re, branch_im, purity_tm, nu_tr = fused_cross_head_gram_stinespring_step(
+                phi_re,
+                phi_im,
+                self.gram_eta,
+                self.stinespring_w_re,
+                self.stinespring_w_im,
+                float(eps),
+            )
+        else:
+            tilde_re, tilde_im, purity_tm = compute_cross_head_hermitian_gram_step(
+                phi_re,
+                phi_im,
+                self.gram_eta,
+                attn_evolution_mode=self.attn_evolution_mode,
+                purity_gamma=self.purity_gamma,
+            )
+            branch_re, branch_im, nu_tr = apply_stinespring_subhead_to_branch_coupling(
+                tilde_re,
+                tilde_im,
+                self.stinespring_w_re,
+                self.stinespring_w_im,
+                eps=float(eps),
+            )
 
         if not torch.compiler.is_compiling():
-            with torch.no_grad():
-                p_clamped = purity_tm.detach().float().clamp(min=float(eps), max=1.0)
-                p_mean = float(p_clamped.mean().item())
-                r_mean = float((1.0 / p_clamped).mean().item())
-                s2_mean = float((-torch.log(p_clamped)).mean().item())
-                nu_mean = float(nu_tr.detach().float().mean().item())
-                self.last_purity_mean = p_mean
-                self.last_mixed_rank_mean = r_mean
-                self.last_renyi2_entropy_mean = s2_mean
-                self.last_gram_trace_err = 0.0
-                self.last_branch_nu_mean = nu_mean
-                self._last_telemetry_dict = {
-                    "subhead_gram_purity_mean": p_mean,
-                    "head_purity_mean": p_mean,
-                    "purity_mean": p_mean,
-                    "reduced_density_purity_mean": p_mean,
-                    "purity_min": float(p_clamped.min().item()),
-                    "purity_max": float(p_clamped.max().item()),
-                    "subhead_gram_trace_mean": 1.0,
-                    "gram_trace_err": 0.0,
-                    "subhead_renyi2_entropy": s2_mean,
-                    "renyi2_entropy_nats": s2_mean,
-                    "subhead_effective_rank": r_mean,
-                    "mixed_rank_mean": r_mean,
-                    "branch_interference_nu_mean": nu_mean,
-                }
+            self._last_purity_tm = purity_tm.detach()
+            self._last_nu_tr = nu_tr.detach()
+            self._telemetry_dirty = True
 
         out_re, out_im = self.w_out(branch_re, branch_im)
         if return_telemetry:
@@ -715,8 +764,13 @@ def count_attention_matmul_calls(
                 txt_calls += 1
         return orig_matmul(a, b, *args, **kwargs)
 
-    with torch.no_grad(), patch("torch.matmul", side_effect=_counting_matmul):
-        attn_layer(psi_re, psi_im)
+    prev_fused = getattr(attn_layer, "use_fused_kernels", False)
+    attn_layer.use_fused_kernels = False
+    try:
+        with torch.no_grad(), patch("torch.matmul", side_effect=_counting_matmul):
+            attn_layer(psi_re, psi_im)
+    finally:
+        attn_layer.use_fused_kernels = prev_fused
 
     return total_calls, txt_calls
 

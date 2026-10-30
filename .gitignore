@@ -12,6 +12,7 @@ eggs/
 lib/
 lib64/
 parts/
+results/model_cards
 sdist/
 var/
 wheels/

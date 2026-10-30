@@ -36,6 +36,10 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
+from ..kernels.fused_kronecker_mixed_state_kernels import (
+    HAS_FUSED_KRONECKER_TRITON, fused_mixed_state_kronecker_chunk_bwd_triton,
+    fused_mixed_state_kronecker_chunk_fwd_triton,
+)
 from ..layers.multihead_superposition_mixed_state_attn import (
     DEFAULT_ATTN_EVOLUTION_MODE, DEFAULT_FACTOR_HEAD_DIM, DEFAULT_GRAM_COUPLING_ETA_INIT,
     DEFAULT_MAX_SEQ_LEN, DEFAULT_SUBHEADS_PER_FACTOR, SUBHEAD_KET_NORM_EPS, VALID_ATTN_EVOLUTION_MODES,
@@ -418,6 +422,7 @@ class MixedStateKroneckerBornChunkedNLLFn(torch.autograd.Function):
     """Vocabulary-chunked Mixed-State `16^4` Kronecker Born NLL with single-pass analytical backward."""
 
     vocab_chunk_size: int = DEFAULT_VOCAB_CHUNK_SIZE
+    use_triton_kernels: bool = True
 
     @staticmethod
     def forward(
@@ -465,7 +470,8 @@ class MixedStateKroneckerBornChunkedNLLFn(torch.autograd.Function):
         z_t = torch.zeros((n_tok,), device=phi_factors.device, dtype=torch.float32)
         target_p_tilde = torch.zeros((n_tok,), device=phi_factors.device, dtype=torch.float32)
         use_compiled = bool(phi_factors.is_cuda and gemm_dtype == torch.bfloat16 and not torch.compiler.is_compiling())
-        fwd_fn = _compiled_mixed_state_chunk_fwd_step if use_compiled else _mixed_state_kronecker_chunk_fwd_step
+        use_triton = bool(use_compiled and MixedStateKroneckerBornChunkedNLLFn.use_triton_kernels and HAS_FUSED_KRONECKER_TRITON and m_num == 4)
+        fwd_fn = fused_mixed_state_kronecker_chunk_fwd_triton if use_triton else (_compiled_mixed_state_chunk_fwd_step if use_compiled else _mixed_state_kronecker_chunk_fwd_step)
 
         for v0 in range(0, v_eff, v_chunk):
             v1 = min(v_eff, v0 + v_chunk)
@@ -509,7 +515,8 @@ class MixedStateKroneckerBornChunkedNLLFn(torch.autograd.Function):
         scale_inv_z = ((grad_out.float() * w_norm).unsqueeze(1), (1.0 / z_clamped).unsqueeze(1))
         targets_col = targets_flat.unsqueeze(1)
         use_compiled = bool(u_batched.is_cuda and gemm_dtype == torch.bfloat16 and not torch.compiler.is_compiling())
-        bwd_fn = _compiled_mixed_state_chunk_bwd_step if use_compiled else _mixed_state_kronecker_chunk_bwd_step
+        use_triton = bool(use_compiled and MixedStateKroneckerBornChunkedNLLFn.use_triton_kernels and HAS_FUSED_KRONECKER_TRITON and m_num == 4)
+        bwd_fn = fused_mixed_state_kronecker_chunk_bwd_triton if use_triton else (_compiled_mixed_state_chunk_bwd_step if use_compiled else _mixed_state_kronecker_chunk_bwd_step)
 
         for v0 in range(0, v_eff, v_chunk):
             v1 = min(v_eff, v0 + v_chunk)
@@ -558,6 +565,7 @@ class MultiHeadMixedStateKroneckerConfig(NgramCalibratedKroneckerConfig):
     self_echo_lambda_init: float = DEFAULT_SELF_ECHO_LAMBDA_INIT
     secondary_branch_scale: float = DEFAULT_NON_DILUTED_SECONDARY_BRANCH_SCALE
     branch_router_mode: str = DEFAULT_BRANCH_ROUTER_MODE
+    use_fused_kernels: bool = True
 
     def __post_init__(self) -> None:
         eff_k = int(self.subheads_per_factor if self.subheads_per_factor is not None else self.n_subheads_per_factor)
@@ -587,6 +595,7 @@ class MultiHeadMixedStateKroneckerConfig(NgramCalibratedKroneckerConfig):
             d_register=int(self.d_register), n_subheads_per_factor=int(self.n_subheads_per_factor),
             attn_evolution_mode=str(self.attn_evolution_mode), max_seq_len=int(self.max_seq_len),
             boson_p=2, gram_eta_init=float(self.gram_eta_init), value_residual_mixing=True,
+            use_fused_kernels=bool(self.use_fused_kernels),
         )
 
 
@@ -1021,6 +1030,16 @@ class MultiHeadMixedStateKroneckerGPT(NgramCalibratedKroneckerBornGPT):
             "cross_branch_overlap": float(self.compute_cross_branch_overlap()),
         }
 
+    def set_fused_kernels(self, enabled: bool = True) -> None:
+        """Toggle fused Triton/compiled CUDA kernels across all attention layers, mixers, and chunked readout (`<= 8` args)."""
+        flag = bool(enabled)
+        object.__setattr__(self.cfg, "use_fused_kernels", flag)
+        for blk in self.blocks:
+            blk.attn.use_fused_kernels = flag
+        for mixer in self.kron_mixers:
+            mixer.use_fused_kernels = flag
+        MixedStateKroneckerBornChunkedNLLFn.use_triton_kernels = flag
+
     def forward(
         self, idx: torch.Tensor, targets: torch.Tensor | None = None,
         return_logits: bool | None = None, token_weights: torch.Tensor | None = None,
@@ -1034,7 +1053,7 @@ class MultiHeadMixedStateKroneckerGPT(NgramCalibratedKroneckerBornGPT):
         povm_w = self.compute_povm_weights()
         hyperparams = torch.tensor(
             [self.cfg.boson_p, self.cfg.holo_alpha, self.cfg.kron_blend, self.cfg.coinc_gamma],
-            device=idx.device, dtype=torch.float32,
+            dtype=torch.float32,
         )
         want_logits = (targets is None) if return_logits is None else bool(return_logits)
         use_mixed = self.cfg.readout_density_mode == "mixed_density"
@@ -1043,6 +1062,8 @@ class MultiHeadMixedStateKroneckerGPT(NgramCalibratedKroneckerBornGPT):
             valid_targets = targets.clamp(min=0, max=v_eff - 1).reshape(-1)
             fn_cls = MixedStateKroneckerBornChunkedNLLFn if use_mixed else CalibratedKroneckerBornChunkedNLLFn
             fn_cls.vocab_chunk_size = int(self.cfg.vocab_chunk_size)
+            if use_mixed:
+                MixedStateKroneckerBornChunkedNLLFn.use_triton_kernels = bool(self.cfg.use_fused_kernels)
             loss = fn_cls.apply(phi_factors, psi_factors, branch_beta, branch_alpha, povm_w, valid_targets, hyperparams, token_weights)
             return (loss if return_logits is None else None), loss
 
@@ -1062,11 +1083,11 @@ class MultiHeadMixedStateKroneckerGPT(NgramCalibratedKroneckerBornGPT):
 
 
 def compute_multihead_mixed_state_kronecker_penalties(
-    model: MultiHeadMixedStateKroneckerGPT,
+    model: MultiHeadMixedStateKroneckerGPT, include_stats: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute Sphere, Unitary (including Stinespring `W_m`), Isotropy, Branch-Orth, & Anchor penalties (`<= 8` args)."""
     v_eff = int(model.cfg.valid_vocab_size)
-    base_penalty, stats = compute_kronecker_manifold_and_isotropy_penalties(model)  # type: ignore[arg-type]
+    base_penalty, stats = compute_kronecker_manifold_and_isotropy_penalties(model, include_stats=include_stats)  # type: ignore[arg-type]
 
     u_bi = _batch_complex_unitary_terms(model.bi_factor_u_re, model.bi_factor_u_im)
     u_tri = _batch_complex_unitary_terms(model.tri_factor_u_re, model.tri_factor_u_im)
@@ -1089,6 +1110,8 @@ def compute_multihead_mixed_state_kronecker_penalties(
 
     w_u, w_p, w_c = float(model.cfg.unitary_penalty_weight), float(model.cfg.povm_anchor_weight), float(model.cfg.ctx_anchor_weight)
     total_penalty = base_penalty + w_u * extra_u.sum() + w_p * povm_anchor_pen + w_c * ctx_anchor_pen
+    if not include_stats:
+        return total_penalty, {}
     stats["unitary_pen"] = float(0.5 * (stats["unitary_pen"] + float(extra_u.mean().detach().item())))
     stats["povm_anchor_pen"] = float(povm_anchor_pen.detach().item())
     stats["ctx_anchor_pen"] = float(ctx_anchor_pen.detach().item())

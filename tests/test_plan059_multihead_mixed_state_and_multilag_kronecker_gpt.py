@@ -536,3 +536,127 @@ def test_end_to_end_multihead_mixed_state_kronecker_gpt_and_eval(
     )
     assert math.isfinite(float(val_metrics["val_ce"]))
     assert int(val_metrics["eval_tokens"]) == eval_tokens
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused Triton kernel parity test")
+def test_cuda_fused_kronecker_mixed_state_kernels_parity() -> None:
+    """Verify numerical equivalence between fused Triton/CUDA kernels and reference implementations."""
+    from qdlblocks.kernels.fused_kronecker_mixed_state_kernels import (
+        flash_causal_pboson_complex_attn_triton,
+        fused_cross_head_gram_stinespring_step,
+        fused_mixed_state_kronecker_chunk_bwd_triton,
+        fused_mixed_state_kronecker_chunk_fwd_triton,
+    )
+    from qdlblocks.layers.multihead_superposition_mixed_state_attn import (
+        apply_stinespring_subhead_to_branch_coupling,
+        causal_born_p2_complex_attn,
+        compute_cross_head_hermitian_gram_step,
+    )
+    from qdlblocks.models.multihead_mixed_state_kronecker_gpt import (
+        _mixed_state_kronecker_chunk_bwd_step,
+        _mixed_state_kronecker_chunk_fwd_step,
+    )
+
+    torch.manual_seed(5908)
+    device = torch.device("cuda")
+
+    # 1. Fused Triton Mixed-State Kronecker Chunk Forward & Backward across R in {2, 4}
+    for r_num in (2, 4):
+        n_tok, v_chunk = 128, 256
+        z_cat = torch.randn(r_num * 4, 2 * n_tok, v_chunk, device=device, dtype=torch.bfloat16) * 0.25
+        beta_f = torch.rand(n_tok, r_num, device=device, dtype=torch.float32) + 0.2
+        beta_f = beta_f / torch.sqrt(beta_f.square().sum(dim=-1, keepdim=True))
+        alpha_c = torch.rand(v_chunk, r_num, device=device, dtype=torch.float32) + 0.2
+        alpha_c = alpha_c / torch.sqrt(alpha_c.square().sum(dim=-1, keepdim=True))
+        povm_c = torch.rand(v_chunk, device=device, dtype=torch.float32) + 0.5
+        targets_in_chunk = torch.randint(-5, v_chunk + 5, (n_tok,), device=device)
+        in_chunk_f = ((targets_in_chunk >= 0) & (targets_in_chunk < v_chunk)).to(torch.float32)
+        rel_idx = targets_in_chunk.clamp(0, v_chunk - 1).unsqueeze(1)
+        v_idx = torch.arange(v_chunk, device=device, dtype=torch.long).unsqueeze(0)
+        targets_col = targets_in_chunk.unsqueeze(1)
+        scale_t = (torch.rand(n_tok, 1, device=device, dtype=torch.float32) * 0.05).detach()
+        inv_z = (torch.rand(n_tok, 1, device=device, dtype=torch.float32) + 0.5).detach()
+        scale_inv_z = (scale_t, inv_z)
+        target_match = (v_idx, targets_col)
+        coeffs = (0.85, 0.30, 0.15)
+
+        z_ref, t_ref = _mixed_state_kronecker_chunk_fwd_step(
+            z_cat, beta_f, alpha_c, povm_c, rel_idx, in_chunk_f, 2.0, coeffs
+        )
+        z_tri, t_tri = fused_mixed_state_kronecker_chunk_fwd_triton(
+            z_cat, beta_f, alpha_c, povm_c, rel_idx, in_chunk_f, 2.0, coeffs
+        )
+        assert torch.allclose(z_tri, z_ref, rtol=1e-2, atol=1e-3), f"R={r_num} fwd z_sum mismatch"
+        assert torch.allclose(t_tri, t_ref, rtol=1e-2, atol=1e-3), f"R={r_num} fwd t_num mismatch"
+
+        g_ref, db_ref, da_ref, dp_ref = _mixed_state_kronecker_chunk_bwd_step(
+            z_cat, beta_f, alpha_c, povm_c, scale_inv_z, target_match, 2.0, coeffs
+        )
+        g_tri, db_tri, da_tri, dp_tri = fused_mixed_state_kronecker_chunk_bwd_triton(
+            z_cat, beta_f, alpha_c, povm_c, scale_inv_z, target_match, 2.0, coeffs
+        )
+        assert torch.allclose(g_tri, g_ref, rtol=2e-2, atol=2e-3), f"R={r_num} bwd g_cat mismatch"
+        assert torch.allclose(db_tri, db_ref, rtol=2e-2, atol=2e-3), f"R={r_num} bwd d_beta mismatch"
+        assert torch.allclose(da_tri, da_ref, rtol=2e-2, atol=2e-3), f"R={r_num} bwd d_alpha mismatch"
+        assert torch.allclose(dp_tri, dp_ref, rtol=2e-2, atol=2e-3), f"R={r_num} bwd d_povm mismatch"
+
+    # 2. Flash Causal Complex p=2 Born Attention Forward & Backward across T in {64, 256}
+    for seq_t in (64, 256):
+        bsz, n_heads, d_h = 2, 8, 16
+        q_re_0 = torch.randn(bsz, n_heads, seq_t, d_h, device=device, dtype=torch.float32)
+        q_im_0 = torch.randn(bsz, n_heads, seq_t, d_h, device=device, dtype=torch.float32)
+        q_n = torch.sqrt((q_re_0.square() + q_im_0.square()).sum(dim=-1, keepdim=True).clamp_min(1e-6))
+        q_re_0, q_im_0 = (q_re_0 / q_n).detach(), (q_im_0 / q_n).detach()
+
+        k_re_0 = torch.randn(bsz, n_heads, seq_t, d_h, device=device, dtype=torch.float32)
+        k_im_0 = torch.randn(bsz, n_heads, seq_t, d_h, device=device, dtype=torch.float32)
+        k_n = torch.sqrt((k_re_0.square() + k_im_0.square()).sum(dim=-1, keepdim=True).clamp_min(1e-6))
+        k_re_0, k_im_0 = (k_re_0 / k_n).detach(), (k_im_0 / k_n).detach()
+
+        v_re_0 = torch.randn(bsz, n_heads, seq_t, d_h, device=device, dtype=torch.float32)
+        v_im_0 = torch.randn(bsz, n_heads, seq_t, d_h, device=device, dtype=torch.float32)
+        v_n = torch.sqrt((v_re_0.square() + v_im_0.square()).sum(dim=-1, keepdim=True).clamp_min(1e-6))
+        v_re_0, v_im_0 = (v_re_0 / v_n).detach(), (v_im_0 / v_n).detach()
+
+        grad_yr = torch.randn_like(v_re_0)
+        grad_yi = torch.randn_like(v_im_0)
+
+        qr_a, qi_a = q_re_0.clone().requires_grad_(True), q_im_0.clone().requires_grad_(True)
+        kr_a, ki_a = k_re_0.clone().requires_grad_(True), k_im_0.clone().requires_grad_(True)
+        vr_a, vi_a = v_re_0.clone().requires_grad_(True), v_im_0.clone().requires_grad_(True)
+        yr_ref, yi_ref = causal_born_p2_complex_attn(qr_a, qi_a, kr_a, ki_a, vr_a, vi_a)
+        ((yr_ref * grad_yr).sum() + (yi_ref * grad_yi).sum()).backward()
+
+        qr_b, qi_b = q_re_0.clone().requires_grad_(True), q_im_0.clone().requires_grad_(True)
+        kr_b, ki_b = k_re_0.clone().requires_grad_(True), k_im_0.clone().requires_grad_(True)
+        vr_b, vi_b = v_re_0.clone().requires_grad_(True), v_im_0.clone().requires_grad_(True)
+        yr_tri, yi_tri = flash_causal_pboson_complex_attn_triton(qr_b, qi_b, kr_b, ki_b, vr_b, vi_b)
+        ((yr_tri * grad_yr).sum() + (yi_tri * grad_yi).sum()).backward()
+
+        assert torch.allclose(yr_tri, yr_ref, rtol=1e-3, atol=1e-4), f"T={seq_t} attn fwd y_re mismatch"
+        assert torch.allclose(yi_tri, yi_ref, rtol=1e-3, atol=1e-4), f"T={seq_t} attn fwd y_im mismatch"
+        assert torch.allclose(qr_b.grad[:, :, 1:], qr_a.grad[:, :, 1:], rtol=2e-3, atol=1e-3), f"T={seq_t} attn dQ_re mismatch"
+        assert torch.allclose(kr_b.grad[:, :, 1:], kr_a.grad[:, :, 1:], rtol=2e-3, atol=1e-3), f"T={seq_t} attn dK_re mismatch"
+        assert torch.allclose(vr_b.grad, vr_a.grad, rtol=2e-3, atol=1e-3), f"T={seq_t} attn dV_re mismatch"
+        assert float(torch.nn.functional.cosine_similarity(qr_b.grad.flatten(), qr_a.grad.flatten(), dim=0).item()) > 0.99999
+        assert float(torch.nn.functional.cosine_similarity(kr_b.grad.flatten(), kr_a.grad.flatten(), dim=0).item()) > 0.99999
+
+    # 3. Fused Cross-Head Gram + Stinespring Coupling vs. Eager Reference
+    y_re = torch.randn(2, 16, 4, 2, 16, device=device, dtype=torch.float32)
+    y_im = torch.randn(2, 16, 4, 2, 16, device=device, dtype=torch.float32)
+    y_norm = torch.sqrt((y_re.square() + y_im.square()).sum(dim=-1, keepdim=True).clamp_min(1e-6))
+    y_re, y_im = y_re / y_norm, y_im / y_norm
+    gram_eta = torch.tensor(0.35, device=device)
+    sw_re = torch.eye(2, device=device).unsqueeze(0).repeat(4, 1, 1)
+    sw_im = torch.zeros(4, 2, 2, device=device)
+
+    t_re, t_im, pur_ref = compute_cross_head_hermitian_gram_step(y_re, y_im, gram_eta)
+    zr_ref, zi_ref, nu_ref = apply_stinespring_subhead_to_branch_coupling(t_re, t_im, sw_re, sw_im)
+    zr_fus, zi_fus, pur_fus, nu_fus = fused_cross_head_gram_stinespring_step(
+        y_re, y_im, gram_eta, sw_re, sw_im
+    )
+    assert torch.allclose(zr_fus, zr_ref, rtol=1e-3, atol=1e-4)
+    assert torch.allclose(zi_fus, zi_ref, rtol=1e-3, atol=1e-4)
+    assert torch.allclose(nu_fus, nu_ref, rtol=1e-3, atol=1e-4)
+    assert torch.allclose(pur_fus, pur_ref, rtol=1e-3, atol=1e-4)
+

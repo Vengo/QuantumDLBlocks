@@ -680,10 +680,10 @@ class NgramCalibratedKroneckerBornGPT(CalibratedKroneckerBornGPT):
             xi_tri_re = torch.einsum("nmd,rmdo->nrmo", self.tri_ctx_wave_re.index_select(0, b_flat).float(), rot_rm)
             xi_tri_im = torch.einsum("nmd,rmdo->nrmo", self.tri_ctx_wave_im.index_select(0, b_flat).float(), rot_rm)
 
-            prev_flat = prev_idx.reshape(-1)
-            prv_emb_re, prv_emb_im = _project_c16_ket_orthogonal_to_carrier(
-                self.embed_re.index_select(0, prev_flat).float(), self.embed_im.index_select(0, prev_flat).float()
-            )
+            cur_bt_re = cur_emb_re.view(b_sz, seq_t, r_num, m_num, d_f)
+            cur_bt_im = cur_emb_im.view(b_sz, seq_t, r_num, m_num, d_f)
+            prv_emb_re = torch.cat([cur_bt_re[:, :1], cur_bt_re[:, :-1]], dim=1)
+            prv_emb_im = torch.cat([cur_bt_im[:, :1], cur_bt_im[:, :-1]], dim=1)
             op_tri_re, op_tri_im = _apply_factor_unitary_bank(
                 prv_emb_re.reshape(n_tok, k_tot, d_f), prv_emb_im.reshape(n_tok, k_tot, d_f),
                 self.tri_factor_u_re.float(), self.tri_factor_u_im.float(),

@@ -162,3 +162,12 @@ The following 20 historical candidate entries from `Waves 6–38` (`scripts/TOOL
 | `[~] Superseded / Legacy` | `stereographic_latitude_probe` | `Plan 028` | Superseded by complex Hilbert-space carrier tilt in [`scripts/calibrated_kronecker_vocab_spectrum_and_povm_drift_probe.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/calibrated_kronecker_vocab_spectrum_and_povm_drift_probe.py). |
 | `[~] Superseded / Legacy` | `synthetic_walk_attention_heatmap_exporter` | `Plan 029` | Superseded by [`scripts/synthetic_fineweb_walk_overfit_probe.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/synthetic_fineweb_walk_overfit_probe.py). |
 | `[~] Superseded / Legacy` | `iso_wallclock_pareto_profiler` & `bipolar_vs_concave_kboson_curve_plotter` | `Plans 030–031` | Superseded by [`scripts/wall_clock_chinchilla_pareto_predictor.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/wall_clock_chinchilla_pareto_predictor.py) and polynomial $p$-boson Born readouts. |
+
+---
+
+## 4. Wave 45 (`EXPERIMENT_PLAN_060.md`) Candidate `Nice-to-Have` Scripts
+
+| Status | Candidate Script | Wave / Plan | Description & Proposed CLI |
+| :---: | :--- | :---: | :--- |
+| `[ ] Candidate (Wave 45 / Plan 060)` | `scripts/classical_vs_quantum_roofline_and_mfu_profiler.py` | `Wave 45` / [`EXPERIMENT_PLAN_060.md`](file:///home/festivity/agy/QuantumDLBlocks/EXPERIMENT_PLAN_060.md) | Automated side-by-side hardware roofline, `TFLOP/s` MFU, and Iso-Wallclock (`10m, 30m, 100m, 180m`) comparison tool between [`CompiledLeaderboardClassicalGPT`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/compiled_leaderboard_classical_gpt.py) and [`MultiHeadMixedStateKroneckerGPT`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/models/multihead_mixed_state_kronecker_gpt.py) across batch sizes on RTX 5060 Ti. |
+| `[ ] Candidate (Wave 45 / Plan 060)` | `scripts/modded_nanogpt_sliding_window_block_mask_bench.py` | `Wave 45` / [`EXPERIMENT_PLAN_060.md`](file:///home/festivity/agy/QuantumDLBlocks/EXPERIMENT_PLAN_060.md) | Benchmarks `torch.nn.attention.flex_attention` document-boundary and sliding-window (`128 -> 1792`) block masks on `CompiledLeaderboardClassicalGPT` on SM120 Blackwell Tensor Cores. |

@@ -42,6 +42,7 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
+from ..kernels.fused_kronecker_mixed_state_kernels import fused_kronecker_16x4_unitary_mixer_step
 from ..layers.packed_complex_register_density_attn import (
     ComplexLinear, DEFAULT_COMPLEX_NORM_EPS, DEFAULT_COMPLEX_REGISTER_DIM,
     DEFAULT_P_BOSON_POWER, PackedComplexRegisterDensityAttention, complex_l2_normalize,
@@ -319,6 +320,7 @@ class Kronecker16x4UnitaryMeaningMixer(nn.Module):
         self.meaning_mix_re = nn.Parameter(torch.empty(self.num_factors, self.num_meanings, self.num_meanings))
         self.meaning_mix_im = nn.Parameter(torch.empty(self.num_factors, self.num_meanings, self.num_meanings))
         self.mixer_gate = nn.Parameter(torch.tensor(DEFAULT_MIXER_GATE_INIT, dtype=torch.float32))
+        self.use_fused_kernels: bool = True
         self.reset_parameters()
 
     @torch.no_grad()
@@ -339,6 +341,11 @@ class Kronecker16x4UnitaryMeaningMixer(nn.Module):
 
     def forward(self, psi_re: torch.Tensor, psi_im: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Apply batched `16x16` factor unitaries, `4x4` factor entangler, and `RxR` meaning interferometer (`<= 8` args)."""
+        if getattr(self, "use_fused_kernels", False) and psi_re.is_cuda and not torch.compiler.is_compiling():
+            return fused_kronecker_16x4_unitary_mixer_step(
+                psi_re, psi_im, self.factor_u_re, self.factor_u_im,
+                self.factor_mix_re, self.factor_mix_im, self.meaning_mix_re, (self.meaning_mix_im, self.mixer_gate),
+            )
         w_dtype = psi_re.dtype
         b_sz, seq_t, d_tot = psi_re.shape
         r_num, m_num, d_f = self.num_meanings, self.num_factors, self.factor_dim
@@ -1044,7 +1051,7 @@ class KroneckerMultiMeaning16x4GPT(nn.Module):
 def _batch_complex_unitary_terms(w_re: torch.Tensor, w_im: torch.Tensor) -> torch.Tensor:
     """Compute per-matrix complex unitary deviation `(||W_re W_re^T + W_im W_im^T - I||_F^2 + ||W_im W_re^T - W_re W_im^T||_F^2) / d`."""
     wf_re, wf_im = w_re.float(), w_im.float()
-    d_w = wf_re.size(-1)
+    d_w = wf_re.size(-2)
     eye = torch.eye(d_w, device=wf_re.device, dtype=torch.float32)
     gram_re = torch.matmul(wf_re, wf_re.transpose(-1, -2)) + torch.matmul(wf_im, wf_im.transpose(-1, -2)) - eye
     gram_im = torch.matmul(wf_im, wf_re.transpose(-1, -2)) - torch.matmul(wf_re, wf_im.transpose(-1, -2))
@@ -1052,7 +1059,7 @@ def _batch_complex_unitary_terms(w_re: torch.Tensor, w_im: torch.Tensor) -> torc
 
 
 def compute_kronecker_manifold_and_isotropy_penalties(
-    model: KroneckerMultiMeaning16x4GPT,
+    model: KroneckerMultiMeaning16x4GPT, include_stats: bool = True,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute smooth 16D Factor-Sphere, Complex-Unitary, Per-Factor Isotropy, & Branch-Orthogonality penalties (`<= 8` args)."""
     v_eff = int(model.cfg.valid_vocab_size)
@@ -1062,10 +1069,6 @@ def compute_kronecker_manifold_and_isotropy_penalties(
     e_re, e_im = model.embed_re[:v_eff].float(), model.embed_im[:v_eff].float()
     factor_norm_sq = e_re.square().sum(dim=-1) + e_im.square().sum(dim=-1)
     sphere_pen = (factor_norm_sq - 1.0).square().mean()
-
-    with torch.no_grad():
-        f_norms = torch.sqrt(factor_norm_sq.detach().clamp_min(PROB_LOG_CLAMP_MIN))
-        embed_norm_median, embed_norm_max = float(f_norms.median().item()), float(f_norms.max().item())
 
     u_batches: list[torch.Tensor] = [_batch_complex_unitary_terms(model.out_factor_u_re, model.out_factor_u_im)]
     for mod in model.modules():
@@ -1078,7 +1081,6 @@ def compute_kronecker_manifold_and_isotropy_penalties(
 
     all_u_terms = torch.cat(u_batches, dim=0)
     unitary_raw_sum, unitary_pen = all_u_terms.sum(), all_u_terms.mean()
-    complex_unitary_err = float(torch.sqrt(all_u_terms.detach().clamp_min(0.0)).mean().item())
 
     inv_norm = torch.rsqrt(factor_norm_sq.unsqueeze(-1) + DEFAULT_KRON_EPS)
     u_re, u_im = e_re * inv_norm, e_im * inv_norm
@@ -1109,6 +1111,12 @@ def compute_kronecker_manifold_and_isotropy_penalties(
         + float(model.cfg.iso_penalty_weight) * iso_pen
         + float(model.cfg.branch_orth_weight) * branch_orth_pen
     )
+    if not include_stats:
+        return total_penalty, {}
+    with torch.no_grad():
+        f_norms = torch.sqrt(factor_norm_sq.detach().clamp_min(PROB_LOG_CLAMP_MIN))
+        embed_norm_median, embed_norm_max = float(f_norms.median().item()), float(f_norms.max().item())
+        complex_unitary_err = float(torch.sqrt(all_u_terms.detach().clamp_min(0.0)).mean().item())
     stats = {
         "sphere_pen": float(sphere_pen.detach().item()), "unitary_pen": float(unitary_pen.detach().item()),
         "iso_pen": float(iso_pen.detach().item()), "branch_orth_pen": float(branch_orth_pen.detach().item()),
