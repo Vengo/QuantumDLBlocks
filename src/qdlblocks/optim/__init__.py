@@ -25,8 +25,22 @@ from .schedules import (
     wsd_lr_multiplier,
 )
 from .tail_ema import TailWeightAverager
+from .vocab_manifold_muon import (
+    DEFAULT_BATCH_GRAM_MUON_LR,
+    DEFAULT_SPHERE_GEODESIC_LR,
+    DEFAULT_SPHERE_SNR_TRUST_TAU,
+    BatchSubspaceTikhonovGramMuon,
+    RiemannianSphereTangentSNROptimizer,
+    project_rows_to_rms_sphere_,
+)
 
 __all__ = [
+    "DEFAULT_BATCH_GRAM_MUON_LR",
+    "DEFAULT_SPHERE_GEODESIC_LR",
+    "DEFAULT_SPHERE_SNR_TRUST_TAU",
+    "BatchSubspaceTikhonovGramMuon",
+    "RiemannianSphereTangentSNROptimizer",
+    "project_rows_to_rms_sphere_",
     "DEFAULT_MUON_REFERENCE_BATCH_TOKENS",
     "DecayMode",
     "KroneckerParameterPartition",

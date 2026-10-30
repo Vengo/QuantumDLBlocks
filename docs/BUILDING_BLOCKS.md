@@ -329,6 +329,25 @@ Writing custom GPU kernels inside a single `examples/XX_*.py` script prevents re
   )
   ```
 
+### 4.12 Standalone Teacher-Free Complex Quantum Born GPT (`standalone_quantum_born_gpt.py` — `Wave 48` / `EXPERIMENT_PLAN_063.md`)
+- **What It Is**: Canonical 100% standalone, end-to-end differentiable Complex Quantum Born language model (`StandaloneQuantumBornGPT`) with zero classical teacher dependencies (`w45b_classical_teacher_ckpt50m_l12_d768_b262k`) and zero periodic Golub-Pereyra ridge-regression refits:
+  1. **Fused `288`-Width Isometric Density + Coherent Ket Attention Packing (`fast_rank_r_hermitian_and_ket_pack`)**: Packs the $\sqrt{2}$-isometric Rank-$R=4$ Hermitian outer product $\tilde{P}(\rho_{s,h}^{\text{tok}}) \in \mathbb{R}^{256}$ (`DEFAULT_FUSED_HEAD_PACK_DIM = 288`) and unit-norm first-moment coherent value ket $|\hat{v}_{s,h}^{\text{coh}}\rangle \in \mathbb{C}^{16} \cong \mathbb{R}^{32}$ into a single causal $p$-boson Born attention GEMM.
+  2. **Uhlmann Phase-Locked Rank-2 Lanczos-Krylov Eigenpair Readout (`extract_rank2_krylov_eigenpair_uhlmann`, `320` dims/head)**: Seeds a 2-step Lanczos-Krylov recursion with the contextual first-moment ket $|\bar{v}_{t,h}\rangle$, locks the Uhlmann parallel-transport phase $\langle \bar{v}_{t,h} \mid \phi_{1,t,h}\rangle \in \mathbb{R}_{\ge 0}$, and concatenates the unit-isometric-scale purified density $\tilde{P}(\rho_{\text{out}}) \in \mathbb{R}^{256}$ with $[\sqrt{\lambda_1}\phi_1, \sqrt{\lambda_2}\phi_2] \in \mathbb{R}^{64}$ (`DEFAULT_KRYLOV_OBSERVABLE_HEAD_DIM = 320`, `1,920` total across 6 heads) into a direct Stiefel readout $W_{\text{obs}} \in \text{St}(1920, 768)$.
+  3. **Rule-9 Single-Pass Chunked Rank-2 Krylov Born Readout (`Rank2KrylovBornChunkedCEFn`)**: Computes Rank-2 Krylov Born log-intensity $I_{t,v} = \hat{\lambda}_{1,t} \langle e_{1,v}, h_{1,t}\rangle^2 + \hat{\lambda}_{2,t} \langle e_{2,v}, h_{2,t}\rangle^2 + \varepsilon$ and analytical backward gradients in a single token-chunk loop with `0` matmuls and `0` power calls in `backward()`.
+- **Minimal Usage**:
+  ```python
+  from qdlblocks.models import (
+      QuantumAttentionMode,
+      Rank2KrylovBornChunkedCEFn,
+      StandaloneQuantumBornBlock,
+      StandaloneQuantumBornConfig,
+      StandaloneQuantumBornGPT,
+      VocabOptimizerMode,
+      VocabularyReadoutMode,
+      build_standalone_quantum_born_optimizers,
+  )
+  ```
+
 ---
 
 ## 5. Riemannian Stiefel Optimization & Learning-Rate Schedules (`src/qdlblocks/optim/`)

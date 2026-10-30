@@ -55,6 +55,11 @@ NS5_QUINTIC_B: float = -4.7750
 NS5_QUINTIC_C: float = 2.0315
 DEFAULT_NS5_STEPS: int = 5
 DEFAULT_ROPE_BASE_THETA: float = 10000.0
+DEFAULT_FUSED_HEAD_PACK_DIM: int = 288
+DEFAULT_KRYLOV_OBSERVABLE_HEAD_DIM: int = 320
+DEFAULT_TIKHONOV_GRAM_LAMBDA: float = 1e-3
+DEFAULT_UHLMANN_PHASE_EPS: float = 1e-7
+DEFAULT_UNITARY_GEODESIC_LR: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -125,6 +130,42 @@ def pack_rank1_ket_outer_isometric(
     outer_re = v_re.unsqueeze(-1) * v_re.unsqueeze(-2) + v_im.unsqueeze(-1) * v_im.unsqueeze(-2)
     outer_im = v_im.unsqueeze(-1) * v_re.unsqueeze(-2) - v_re.unsqueeze(-1) * v_im.unsqueeze(-2)
     return pack_hermitian_isometric(outer_re, outer_im)
+
+
+def fast_rank_r_hermitian_and_ket_pack(
+    v_re: torch.Tensor,
+    v_im: torch.Tensor,
+    re_pack_mask: torch.Tensor,
+    im_pack_mask: torch.Tensor,
+    eps: float = TRACE_NORM_EPS,
+) -> torch.Tensor:
+    """Pack Rank-$R$ trace-1 isometric Hermitian density (`d_h^2 = 256`) + coherent first-moment ket (`2 * d_h = 32`) into `(..., 288)`."""
+    orig_dtype = v_re.dtype
+    total_energy = (
+        v_re.float().square().sum(dim=(-2, -1), keepdim=True) + v_im.float().square().sum(dim=(-2, -1), keepdim=True)
+    ).clamp_min(eps)
+    inv_sqrt_e = torch.rsqrt(total_energy).to(orig_dtype)
+    v_re_s = v_re * inv_sqrt_e
+    v_im_s = v_im * inv_sqrt_e
+
+    vt_re = v_re_s.transpose(-2, -1)
+    vt_im = v_im_s.transpose(-2, -1)
+    rho_re = torch.matmul(vt_re, v_re_s) + torch.matmul(vt_im, v_im_s)
+    rho_im = torch.matmul(vt_im, v_re_s) - torch.matmul(vt_re, v_im_s)
+    packed_rho = (rho_re * re_pack_mask.to(orig_dtype) + rho_im * im_pack_mask.to(orig_dtype)).flatten(
+        start_dim=-2, end_dim=-1
+    )
+
+    v_coh_re_raw = v_re.sum(dim=-2)
+    v_coh_im_raw = v_im.sum(dim=-2)
+    coh_norm_sq = (
+        v_coh_re_raw.float().square().sum(dim=-1, keepdim=True)
+        + v_coh_im_raw.float().square().sum(dim=-1, keepdim=True)
+    ).clamp_min(eps)
+    inv_coh_norm = torch.rsqrt(coh_norm_sq).to(orig_dtype)
+    v_coh_re = v_coh_re_raw * inv_coh_norm
+    v_coh_im = v_coh_im_raw * inv_coh_norm
+    return torch.cat([packed_rho, v_coh_re, v_coh_im], dim=-1)
 
 
 def bures_wasserstein_mcweeny_step(
@@ -213,22 +254,174 @@ def extract_rank2_krylov_eigenpair(
     }
 
 
-def _newton_schulz5_tall_real(mat: torch.Tensor, steps: int = DEFAULT_NS5_STEPS) -> torch.Tensor:
-    """Compute exact unit-singular-value polar factor $U = M (M^T M)^{-1/2}$ of `mat` `(..., D, d)` ($D \\ge d$).
+def _complex_hermitian_mv(
+    rho_re: torch.Tensor,
+    rho_im: torch.Tensor,
+    v_re: torch.Tensor,
+    v_im: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute complex matrix-vector product $\\rho |v\\rangle$ on `(..., d_h, d_h)` and `(..., d_h)` without $K=1$ `bmm`."""
+    vr_row = v_re.unsqueeze(-2)
+    vi_row = v_im.unsqueeze(-2)
+    out_re = (rho_re * vr_row - rho_im * vi_row).sum(dim=-1)
+    out_im = (rho_re * vi_row + rho_im * vr_row).sum(dim=-1)
+    return out_re, out_im
 
-    Normalizing by the Frobenius norm $\\|M\\|_F$ guarantees all initial singular values lie in $[0, 1] \\subset (0, \\sqrt{3})$,
-    where the cubic Newton-Schulz map $X \\leftarrow \\frac{1}{2}X(3I - X^T X)$ is strictly bounded in $[0, 1]$ and converges
-    quadratically to $\\sigma_i = 1.0$ with zero SVD calls.
-    """
-    x = mat.float()
-    norm = torch.linalg.matrix_norm(x, ord="fro", dim=(-2, -1), keepdim=True).clamp_min(TRACE_NORM_EPS)
-    x = x / norm
-    eye = torch.eye(x.size(-1), device=x.device, dtype=x.dtype)
-    total_iters = max(7, steps + 2)
-    for _ in range(total_iters):
+
+def extract_rank2_krylov_eigenpair_uhlmann(
+    rho_re: torch.Tensor,
+    rho_im: torch.Tensor,
+    v_bar_re: torch.Tensor,
+    v_bar_im: torch.Tensor,
+    eps: float = DEFAULT_UHLMANN_PHASE_EPS,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Extract Uhlmann phase-locked Rank-2 Lanczos-Krylov eigenpair seeded by contextual first-moment ket `|v_bar>`."""
+    orig_dtype = rho_re.dtype
+    anchor_re, anchor_im = complex_l2_normalize(v_bar_re.float(), v_bar_im.float(), eps=eps)
+    phi1_re = anchor_re.to(orig_dtype)
+    phi1_im = anchor_im.to(orig_dtype)
+
+    w1_re, w1_im = _complex_hermitian_mv(rho_re, rho_im, phi1_re, phi1_im)
+    tilde_re, tilde_im = complex_l2_normalize(w1_re.float(), w1_im.float(), eps=eps)
+
+    c_re = (tilde_re * anchor_re + tilde_im * anchor_im).sum(dim=-1, keepdim=True)
+    c_im = (tilde_re * anchor_im - tilde_im * anchor_re).sum(dim=-1, keepdim=True)
+    c_inv = torch.rsqrt((c_re.square() + c_im.square()).clamp_min(eps * eps))
+    phase_re = c_re * c_inv
+    phase_im = c_im * c_inv
+
+    phi1_locked_re = (phase_re * tilde_re - phase_im * tilde_im).to(orig_dtype)
+    phi1_locked_im = (phase_re * tilde_im + phase_im * tilde_re).to(orig_dtype)
+
+    r_phi1_re, r_phi1_im = _complex_hermitian_mv(rho_re, rho_im, phi1_locked_re, phi1_locked_im)
+    lam1 = (phi1_locked_re.float() * r_phi1_re.float() + phi1_locked_im.float() * r_phi1_im.float()).sum(dim=-1).clamp(
+        0.0, 1.0
+    )
+
+    u2_re = r_phi1_re.float() - lam1.unsqueeze(-1) * phi1_locked_re.float()
+    u2_im = r_phi1_im.float() - lam1.unsqueeze(-1) * phi1_locked_im.float()
+    ov_re = (phi1_locked_re.float() * u2_re + phi1_locked_im.float() * u2_im).sum(dim=-1, keepdim=True)
+    ov_im = (phi1_locked_re.float() * u2_im - phi1_locked_im.float() * u2_re).sum(dim=-1, keepdim=True)
+    u2_perp_re = u2_re - (ov_re * phi1_locked_re.float() - ov_im * phi1_locked_im.float())
+    u2_perp_im = u2_im - (ov_re * phi1_locked_im.float() + ov_im * phi1_locked_re.float())
+    phi2_f_re, phi2_f_im = complex_l2_normalize(u2_perp_re, u2_perp_im, eps=eps)
+    phi2_locked_re = phi2_f_re.to(orig_dtype)
+    phi2_locked_im = phi2_f_im.to(orig_dtype)
+
+    r_phi2_re, r_phi2_im = _complex_hermitian_mv(rho_re, rho_im, phi2_locked_re, phi2_locked_im)
+    lam2 = (phi2_f_re * r_phi2_re.float() + phi2_f_im * r_phi2_im.float()).sum(dim=-1).clamp(0.0, 1.0)
+    return lam1, lam2, phi1_locked_re, phi1_locked_im, phi2_locked_re, phi2_locked_im
+
+
+def _newton_schulz5_tall_real(
+    mat: torch.Tensor,
+    steps: int = DEFAULT_NS5_STEPS,
+    tikhonov_lambda: float = 0.0,
+) -> torch.Tensor:
+    """Compute unit-singular-value polar factor $U = M (M^T M + \\lambda_{\\text{tik}} I)^{-1/2}$ of `mat` `(..., D, d)` ($D \\ge d$)."""
+    x_f32 = mat.float()
+    norm = torch.linalg.matrix_norm(x_f32, ord="fro", dim=(-2, -1), keepdim=True).clamp_min(TRACE_NORM_EPS)
+    x_f32 = x_f32 / norm
+    use_bf16 = x_f32.is_cuda and x_f32.size(-1) >= 128 and torch.cuda.is_bf16_supported()
+    work_dtype = torch.bfloat16 if use_bf16 else torch.float32
+    x = x_f32.to(work_dtype)
+    eye = torch.eye(x.size(-1), device=x.device, dtype=work_dtype)
+    for step_idx in range(max(5, steps)):
         gram = torch.matmul(x.transpose(-2, -1), x)
+        if step_idx == 0 and tikhonov_lambda > 0.0:
+            gram = gram + float(tikhonov_lambda) * eye
         x = 0.5 * torch.matmul(x, 3.0 * eye - gram)
-    return x
+    x_out = x.float()
+    eye_f32 = torch.eye(x_out.size(-1), device=x_out.device, dtype=torch.float32)
+    gram_f32 = torch.matmul(x_out.transpose(-2, -1), x_out)
+    return 0.5 * torch.matmul(x_out, 3.0 * eye_f32 - gram_f32)
+
+
+def _complex_newton_schulz5(
+    z_re: torch.Tensor,
+    z_im: torch.Tensor,
+    steps: int = DEFAULT_NS5_STEPS,
+    tikhonov_lambda: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute unit-singular-value complex polar factor of `(z_re, z_im)` `(..., d, d)` with optional Tikhonov damping."""
+    x_re = z_re.float()
+    x_im = z_im.float()
+    fro_sq = (x_re.square().sum(dim=(-2, -1), keepdim=True) + x_im.square().sum(dim=(-2, -1), keepdim=True)).clamp_min(
+        TRACE_NORM_EPS
+    )
+    inv_fro = torch.rsqrt(fro_sq)
+    x_re = x_re * inv_fro
+    x_im = x_im * inv_fro
+    eye = torch.eye(x_re.size(-1), device=x_re.device, dtype=x_re.dtype)
+
+    for step_idx in range(max(6, steps + 1)):
+        gram_re = torch.matmul(x_re.transpose(-2, -1), x_re) + torch.matmul(x_im.transpose(-2, -1), x_im)
+        gram_im = torch.matmul(x_re.transpose(-2, -1), x_im) - torch.matmul(x_im.transpose(-2, -1), x_re)
+        if step_idx == 0 and tikhonov_lambda > 0.0:
+            gram_re = gram_re + float(tikhonov_lambda) * eye
+        three_minus_re = 3.0 * eye - gram_re
+        three_minus_im = -gram_im
+        next_re = 0.5 * (torch.matmul(x_re, three_minus_re) - torch.matmul(x_im, three_minus_im))
+        next_im = 0.5 * (torch.matmul(x_re, three_minus_im) + torch.matmul(x_im, three_minus_re))
+        x_re, x_im = next_re, next_im
+    return x_re, x_im
+
+
+def riemannian_complex_unitary_muon_step(
+    u_re: torch.Tensor,
+    u_im: torch.Tensor,
+    grad_re: torch.Tensor,
+    grad_im: torch.Tensor,
+    mom_re: torch.Tensor,
+    mom_im: torch.Tensor,
+    lr: float = DEFAULT_UNITARY_GEODESIC_LR,
+    tikhonov_lambda: float = DEFAULT_TIKHONOV_GRAM_LAMBDA,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Execute 1 batched Joint-Complex Unitary `RiemannianStiefelMuon` step on $U = U_{\\text{re}} + i U_{\\text{im}} \\in U(d_h)$ (`<= 8` args)."""
+    g_in_re = torch.nan_to_num(grad_re.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    g_in_im = torch.nan_to_num(grad_im.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    beta = DEFAULT_RIEMANNIAN_MOMENTUM_BETA
+    mom_re.mul_(beta).add_(g_in_re)
+    mom_im.mul_(beta).add_(g_in_im)
+    g_re = g_in_re + float(beta) * mom_re.float()
+    g_im = g_in_im + float(beta) * mom_im.float()
+
+    ur = u_re.float()
+    ui = u_im.float()
+    ut_re = ur.transpose(-2, -1)
+    ut_im = -ui.transpose(-2, -1)
+
+    p_re = torch.matmul(ut_re, g_re) - torch.matmul(ut_im, g_im)
+    p_im = torch.matmul(ut_re, g_im) + torch.matmul(ut_im, g_re)
+    omega_re = 0.5 * (p_re - p_re.transpose(-2, -1))
+    omega_im = 0.5 * (p_im + p_im.transpose(-2, -1))
+
+    t_re = torch.matmul(ur, omega_re) - torch.matmul(ui, omega_im)
+    t_im = torch.matmul(ur, omega_im) + torch.matmul(ui, omega_re)
+
+    z_re, z_im = _complex_newton_schulz5(t_re, t_im, tikhonov_lambda=tikhonov_lambda)
+    pz_re = torch.matmul(ut_re, z_re) - torch.matmul(ut_im, z_im)
+    pz_im = torch.matmul(ut_re, z_im) + torch.matmul(ut_im, z_re)
+    om_re = 0.5 * (pz_re - pz_re.transpose(-2, -1))
+    om_im = 0.5 * (pz_im + pz_im.transpose(-2, -1))
+    tan_re = torch.matmul(ur, om_re) - torch.matmul(ui, om_im)
+    tan_im = torch.matmul(ur, om_im) + torch.matmul(ui, om_re)
+
+    scale = 1.0 / math.sqrt(1.0 + float(lr) * float(lr))
+    nx_re = (ur - float(lr) * tan_re) * scale
+    nx_im = (ui - float(lr) * tan_im) * scale
+
+    eye = torch.eye(ur.size(-1), device=ur.device, dtype=ur.dtype)
+    gram_re = torch.matmul(nx_re.transpose(-2, -1), nx_re) + torch.matmul(nx_im.transpose(-2, -1), nx_im)
+    gram_im = torch.matmul(nx_re.transpose(-2, -1), nx_im) - torch.matmul(nx_im.transpose(-2, -1), nx_re)
+    tm_re = 3.0 * eye - gram_re
+    tm_im = -gram_im
+    pol_re = 0.5 * (torch.matmul(nx_re, tm_re) - torch.matmul(nx_im, tm_im))
+    pol_im = 0.5 * (torch.matmul(nx_re, tm_im) + torch.matmul(nx_im, tm_re))
+
+    u_re.copy_(pol_re.to(u_re.dtype))
+    u_im.copy_(pol_im.to(u_im.dtype))
+    return u_re, u_im
 
 
 def riemannian_stiefel_muon_step(
@@ -238,6 +431,7 @@ def riemannian_stiefel_muon_step(
     lr: float = DEFAULT_RIEMANNIAN_MUON_LR,
     beta: float = DEFAULT_RIEMANNIAN_MOMENTUM_BETA,
     ns_steps: int = DEFAULT_NS5_STEPS,
+    tikhonov_lambda: float = 0.0,
 ) -> torch.Tensor:
     """Execute 1 exact `Riemannian Stiefel-Muon` geodesic step on real Stiefel/Orthogonal matrix `weight`.
 
@@ -250,12 +444,9 @@ def riemannian_stiefel_muon_step(
     3. Unit-convergent Newton-Schulz orthogonalization $U_{\\text{tan}} = \\text{NS}(M_{\\text{tan}})$, guaranteeing $W^T U_{\\text{tan}} + U_{\\text{tan}}^T W = 0$.
     4. Exact scalar geodesic retraction $W_{\\text{next}} = (W - \\eta U_{\\text{tan}}) / \\sqrt{1 + \\eta^2}$ + 1-step Schulz polish.
     """
-    if not torch.isfinite(grad).all():
-        return weight
-    momentum_buf.mul_(beta).add_(grad.float())
-    g_nest = grad.float() + float(beta) * momentum_buf.float()
-    if float(torch.linalg.matrix_norm(g_nest, ord="fro").max().item()) < TRACE_NORM_EPS:
-        return weight
+    g_clean = torch.nan_to_num(grad.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    momentum_buf.mul_(beta).add_(g_clean)
+    g_nest = g_clean + float(beta) * momentum_buf.float()
     w_f32 = weight.float()
 
     transposed = w_f32.size(-2) < w_f32.size(-1)
@@ -264,29 +455,47 @@ def riemannian_stiefel_muon_step(
         g_nest = g_nest.transpose(-2, -1)
 
     rows, cols = w_f32.size(-2), w_f32.size(-1)
-    wt_g = torch.matmul(w_f32.transpose(-2, -1), g_nest)
-    if rows == cols:
-        sym_part = 0.5 * (wt_g + wt_g.transpose(-2, -1))
-        m_tan = g_nest - torch.matmul(w_f32, sym_part)
+    use_bf16 = w_f32.is_cuda and cols >= 128 and torch.cuda.is_bf16_supported()
+    if use_bf16:
+        w_work = w_f32.bfloat16()
+        g_work = g_nest.bfloat16()
+        wt_g = torch.matmul(w_work.transpose(-2, -1), g_work)
+        if rows == cols:
+            sym_part = 0.5 * (wt_g + wt_g.transpose(-2, -1))
+            m_tan = (g_work - torch.matmul(w_work, sym_part)).float()
+        else:
+            m_tan = (g_work - torch.matmul(w_work, wt_g)).float()
     else:
-        m_tan = g_nest - torch.matmul(w_f32, wt_g)
+        wt_g = torch.matmul(w_f32.transpose(-2, -1), g_nest)
+        if rows == cols:
+            sym_part = 0.5 * (wt_g + wt_g.transpose(-2, -1))
+            m_tan = g_nest - torch.matmul(w_f32, sym_part)
+        else:
+            m_tan = g_nest - torch.matmul(w_f32, wt_g)
 
-    if float(torch.linalg.matrix_norm(m_tan, ord="fro").max().item()) < TRACE_NORM_EPS:
-        return weight
-
-    u_tan = _newton_schulz5_tall_real(m_tan, steps=ns_steps)
-    if rows == cols:
-        omega_hat = torch.matmul(w_f32.transpose(-2, -1), u_tan)
-        omega_skew = 0.5 * (omega_hat - omega_hat.transpose(-2, -1))
-        u_tan = torch.matmul(w_f32, omega_skew)
+    u_tan = _newton_schulz5_tall_real(m_tan, steps=ns_steps, tikhonov_lambda=tikhonov_lambda)
+    if use_bf16:
+        u_bf16 = u_tan.bfloat16()
+        if rows == cols:
+            omega_hat = torch.matmul(w_work.transpose(-2, -1), u_bf16)
+            omega_skew = 0.5 * (omega_hat - omega_hat.transpose(-2, -1))
+            u_tan = torch.matmul(w_work, omega_skew).float()
+        else:
+            u_tan = (u_bf16 - torch.matmul(w_work, torch.matmul(w_work.transpose(-2, -1), u_bf16))).float()
     else:
-        u_tan = u_tan - torch.matmul(w_f32, torch.matmul(w_f32.transpose(-2, -1), u_tan))
-        u_tan = _newton_schulz5_tall_real(u_tan, steps=ns_steps)
+        eye_c = torch.eye(cols, device=w_f32.device, dtype=w_f32.dtype)
+        if rows == cols:
+            omega_hat = torch.matmul(w_f32.transpose(-2, -1), u_tan)
+            omega_skew = 0.5 * (omega_hat - omega_hat.transpose(-2, -1))
+            u_tan = torch.matmul(w_f32, omega_skew)
+        else:
+            u_tan = u_tan - torch.matmul(w_f32, torch.matmul(w_f32.transpose(-2, -1), u_tan))
+            u_tan = 0.5 * torch.matmul(u_tan, 3.0 * eye_c - torch.matmul(u_tan.transpose(-2, -1), u_tan))
 
     retract_scale = 1.0 / math.sqrt(1.0 + float(lr) * float(lr))
     w_next = (w_f32 - float(lr) * u_tan) * retract_scale
-    eye_c = torch.eye(cols, device=w_next.device, dtype=w_next.dtype)
-    w_next = 0.5 * torch.matmul(w_next, 3.0 * eye_c - torch.matmul(w_next.transpose(-2, -1), w_next))
+    eye_f32 = torch.eye(cols, device=w_next.device, dtype=w_next.dtype)
+    w_next = 0.5 * torch.matmul(w_next, 3.0 * eye_f32 - torch.matmul(w_next.transpose(-2, -1), w_next))
 
     if transposed:
         w_next = w_next.transpose(-2, -1)
