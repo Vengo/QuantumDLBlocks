@@ -138,3 +138,7 @@ When implementing and running an `EXPERIMENT_PLAN_0XX.md`, implementer agents an
      - The exact empirical results and telemetry observed, and
      - Concrete mathematical/architectural ideas and hypotheses about what happened and what the next wave should test.
 
+## 8. Environment Instructions
+
+This workflow may execute on different machines. Please read local\_details.md for information about how to use the local environment for scripts.
+

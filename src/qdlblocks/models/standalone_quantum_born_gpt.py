@@ -1,31 +1,11 @@
 """Wave 48 (`EXPERIMENT_PLAN_063.md`): Standalone Teacher-Free Complex Quantum Born GPT.
 
 Synthesizes the quantum-geometric mechanisms from *"Top-1 Accuracy vs Cross-Entropy Divergence"*
-(Pages 1-36) into a 100% standalone, end-to-end differentiable language model (`StandaloneQuantumBornGPT`)
-with zero classical teacher dependencies and zero Golub-Pereyra ridge-regression refits:
-
-1. **Fused `288`-Width Isometric Density + First-Moment Ket Attention Packing**:
-   - Packs the $\\sqrt{2}$-isometric Rank-$R=4$ Hermitian outer product $\\tilde{P}(\\rho_{s,h}^{\\text{tok}}) \\in \\mathbb{R}^{256}$
-     and the unit-norm first-moment coherent value ket $|\\hat{v}_{s,h}^{\\text{coh}}\\rangle \\in \\mathbb{C}^{16} \\cong \\mathbb{R}^{32}$
-     into a single contiguous `288`-dim vector per head, contracting both in one causal $p$-boson Born
-     attention GEMM (`(B, H, T, T) @ (B, H, T, 288)`).
-2. **Uhlmann Phase-Locked Rank-2 Lanczos-Krylov Eigenpair Extraction (`320`-Dim/Head Readout)**:
-   - After 1-step Bures-Wasserstein McWeeny purification $\\rho \\leftarrow \\rho^2 / \\operatorname{Tr}(\\rho^2)$
-     and per-head $U(16)$ unitary evolution, seeds a 2-step Lanczos-Krylov recursion with the contextual
-     first-moment ket $|\\bar{v}_{t,h}\\rangle$ and locks the Uhlmann parallel-transport phase
-     $\\langle \\bar{v}_{t,h} \\mid \\phi_{1,t,h}\\rangle \\in \\mathbb{R}_{\\ge 0}$.
-   - Concatenates the unit-isometric-scale purified density $\\tilde{P}(\\rho_{\\text{out}}) \\in \\mathbb{R}^{256}$
-     with both scaled Krylov eigenmodes $[\\sqrt{\\lambda_1}\\phi_1, \\sqrt{\\lambda_2}\\phi_2] \\in \\mathbb{R}^{64}$
-     (`320` dims/head, `1,920` total across 6 heads) into a single direct Stiefel readout
-     $W_{\\text{obs}} \\in \\text{St}(1920, 768)$ with scalar residual gain `obs_scale`.
-3. **Tikhonov-Damped `RiemannianStiefelMuon` Across All 2D Stiefel & 3D $U(16)$ Layers**:
-   - Updates 100% of 2D real Stiefel matrices and 3D complex head unitaries using Tikhonov-damped
-     Newton-Schulz orthogonalization ($\\lambda_{\\text{tik}} = 10^{-3}$) and $1 / \\sqrt{1 + \\eta^2}$
-     geodesic retraction.
-4. **Active-Token Vocabulary Manifold Optimization & Rank-2 Krylov Born Readout**:
-   - Supports `BatchSubspaceTikhonovGramMuon` (`(Q, N_act, A)` feature-Gram Muon on $\\sqrt{d}\\,\\mathbb{S}^{d-1}$),
-     `RiemannianSphereTangentSNROptimizer`, and `AdamW` across `RANK2_KRYLOV_BORN` (`Rank2KrylovBornChunkedCEFn`,
-     Rule-9 single-pass chunked autograd) and `SOFTCAP_LINEAR_CE` (`_CompiledChunkedSoftcapLinearCEFn`).
+(Pages 1-36) into a 100% standalone, end-to-end differentiable language model (`StandaloneQuantumBornGPT`):
+1. Fused `288`-Width Isometric Density + First-Moment Ket Attention Packing.
+2. Uhlmann Phase-Locked Rank-2 Lanczos-Krylov Eigenpair Extraction (`320`-Dim/Head Readout).
+3. Tikhonov-Damped `RiemannianStiefelMuon` Across All 2D Stiefel & 3D $U(16)$ Layers.
+4. Active-Token Vocabulary Manifold Optimization & Rank-2 Krylov Born Readout.
 """
 
 from __future__ import annotations
@@ -885,6 +865,7 @@ class StandaloneRiemannianOptimizerBundle:
         self.wte_opt = wte_opt
         self.head_opt = head_opt
         self._base_scalar_lrs = [float(g["lr"]) for g in self.scalar_opt.param_groups]
+        self.scalar_post_step_hook: Any = None
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Clear gradients across all underlying optimizers."""
@@ -909,6 +890,8 @@ class StandaloneRiemannianOptimizerBundle:
         for base_lr, group in zip(self._base_scalar_lrs, self.scalar_opt.param_groups):
             group["lr"] = base_lr * float(lr_scale)
         self.scalar_opt.step()
+        if self.scalar_post_step_hook is not None:
+            self.scalar_post_step_hook()
 
         if self.wte_opt is not None and idx is not None:
             idx_in = torch.unique(idx.reshape(-1))
@@ -919,8 +902,7 @@ class StandaloneRiemannianOptimizerBundle:
         if self.head_opt is not None:
             if idx is not None and targets is not None:
                 act_ids = torch.unique(torch.cat([idx.reshape(-1), targets.reshape(-1)]))
-                self.head_opt.step_active(act_ids, lr_scale=lr_scale * 0.75)
-                self.head_opt.step_full(lr_scale=lr_scale * 0.25)
+                self.head_opt.step_full(lr_scale=lr_scale, active_idx=act_ids)
             else:
                 self.head_opt.step_full(lr_scale=lr_scale)
 
