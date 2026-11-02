@@ -300,6 +300,11 @@ class BatchSubspaceTikhonovGramMuon(torch.optim.Optimizer):
         }
         super().__init__(params, defaults)
 
+    def set_momentum(self, beta: float) -> None:
+        """Update active sphere tangent momentum coefficient `beta` across all parameter groups."""
+        for group in self.param_groups:
+            group["beta"] = float(beta)
+
     @torch.no_grad()
     def step_active(
         self,
@@ -430,6 +435,11 @@ class RiemannianSphereTangentSNROptimizer(torch.optim.Optimizer):
             "snr_tau": float(snr_tau),
         }
         super().__init__(params, defaults)
+
+    def set_momentum(self, beta: float) -> None:
+        """Update active sphere tangent momentum coefficient `beta` across all parameter groups."""
+        for group in self.param_groups:
+            group["beta"] = float(beta)
 
     @torch.no_grad()
     def step_active(

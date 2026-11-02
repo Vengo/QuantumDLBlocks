@@ -411,6 +411,11 @@ class ModularRiemannianStiefelKrausMuon(torch.optim.Optimizer):
         for group in self.param_groups:
             group["lr_mult"] = float(lr_mult)
 
+    def set_momentum(self, beta: float) -> None:
+        """Update Riemannian tangent momentum coefficient `beta` across all parameter groups."""
+        for group in self.param_groups:
+            group["beta"] = float(beta)
+
     def get_last_step_diagnostics(self) -> dict[str, float]:
         """Return the most recent parameter-gradient / momentum / retraction vector diagnostics."""
         return dict(self._last_step_diagnostics)
@@ -518,7 +523,7 @@ class ModularRiemannianStiefelKrausMuon(torch.optim.Optimizer):
                 self._last_step_diagnostics["unitary_pre_mom_normal_frac"] = float((mn_norm / m_tot).mean().item())
             if self.momentum_mode != StiefelMomentumMode.EUCLIDEAN_AMBIENT:
                 riemannian_complex_tangent_transport_muon_step(
-                    ur_cat, ui_cat, gr_cat, gi_cat, mr_cat, mi_cat, lr=unitary_lr, momentum_mode=self.momentum_mode
+                    ur_cat, ui_cat, gr_cat, gi_cat, mr_cat, mi_cat, lr=(unitary_lr, beta), momentum_mode=self.momentum_mode
                 )
             elif ur_cat.size(-2) == ur_cat.size(-1):
                 riemannian_complex_unitary_muon_step(

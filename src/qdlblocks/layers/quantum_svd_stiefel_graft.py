@@ -15,6 +15,7 @@ Implements **Wave 52D** (`Axes K, L, M`) for Surgical Quantum Front-End Grafting
 from __future__ import annotations
 
 from enum import Enum
+import math
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..models.compiled_leaderboard_classical_gpt import apply_native_leaderboard_rotary
+from ..models.compiled_leaderboard_classical_gpt import (
+    DEFAULT_BOS_TOKEN_ID,
+    apply_native_leaderboard_rotary,
+)
 from .impure_density_mirror_block import TRACE_NORM_EPS, initialize_stiefel_parameter
 from .quantum_statmech_channels import QuantumChannelMode
 from .wavepacket_statmech_block import DEFAULT_PPMI_ORTHO_SEED
@@ -39,6 +43,9 @@ DEFAULT_SVD_STIEFEL_OBS_SCALE_MIN: float = 0.02
 DEFAULT_SVD_STIEFEL_OBS_SCALE_MAX: float = 5.00
 DEFAULT_CALIBRATED_LAMBDA_BOUND: float = 30.0
 DEFAULT_PARTIAL_KEY_SHIFT_HALF: int = 64
+DEFAULT_WSD_COOLDOWN_FRAC: float = 0.35
+DEFAULT_WSD_MIN_LR_RATIO: float = 0.08
+DEFAULT_COLD_START_OBS_SCALE_INIT: float = 0.25
 
 
 class QuantumStiefelProjMode(str, Enum):
@@ -66,6 +73,75 @@ class QuantumQKPhaseMode(str, Enum):
 
     STANDARD_REAL_DOT = "standard_real_dot"
     BERRY_PHASE_COMPLEX_QK = "berry_phase_complex_qk"
+
+
+class QuantumDocSWCMode(str, Enum):
+    """Axis U enum selecting full-1024 causal vs. Document-Boundary Sliding-Window Causal mask (Rule 3)."""
+
+    FULL_CAUSAL_1024 = "full_causal_1024"
+    TEACHER_DOC_SWC_MASK = "teacher_doc_swc_mask"
+
+
+class QuantumDepthLRMode(str, Enum):
+    """Axis V enum selecting uniform flat-then-cosine vs. depth-scaled/unscaled warmup-cosine or WSD cooldown schedule (Rule 3)."""
+
+    UNIFORM_FLAT_THEN_COSINE = "uniform_flat_then_cosine"
+    DEPTH_SQRT_WARMUP_COSINE = "depth_sqrt_warmup_cosine"
+    WARMUP_COSINE_UNSCALED = "warmup_cosine_unscaled"
+    DEPTH_SQRT_WARMUP_WSD_COOLDOWN = "depth_sqrt_warmup_wsd_cooldown"
+
+
+def build_doc_swc_sdpa_masks(
+    idx: torch.Tensor,
+    long_win: int,
+    short_win: int,
+    final_win: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Construct `(mask_long, mask_short, mask_final)` of shape `(B, 1, T, T)` for Document-Boundary SWC SDPA (`<= 8` args)."""
+    _, seq_len = idx.shape
+    docs = (idx == DEFAULT_BOS_TOKEN_ID).cumsum(dim=1)
+    q_pos = torch.arange(seq_len, device=idx.device).view(1, seq_len, 1)
+    k_pos = torch.arange(seq_len, device=idx.device).view(1, 1, seq_len)
+    delta = q_pos - k_pos
+    causal_same_doc = (delta >= 0) & (docs.unsqueeze(2) == docs.unsqueeze(1))
+    mask_long = (causal_same_doc & (delta < int(long_win))).unsqueeze(1)
+    mask_short = (causal_same_doc & (delta < int(short_win))).unsqueeze(1)
+    mask_final = (causal_same_doc & (delta < int(final_win))).unsqueeze(1)
+    return mask_long, mask_short, mask_final
+
+
+def compute_depth_lr_scale(n_sublayers: int) -> float:
+    r"""Compute depth geodesic trust-region factor $\gamma_{\text{depth}}(N_{\text{sub}}) = 1 / \sqrt{\max(1, N_{\text{sub}} / 2)}$."""
+    return 1.0 / math.sqrt(max(1.0, float(n_sublayers) / 2.0))
+
+
+def compute_quantum_backbone_lr_multiplier(
+    step: int,
+    total_steps: int,
+    depth_lr_mode: QuantumDepthLRMode = QuantumDepthLRMode.DEPTH_SQRT_WARMUP_COSINE,
+) -> float:
+    """Compute step learning-rate multiplier for `UNIFORM_FLAT_THEN_COSINE`, `DEPTH_SQRT_WARMUP_COSINE`, or `DEPTH_SQRT_WARMUP_WSD_COOLDOWN`."""
+    t_tot = max(1, int(total_steps))
+    s_cur = max(1, min(int(step), t_tot))
+    mode = QuantumDepthLRMode(depth_lr_mode)
+    if mode == QuantumDepthLRMode.UNIFORM_FLAT_THEN_COSINE:
+        progress = float(s_cur - 1) / float(t_tot)
+        if progress < 0.70:
+            return 1.0
+        return 0.15 + 0.85 * 0.5 * (1.0 + math.cos(math.pi * (progress - 0.70) / 0.30))
+    t_warm = max(1, int(0.10 * float(t_tot)))
+    if s_cur <= t_warm:
+        if t_warm == 1:
+            return 1.0
+        return 0.10 + 0.90 * (float(s_cur - 1) / float(t_warm - 1))
+    if mode == QuantumDepthLRMode.DEPTH_SQRT_WARMUP_WSD_COOLDOWN:
+        t_stable = max(t_warm, int(round((1.0 - DEFAULT_WSD_COOLDOWN_FRAC) * float(t_tot))))
+        if s_cur <= t_stable:
+            return 1.0
+        cool_prog = float(s_cur - t_stable) / float(max(1, t_tot - t_stable))
+        return 1.0 - (1.0 - DEFAULT_WSD_MIN_LR_RATIO) * min(1.0, max(0.0, cool_prog))
+    rem = float(s_cur - t_warm) / float(max(1, t_tot - t_warm))
+    return 0.10 + 0.90 * 0.5 * (1.0 + math.cos(math.pi * rem))
 
 
 def apply_berry_qk_phase(q_rot: torch.Tensor, berry_phase_hrd: torch.Tensor) -> torch.Tensor:
@@ -317,7 +393,7 @@ class BiorthogonalSVDStiefelProjection(nn.Module):
                 wt = torch.matmul(b_cpu if b_cpu.size(0) == self.d_out else b_cpu.t(), wt)
             else:
                 wt = torch.matmul(wt, b_cpu.t() if b_cpu.size(0) == self.d_in else b_cpu)
-        u_svd, s_svd, vh_svd = torch.linalg.svd(wt.double(), full_matrices=False)
+        u_svd, s_svd, vh_svd = torch.linalg.svd(wt.float(), full_matrices=False)
         r = self.rank
         self.u_stiefel.copy_(u_svd[:, :r].contiguous().to(device=self.u_stiefel.device, dtype=self.u_stiefel.dtype))
         self.sigma.copy_(s_svd[:r].contiguous().to(device=self.sigma.device, dtype=self.sigma.dtype))
@@ -378,6 +454,16 @@ class SVDStiefelWavepacketStatMechBlock(nn.Module):
         self.self_ortho_mode = QuantumSelfOrthoMode(self_ortho_mode)
         self.qk_phase_mode = QuantumQKPhaseMode(qk_phase_mode)
         self.gate_in_ch = min(int(gate_in_ch), self.d_model)
+        self.layer_idx: int = 0
+        self.is_long_window_layer: bool = True
+        self.ket_amplitude_mode: str = "entropy_preserving_coherent_ket"
+        self.attn_kernel_mode: str = "expanded_sdpa_chunks"
+        self.use_partial_key_offset: bool = True
+        self.sdpa_scale: float = 0.22
+        self.ve_part_ch: int = 6
+        self.q_ve_gate: nn.Linear | None = None
+        self.rho_coupling_scale = nn.Parameter(torch.tensor(0.25, dtype=torch.float32), requires_grad=False)
+        self.qk_born_beta = nn.Parameter(torch.zeros(self.num_heads, dtype=torch.float32), requires_grad=False)
 
         r_qkv = resolve_svd_stiefel_rank(self.proj_mode, self.d_model, self.d_emb)
         r_obs = resolve_svd_stiefel_rank(self.proj_mode, self.d_emb, self.d_model)
@@ -420,6 +506,10 @@ class SVDStiefelWavepacketStatMechBlock(nn.Module):
         w_in_bridge: torch.Tensor | None = None,
     ) -> None:
         """Calibrate SVD-Stiefel projections, `block_lambdas`, `sa_lambdas`, `q_xsa_alpha`, and `q_attn_gate` from `teacher_blk0`."""
+        self.layer_idx = int(getattr(teacher_blk0, "layer_idx", 0))
+        self.is_long_window_layer = bool(getattr(teacher_blk0, "is_long_window_layer", True))
+        self.use_partial_key_offset = bool(getattr(teacher_blk0, "use_partial_key_offset", True))
+        self.sdpa_scale = float(getattr(teacher_blk0, "attn_scale", 0.12))
         if teacher_blk0.qkv_proj is not None and teacher_blk0.out_proj is not None:
             wq, wk, wv = teacher_blk0.qkv_proj.weight.detach().float().chunk(3, dim=0)
             wout = teacher_blk0.out_proj.weight.detach().float()
@@ -438,6 +528,39 @@ class SVDStiefelWavepacketStatMechBlock(nn.Module):
             self.q_attn_gate.weight.copy_(
                 gw_rs.to(device=self.q_attn_gate.weight.device, dtype=self.q_attn_gate.weight.dtype)
             )
+        if getattr(teacher_blk0, "ve_gate", None) is not None:
+            self.ve_part_ch = int(getattr(teacher_blk0, "ve_part_ch", 6))
+            self.q_ve_gate = nn.Linear(2 * self.ve_part_ch, self.num_heads, bias=False).to(
+                device=self.q_attn_gate.weight.device, dtype=self.q_attn_gate.weight.dtype
+            )
+            vw_rs = interpolate_head_vector(teacher_blk0.ve_gate.weight, self.num_heads)
+            self.q_ve_gate.weight.copy_(vw_rs.to(device=self.q_ve_gate.weight.device, dtype=self.q_ve_gate.weight.dtype))
+        else:
+            self.q_ve_gate = None
+
+    @torch.no_grad()
+    def calibrate_cold_start_block_(self, structural_blk: Any) -> None:
+        """Configure structural metadata (`layer_idx`, window flags, zero gates, unit `sigma`) for cold-start from-scratch training."""
+        self.layer_idx = int(getattr(structural_blk, "layer_idx", 0))
+        self.is_long_window_layer = bool(getattr(structural_blk, "is_long_window_layer", True))
+        self.use_partial_key_offset = bool(getattr(structural_blk, "use_partial_key_offset", True))
+        self.sdpa_scale = float(getattr(structural_blk, "attn_scale", 0.12))
+        self.block_lambdas.copy_(structural_blk.block_lambdas.detach().to(self.block_lambdas.dtype))
+        if getattr(structural_blk, "sa_lambdas", None) is not None:
+            self.sa_lambdas.copy_(structural_blk.sa_lambdas.detach().to(self.sa_lambdas.dtype))
+        self.q_xsa_alpha.zero_()
+        self.q_attn_gate.weight.zero_()
+        self.obs_scale.fill_(DEFAULT_COLD_START_OBS_SCALE_INIT)
+        for proj in (self.q_proj, self.k_proj, self.v_proj, self.obs_proj):
+            proj.sigma.fill_(1.0)
+        if getattr(structural_blk, "ve_gate", None) is not None:
+            self.ve_part_ch = int(getattr(structural_blk, "ve_part_ch", 6))
+            self.q_ve_gate = nn.Linear(2 * self.ve_part_ch, self.num_heads, bias=False).to(
+                device=self.q_attn_gate.weight.device, dtype=self.q_attn_gate.weight.dtype
+            )
+            self.q_ve_gate.weight.zero_()
+        else:
+            self.q_ve_gate = None
 
     def real_stiefel_parameters(self) -> list[nn.Parameter]:
         """Return all 8 tall column-orthonormal Stiefel matrices from `(q_proj, k_proj, v_proj, obs_proj)`."""
@@ -457,13 +580,21 @@ class SVDStiefelWavepacketStatMechBlock(nn.Module):
             params.extend(proj.scalar_parameters())
         params.extend(self.core_block.scalar_parameters())
         params.append(self.sa_lambdas)
+        if self.rho_coupling_scale.requires_grad:
+            params.append(self.rho_coupling_scale)
         if self.q_xsa_alpha.requires_grad:
             params.append(self.q_xsa_alpha)
         if self.berry_qk_phase.requires_grad:
             params.append(self.berry_qk_phase)
+        if self.qk_born_beta.requires_grad:
+            params.append(self.qk_born_beta)
         for p in self.q_attn_gate.parameters():
             if p.requires_grad:
                 params.append(p)
+        if self.q_ve_gate is not None:
+            for p in self.q_ve_gate.parameters():
+                if p.requires_grad:
+                    params.append(p)
         return params
 
     @torch.no_grad()
@@ -472,10 +603,12 @@ class SVDStiefelWavepacketStatMechBlock(nn.Module):
         for proj in (self.q_proj, self.k_proj, self.v_proj, self.obs_proj):
             proj.clamp_sigma_()
         self.obs_scale.clamp_(DEFAULT_SVD_STIEFEL_OBS_SCALE_MIN, DEFAULT_SVD_STIEFEL_OBS_SCALE_MAX)
+        self.rho_coupling_scale.clamp_(0.002, 1.00)
         self.block_lambdas.clamp_(-DEFAULT_CALIBRATED_LAMBDA_BOUND, DEFAULT_CALIBRATED_LAMBDA_BOUND)
         self.sa_lambdas.clamp_(-5.0, 5.0)
         self.q_xsa_alpha.clamp_(-4.0, 4.0)
         self.berry_qk_phase.clamp_(-3.1416, 3.1416)
+        self.qk_born_beta.clamp_(-1.50, 1.50)
         if hasattr(self.core_block, "dm_res_mix"):
             self.core_block.dm_res_mix.clamp_(0.01, 1.00)
         if hasattr(self.core_block, "dm_lag_mix"):
@@ -521,7 +654,7 @@ class SVDStiefelWavepacketStatMechBlock(nn.Module):
         if self.qk_phase_mode == QuantumQKPhaseMode.BERRY_PHASE_COMPLEX_QK:
             q_rot = apply_berry_qk_phase(q_rot, self.berry_qk_phase)
         k_rot = apply_native_leaderboard_rotary(k_heads, cos_4d, sin_4d)
-        if seq_len > 1 and self.head_dim == 2 * DEFAULT_PARTIAL_KEY_SHIFT_HALF:
+        if self.use_partial_key_offset and seq_len > 1 and self.head_dim == 2 * DEFAULT_PARTIAL_KEY_SHIFT_HALF:
             d_half = DEFAULT_PARTIAL_KEY_SHIFT_HALF
             k_shifted = torch.cat([k_rot[:, :1, :, d_half:], k_rot[:, :-1, :, d_half:]], dim=1)
             k_rot = torch.cat([k_rot[..., :d_half], k_shifted], dim=-1)
@@ -681,7 +814,12 @@ def compute_teacher_layer1_target(
 
 __all__ = [
     "BiorthogonalSVDStiefelProjection",
+    "DEFAULT_COLD_START_OBS_SCALE_INIT",
     "DEFAULT_SVD_STIEFEL_OBS_SCALE_INIT",
+    "DEFAULT_WSD_COOLDOWN_FRAC",
+    "DEFAULT_WSD_MIN_LR_RATIO",
+    "QuantumDepthLRMode",
+    "QuantumDocSWCMode",
     "QuantumQKPhaseMode",
     "QuantumSelfOrthoMode",
     "QuantumStiefelProjMode",
@@ -690,7 +828,10 @@ __all__ = [
     "apply_boundary_stiefel_bridge",
     "apply_fubini_study_self_ortho",
     "apply_interior_rho_v_coupling",
+    "build_doc_swc_sdpa_masks",
+    "compute_depth_lr_scale",
     "compute_liouville_commutator",
+    "compute_quantum_backbone_lr_multiplier",
     "compute_teacher_layer1_target",
     "encode_svd_stiefel_layer0",
     "encode_svd_stiefel_layer1",

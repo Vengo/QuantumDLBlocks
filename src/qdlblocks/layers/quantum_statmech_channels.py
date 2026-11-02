@@ -58,6 +58,13 @@ DEFAULT_TSALLIS_PURITY_CENTER: float = 0.35
 DEFAULT_COLUMN_SCALE_LR_RATIO: float = 1.00
 DEFAULT_COLUMN_SCALE_MIN: float = 0.50
 DEFAULT_COLUMN_SCALE_MAX: float = 2.00
+DEFAULT_STIEFEL_SNR_TRUST_TAU: float = 0.35
+DEFAULT_MOM_FIXED_HIGH_BETA: float = 0.90
+DEFAULT_MOM_WARMUP_ZERO_FRAC: float = 0.10
+DEFAULT_MOM_WARMUP_END_FRAC: float = 0.375
+DEFAULT_MOM_MODDED_START_BETA: float = 0.50
+DEFAULT_MOM_MODDED_END_BETA: float = 0.92
+DEFAULT_MOM_LOW_STEADY_BETA: float = 0.70
 
 
 class PurificationMode(str, Enum):
@@ -85,13 +92,53 @@ class EntropyGateMode(str, Enum):
 
 
 class StiefelMomentumMode(str, Enum):
-    """Strategy enum selecting ambient Euclidean, tangent-transported, column-scaled, or unnormalized-boundary momentum (Rule 3)."""
+    """Strategy enum selecting ambient Euclidean, tangent-transported, SNR-gated, or column-scaled momentum (Rule 3)."""
 
     EUCLIDEAN_AMBIENT = "euclidean_ambient"
     RIEMANNIAN_TANGENT_TRANSPORTED = "riemannian_tangent_transported"
+    RIEMANNIAN_TANGENT_SNR_GATED = "riemannian_tangent_snr_gated"
     RIEMANNIAN_COLUMN_SCALED_STIEFEL = "riemannian_column_scaled_stiefel"
     UNNORMALIZED_FINAL_READOUT_HEAD = "unnormalized_final_readout_head"
     UNNORMALIZED_FINAL_BLOCK_AND_HEAD = "unnormalized_final_block_and_head"
+
+
+class QuantumMomentumScheduleMode(str, Enum):
+    """Axis X strategy enum selecting fixed vs. warmup Riemannian momentum schedules (Rule 3, `EXPERIMENT_PLAN_075.md`)."""
+
+    FIXED_HIGH_MOMENTUM_090 = "fixed_high_momentum_090"
+    ZERO_EARLY_TO_WARMUP_090 = "zero_early_to_warmup_090"
+    MODERATE_WARMUP_050_TO_092 = "moderate_warmup_050_to_092"
+    LOW_STEADY_MOMENTUM_070 = "low_steady_momentum_070"
+
+
+def compute_riemannian_momentum_beta(
+    step: int,
+    total_steps: int,
+    mode: QuantumMomentumScheduleMode = QuantumMomentumScheduleMode.FIXED_HIGH_MOMENTUM_090,
+) -> float:
+    """Compute step-dependent Riemannian momentum coefficient `beta_t` for `step` in `1..total_steps` (`<= 8` args)."""
+    sched = QuantumMomentumScheduleMode(mode)
+    if sched == QuantumMomentumScheduleMode.FIXED_HIGH_MOMENTUM_090:
+        return DEFAULT_MOM_FIXED_HIGH_BETA
+    t_tot = max(1, int(total_steps))
+    s_cur = max(1, min(int(step), t_tot))
+    tau = float(s_cur - 1) / float(max(1, t_tot - 1))
+    if sched == QuantumMomentumScheduleMode.ZERO_EARLY_TO_WARMUP_090:
+        if tau < DEFAULT_MOM_WARMUP_ZERO_FRAC:
+            return 0.0
+        if tau >= DEFAULT_MOM_WARMUP_END_FRAC:
+            return DEFAULT_MOM_FIXED_HIGH_BETA
+        span = max(1e-6, DEFAULT_MOM_WARMUP_END_FRAC - DEFAULT_MOM_WARMUP_ZERO_FRAC)
+        return DEFAULT_MOM_FIXED_HIGH_BETA * ((tau - DEFAULT_MOM_WARMUP_ZERO_FRAC) / span)
+    if sched == QuantumMomentumScheduleMode.MODERATE_WARMUP_050_TO_092:
+        if tau >= DEFAULT_MOM_WARMUP_END_FRAC:
+            return DEFAULT_MOM_MODDED_END_BETA
+        return DEFAULT_MOM_MODDED_START_BETA + (DEFAULT_MOM_MODDED_END_BETA - DEFAULT_MOM_MODDED_START_BETA) * (
+            tau / max(1e-6, DEFAULT_MOM_WARMUP_END_FRAC)
+        )
+    if tau >= 0.25:
+        return DEFAULT_MOM_LOW_STEADY_BETA
+    return DEFAULT_MOM_LOW_STEADY_BETA * (tau / 0.25)
 
 
 _COL_SCALED_STIEFEL_MODES = (
@@ -460,17 +507,35 @@ def riemannian_stiefel_tangent_transport_muon_step(
             / float(w_unit.size(-1))
         ).sqrt().clamp_min(TRACE_NORM_EPS)
         u_s_unit = u_s_raw / col_fro_scale
-    elif momentum_mode == StiefelMomentumMode.RIEMANNIAN_TANGENT_TRANSPORTED:
+    elif momentum_mode in (
+        StiefelMomentumMode.RIEMANNIAN_TANGENT_TRANSPORTED,
+        StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_GATED,
+    ):
         w_unit = w_f32
         g_tan = project_real_stiefel_tangent(g_clean, w_unit)
         m_prev_tan = project_real_stiefel_tangent(m_f32, w_unit)
-        m_updated = float(beta) * m_prev_tan + g_tan
-        m_tan = g_tan + float(beta) * m_updated
+        if momentum_mode == StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_GATED:
+            g_sq = g_tan.square().sum(dim=(-2, -1), keepdim=True).clamp_min(TRACE_NORM_EPS)
+            m_sq = m_prev_tan.square().sum(dim=(-2, -1), keepdim=True)
+            dot_mg = (m_prev_tan * g_tan).sum(dim=(-2, -1), keepdim=True)
+            m_prev_clean = m_prev_tan - torch.clamp_max(dot_mg / g_sq, 0.0) * g_tan
+            m_updated = float(beta) * m_prev_clean + g_tan
+            m_tan = g_tan + float(beta) * m_updated
+            g_n, m_n = g_sq.sqrt(), m_sq.sqrt()
+            cos_mg = dot_mg / (m_n * g_n + TRACE_NORM_EPS)
+            coh = m_updated.norm(dim=(-2, -1), keepdim=True) / (float(beta) * m_n + g_n + TRACE_NORM_EPS)
+            snr_tan = (coh * (1.0 + 0.5 * cos_mg)).clamp(0.05, 1.50)
+            step_lr: torch.Tensor | float = float(lr) * (snr_tan / (snr_tan + DEFAULT_STIEFEL_SNR_TRUST_TAU))
+        else:
+            m_updated = float(beta) * m_prev_tan + g_tan
+            m_tan = g_tan + float(beta) * m_updated
+            step_lr = float(lr)
     else:
         w_unit = w_f32
         m_updated = float(beta) * m_f32 + g_clean
         g_nest = g_clean + float(beta) * m_updated
         m_tan = project_real_stiefel_tangent(g_nest, w_unit)
+        step_lr = float(lr)
 
     cols = w_unit.size(-1)
     u_raw = _newton_schulz5_tall_real(m_tan, steps=ns_steps, tikhonov_lambda=tikhonov_lambda)
@@ -479,8 +544,11 @@ def riemannian_stiefel_tangent_transport_muon_step(
         u_raw = 0.5 * torch.matmul(u_raw, 3.0 * eye_c - torch.matmul(u_raw.transpose(-2, -1), u_raw))
     u_tan = project_real_stiefel_tangent(u_raw, w_unit)
 
-    retract_scale = 1.0 / math.sqrt(1.0 + float(lr) * float(lr))
-    w_unit_next = (w_unit - float(lr) * u_tan) * retract_scale
+    if isinstance(step_lr, torch.Tensor):
+        retract_scale: torch.Tensor | float = torch.rsqrt(1.0 + step_lr * step_lr)
+    else:
+        retract_scale = 1.0 / math.sqrt(1.0 + float(step_lr) * float(step_lr))
+    w_unit_next = (w_unit - step_lr * u_tan) * retract_scale
     eye_f32 = torch.eye(cols, device=w_unit_next.device, dtype=w_unit_next.dtype)
     w_unit_next = 0.5 * torch.matmul(
         w_unit_next, 3.0 * eye_f32 - torch.matmul(w_unit_next.transpose(-2, -1), w_unit_next)
@@ -497,7 +565,10 @@ def riemannian_stiefel_tangent_transport_muon_step(
         s_next_sq = s_next.square().sum(dim=-1, keepdim=True).clamp_min(TRACE_NORM_EPS)
         m_s_stored = m_s_updated - (m_s_updated * s_next).sum(dim=-1, keepdim=True) / s_next_sq * s_next
         m_stored = project_real_stiefel_tangent(m_updated, w_unit_next) + w_unit_next * m_s_stored
-    elif momentum_mode == StiefelMomentumMode.RIEMANNIAN_TANGENT_TRANSPORTED:
+    elif momentum_mode in (
+        StiefelMomentumMode.RIEMANNIAN_TANGENT_TRANSPORTED,
+        StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_GATED,
+    ):
         w_next = w_unit_next
         m_stored = project_real_stiefel_tangent(m_updated, w_next)
     else:
@@ -577,21 +648,41 @@ def riemannian_complex_tangent_transport_muon_step(
     grad_im: torch.Tensor,
     mom_re: torch.Tensor,
     mom_im: torch.Tensor,
-    lr: float = DEFAULT_UNITARY_GEODESIC_LR,
+    lr: float | tuple[float, float] = DEFAULT_UNITARY_GEODESIC_LR,
     momentum_mode: StiefelMomentumMode = StiefelMomentumMode.EUCLIDEAN_AMBIENT,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Execute 1 batched Complex Unitary/Stiefel Muon step supporting `EUCLIDEAN_AMBIENT` vs. `RIEMANNIAN_TANGENT_TRANSPORTED` (`<= 8` args)."""
+    """Execute 1 batched Complex Unitary/Stiefel Muon step supporting `EUCLIDEAN_AMBIENT`, `RIEMANNIAN_TANGENT_TRANSPORTED`, and `RIEMANNIAN_TANGENT_SNR_GATED` (`<= 8` args)."""
     g_in_re = torch.nan_to_num(grad_re.float(), nan=0.0, posinf=0.0, neginf=0.0)
     g_in_im = torch.nan_to_num(grad_im.float(), nan=0.0, posinf=0.0, neginf=0.0)
     ar = a_re.float()
     ai = a_im.float()
-    beta = DEFAULT_RIEMANNIAN_MOMENTUM_BETA
+    if isinstance(lr, tuple):
+        eff_lr, beta = float(lr[0]), float(lr[1])
+    else:
+        eff_lr, beta = float(lr), DEFAULT_RIEMANNIAN_MOMENTUM_BETA
 
+    step_lr: torch.Tensor | float = eff_lr
     if momentum_mode != StiefelMomentumMode.EUCLIDEAN_AMBIENT:
         g_tan_re, g_tan_im = project_complex_stiefel_tangent(g_in_re, g_in_im, ar, ai)
         m_pre_tan_re, m_pre_tan_im = project_complex_stiefel_tangent(mom_re.float(), mom_im.float(), ar, ai)
-        mom_re.copy_(float(beta) * m_pre_tan_re + g_tan_re)
-        mom_im.copy_(float(beta) * m_pre_tan_im + g_tan_im)
+        if momentum_mode == StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_GATED:
+            g_sq = (g_tan_re.square() + g_tan_im.square()).sum(dim=(-2, -1), keepdim=True).clamp_min(TRACE_NORM_EPS)
+            m_sq = (m_pre_tan_re.square() + m_pre_tan_im.square()).sum(dim=(-2, -1), keepdim=True)
+            dot_mg = (m_pre_tan_re * g_tan_re + m_pre_tan_im * g_tan_im).sum(dim=(-2, -1), keepdim=True)
+            neg_proj = torch.clamp_max(dot_mg / g_sq, 0.0)
+            m_pre_clean_re = m_pre_tan_re - neg_proj * g_tan_re
+            m_pre_clean_im = m_pre_tan_im - neg_proj * g_tan_im
+            mom_re.copy_(float(beta) * m_pre_clean_re + g_tan_re)
+            mom_im.copy_(float(beta) * m_pre_clean_im + g_tan_im)
+            g_n, m_n = g_sq.sqrt(), m_sq.sqrt()
+            m_upd_n = (mom_re.float().square() + mom_im.float().square()).sum(dim=(-2, -1), keepdim=True).sqrt()
+            cos_mg = dot_mg / (m_n * g_n + TRACE_NORM_EPS)
+            coh = m_upd_n / (float(beta) * m_n + g_n + TRACE_NORM_EPS)
+            snr_tan = (coh * (1.0 + 0.5 * cos_mg)).clamp(0.05, 1.50)
+            step_lr = eff_lr * (snr_tan / (snr_tan + DEFAULT_STIEFEL_SNR_TRUST_TAU))
+        else:
+            mom_re.copy_(float(beta) * m_pre_tan_re + g_tan_re)
+            mom_im.copy_(float(beta) * m_pre_tan_im + g_tan_im)
         g_re = g_tan_re + float(beta) * mom_re.float()
         g_im = g_tan_im + float(beta) * mom_im.float()
     else:
@@ -604,9 +695,12 @@ def riemannian_complex_tangent_transport_muon_step(
     z_re, z_im = _complex_newton_schulz5(t_re, t_im, steps=DEFAULT_NS5_STEPS, tikhonov_lambda=DEFAULT_TIKHONOV_GRAM_LAMBDA)
     tan_re, tan_im = project_complex_stiefel_tangent(z_re, z_im, ar, ai)
 
-    scale = 1.0 / math.sqrt(1.0 + float(lr) * float(lr))
-    nx_re = (ar - float(lr) * tan_re) * scale
-    nx_im = (ai - float(lr) * tan_im) * scale
+    if isinstance(step_lr, torch.Tensor):
+        scale: torch.Tensor | float = torch.rsqrt(1.0 + step_lr * step_lr)
+    else:
+        scale = 1.0 / math.sqrt(1.0 + float(step_lr) * float(step_lr))
+    nx_re = (ar - step_lr * tan_re) * scale
+    nx_im = (ai - step_lr * tan_im) * scale
 
     eye = torch.eye(ar.size(-1), device=ar.device, dtype=ar.dtype)
     gram_re = torch.matmul(nx_re.transpose(-2, -1), nx_re) + torch.matmul(nx_im.transpose(-2, -1), nx_im)
@@ -865,17 +959,25 @@ __all__ = [
     "DEFAULT_COLUMN_SCALE_MIN",
     "DEFAULT_KRAUS_CHANNEL_RANK",
     "DEFAULT_KRAUS_DOMINANT_WEIGHT",
+    "DEFAULT_MOM_LOW_STEADY_BETA",
+    "DEFAULT_MOM_MODDED_END_BETA",
+    "DEFAULT_MOM_MODDED_START_BETA",
+    "DEFAULT_MOM_WARMUP_END_FRAC",
+    "DEFAULT_MOM_WARMUP_ZERO_FRAC",
     "DEFAULT_STATMECH_MCWEENY_STEPS",
+    "DEFAULT_STIEFEL_SNR_TRUST_TAU",
     "DEFAULT_TSALLIS_PURITY_CENTER",
     "EntropyGateMode",
     "PurificationMode",
     "QuantumChannelMode",
+    "QuantumMomentumScheduleMode",
     "StiefelMomentumMode",
     "apply_detached_tsallis_entropy_gate",
     "causal_born_p3_weights",
     "causal_born_p3_weights_impl",
     "compiled_statmech_purify_evolve_uhlmann_krylov_step",
     "compute_real_stiefel_vector_diagnostics",
+    "compute_riemannian_momentum_beta",
     "cubic_fermi_dirac_purification_step",
     "evolve_head_cptp_kraus_functional",
     "evolve_head_unitary_functional",

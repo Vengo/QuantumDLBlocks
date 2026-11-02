@@ -82,7 +82,7 @@ DEFAULT_GRAFT_SCALAR_LR: float = 0.04
 
 
 class QuantumWavefunctionShape(str, Enum):
-    """Axis A & H enum selecting the token wavefunction factorization geometry (Rule 3)."""
+    """Axis A, H & Y enum selecting the token wavefunction factorization geometry (Rule 3)."""
 
     SHAPE_24x2x16 = "shape_24x2x16"
     SHAPE_1x2x256 = "shape_1x2x256"
@@ -90,6 +90,7 @@ class QuantumWavefunctionShape(str, Enum):
     SHAPE_256x2x2 = "shape_256x2x2"
     SHAPE_48x2x8 = "shape_48x2x8"
     SHAPE_12x2x32 = "shape_12x2x32"
+    SHAPE_6x2x64 = "shape_6x2x64"
     SHAPE_1x2x512_PKT32 = "shape_1x2x512_pkt32"
 
 
@@ -180,6 +181,8 @@ def resolve_wavefunction_shape_spec(wf_shape: QuantumWavefunctionShape) -> tuple
         return (96, 8, 768, 96, 8, 6)
     if shape_mode == QuantumWavefunctionShape.SHAPE_12x2x32:
         return (24, 32, 768, 24, 32, 6)
+    if shape_mode == QuantumWavefunctionShape.SHAPE_6x2x64:
+        return (12, 64, 768, 12, 64, 6)
     if shape_mode == QuantumWavefunctionShape.SHAPE_256x2x2:
         n_q, d_s = DEFAULT_QUBIT_SPINOR_COUNT, DEFAULT_QUBIT_SPHERE_DIM
         return (n_q, d_s, n_q * d_s, n_q, d_s, DEFAULT_QUBIT_HEADS)
@@ -568,7 +571,6 @@ class ConfigurableWavepacketStatMechBlock(_BaseQuantumGraftLayer0):
             u0_im = self.head_unitary_im.to(work_dtype).view(1, self.num_heads, 1, self.d_h, self.d_h)
 
         with torch.no_grad():
-            self._last_rho0_re_im = (rho0_re.detach(), rho0_im.detach())
             diag_evol = torch.diagonal(evol_re, dim1=-2, dim2=-1)
             lam1 = diag_evol.max(dim=-1).values.clamp(0.0, 1.0)
             self._last_telemetry_tensors = (
@@ -786,7 +788,7 @@ class FrozenTrunkQuantumFrontEndGPT(nn.Module):
             self.in_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
             wp_complex_modes = max(1, self.pkt_count // 2)
-            n_groups = max(1, wp_complex_modes // 4)
+            n_groups = max(1, (wp_complex_modes + 3) // 4)
             init_wp_re = torch.tensor([0.15, 0.10, 0.08, 0.05], dtype=torch.float32).repeat(n_groups)[:wp_complex_modes]
             init_wp_im = torch.tensor([0.00, 0.10, -0.08, 0.05], dtype=torch.float32).repeat(n_groups)[:wp_complex_modes]
             if self.graft_cfg.wte_init_mode == QuantumWteInitMode.TEACHER_PROCRUSTES_SPHERE:

@@ -36,8 +36,10 @@ class TailWeightAverager:
         every_n_steps: int | None = None,
         preserve_frobenius_norm: bool | None = None,
         spherical_param_patterns: tuple[str, ...] | None = None,
+        shadow_device: str | torch.device | None = None,
     ) -> None:
         self.model = model
+        self.shadow_device = torch.device(shadow_device) if shadow_device is not None else None
         self.start_frac = float(start_fraction if start_fraction is not None else start_frac)
         if beta is not None:
             self.ema_rate = 1.0 - float(beta)
@@ -104,12 +106,14 @@ class TailWeightAverager:
         params = self._named_trainable_params()
         if not self.is_seeded:
             for name, param in params:
-                self.shadow[name] = param.detach().float().clone()
+                t_dev = self.shadow_device if self.shadow_device is not None else param.device
+                self.shadow[name] = param.detach().to(device=t_dev, dtype=torch.float32).clone()
             self.num_updates = 1
             return True
 
         for name, param in params:
-            p_fp32 = param.detach().float()
+            t_dev = self.shadow_device if self.shadow_device is not None else param.device
+            p_fp32 = param.detach().to(device=t_dev, dtype=torch.float32)
             if name not in self.shadow:
                 self.shadow[name] = p_fp32.clone()
             else:
@@ -147,7 +151,8 @@ class TailWeightAverager:
             for name, param in params:
                 if name not in self.shadow:
                     continue
-                orig_data[name] = param.data.detach().clone()
+                b_dev = self.shadow_device if self.shadow_device is not None else param.device
+                orig_data[name] = param.data.detach().to(device=b_dev).clone()
                 w_cur = param.data.detach().float()
                 w_ema = self.shadow[name].to(device=w_cur.device, dtype=torch.float32)
                 w_blend = (1.0 - alpha) * w_cur + alpha * w_ema

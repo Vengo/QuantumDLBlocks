@@ -226,24 +226,31 @@ def apply_causal_wavepacket_dispersion(
     wp_causal_re: torch.Tensor,
     wp_causal_im: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply multi-lag causal complex wavepacket dispersion across $(H=6, R=4, 2, d_h=16)$ modes."""
+    """Apply multi-lag causal complex wavepacket dispersion across $(H, R, 2, d_h)$ modes."""
     bsz, seq_len, num_pkts, d_h = raw_wp.shape
     wp_complex_modes = max(1, num_pkts // 2)
-    n_groups = max(1, wp_complex_modes // 4)
-    wp_c = raw_wp.view(bsz, seq_len, n_groups, 4, 2, d_h)
-    ret_01 = F.pad(wp_c[:, :-1, :, :2], (0, 0, 0, 0, 0, 0, 0, 0, 1, 0))
-    ret_2 = (
-        F.pad(wp_c[:, :-2, :, 2:3], (0, 0, 0, 0, 0, 0, 0, 0, 2, 0))
-        if seq_len > 2
-        else torch.zeros_like(wp_c[:, :, :, 2:3])
-    )
-    ret_3 = (
-        F.pad(wp_c[:, :-3, :, 3:4], (0, 0, 0, 0, 0, 0, 0, 0, 3, 0))
-        if seq_len > 3
-        else torch.zeros_like(wp_c[:, :, :, 3:4])
-    )
-    ret_wp = torch.cat([ret_01, ret_2, ret_3], dim=3).view(bsz, seq_len, wp_complex_modes, 2, d_h)
-    cur_wp = wp_c.view(bsz, seq_len, wp_complex_modes, 2, d_h)
+    cur_wp = raw_wp.view(bsz, seq_len, wp_complex_modes, 2, d_h)
+    if wp_complex_modes % 4 == 0:
+        n_groups = wp_complex_modes // 4
+        wp_c = raw_wp.view(bsz, seq_len, n_groups, 4, 2, d_h)
+        ret_01 = F.pad(wp_c[:, :-1, :, :2], (0, 0, 0, 0, 0, 0, 0, 0, 1, 0))
+        ret_2 = (
+            F.pad(wp_c[:, :-2, :, 2:3], (0, 0, 0, 0, 0, 0, 0, 0, 2, 0))
+            if seq_len > 2
+            else torch.zeros_like(wp_c[:, :, :, 2:3])
+        )
+        ret_3 = (
+            F.pad(wp_c[:, :-3, :, 3:4], (0, 0, 0, 0, 0, 0, 0, 0, 3, 0))
+            if seq_len > 3
+            else torch.zeros_like(wp_c[:, :, :, 3:4])
+        )
+        ret_wp = torch.cat([ret_01, ret_2, ret_3], dim=3).view(bsz, seq_len, wp_complex_modes, 2, d_h)
+    else:
+        lag1 = F.pad(cur_wp[:, :-1], (0, 0, 0, 0, 0, 0, 1, 0))
+        lag2 = F.pad(cur_wp[:, :-2], (0, 0, 0, 0, 0, 0, 2, 0)) if seq_len > 2 else torch.zeros_like(cur_wp)
+        lag3 = F.pad(cur_wp[:, :-3], (0, 0, 0, 0, 0, 0, 3, 0)) if seq_len > 3 else torch.zeros_like(cur_wp)
+        m_mod = (torch.arange(wp_complex_modes, device=raw_wp.device) % 4).view(1, 1, wp_complex_modes, 1, 1)
+        ret_wp = torch.where(m_mod < 2, lag1, torch.where(m_mod == 2, lag2, lag3))
     g_re = torch.tanh(wp_causal_re).to(raw_wp.dtype).view(1, 1, wp_complex_modes, 1)
     g_im = torch.tanh(wp_causal_im).to(raw_wp.dtype).view(1, 1, wp_complex_modes, 1)
     out_re = cur_wp[..., 0, :] + g_re * ret_wp[..., 0, :] - g_im * ret_wp[..., 1, :]
