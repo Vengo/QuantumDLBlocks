@@ -269,6 +269,11 @@ def _step_active_wavepacket_3d(
     rms_u = u_norm.square().mean().sqrt().clamp_min(VOCAB_MANIFOLD_EPS)
     rel_mag = (u_norm / rms_u).clamp_max(2.5)
     theta = lr * rel_mag * (snr / (snr + DEFAULT_SPHERE_SNR_TRUST_TAU))
+    slice_mult = state.get("slice_lr_mult")
+    if slice_mult is None:
+        slice_mult = getattr(p, "_slice_lr_mult", None)
+    if slice_mult is not None:
+        theta = theta * slice_mult.to(device=theta.device, dtype=theta.dtype).view(1, -1, 1)
 
     u_dir = (target_radius / u_norm.clamp_min(VOCAB_MANIFOLD_EPS)) * u_tan
     w_raw = torch.cos(theta) * w_act - torch.sin(theta) * u_dir
@@ -305,6 +310,21 @@ class BatchSubspaceTikhonovGramMuon(torch.optim.Optimizer):
         for group in self.param_groups:
             group["beta"] = float(beta)
 
+    def configure_packet_lr_scales(
+        self,
+        param: torch.Tensor,
+        m_sem: int,
+        id_lr_scale: float = 0.25,
+    ) -> None:
+        """Configure per-slice geodesic learning-rate multipliers (`1.0` on `0..m_sem-1`, `id_lr_scale` on `m_sem..M_c-1`)."""
+        m_c = int(param.size(1))
+        m_sem_eff = max(0, min(int(m_sem), m_c))
+        mult = torch.ones(m_c, device=param.device, dtype=torch.float32)
+        if m_sem_eff < m_c:
+            mult[m_sem_eff:] = float(id_lr_scale)
+        self.state[param]["slice_lr_mult"] = mult
+        setattr(param, "_slice_lr_mult", mult)
+
     @torch.no_grad()
     def step_active(
         self,
@@ -328,6 +348,16 @@ class BatchSubspaceTikhonovGramMuon(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
                 idx_dev = idx_act.to(p.device)
+                if p.ndim == 4:
+                    p_3d = p.view(p.size(0), p.size(1), p.size(2) * p.size(3))
+                    p_3d.grad = p.grad.view(p.size(0), p.size(1), p.size(2) * p.size(3))
+                    slice_mult = getattr(p, "_slice_lr_mult", None)
+                    if slice_mult is not None:
+                        self.state[p]["slice_lr_mult"] = slice_mult
+                    _step_active_wavepacket_3d(
+                        p_3d, self.state[p], idx_dev, lr, beta1, beta2, tik_lam, ns_steps
+                    )
+                    continue
                 if p.ndim == 3:
                     _step_active_wavepacket_3d(
                         p, self.state[p], idx_dev, lr, beta1, beta2, tik_lam, ns_steps

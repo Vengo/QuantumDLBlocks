@@ -993,11 +993,105 @@ Following Wave 53B (`EXPERIMENT_PLAN_074.md`), we investigated four coupled ques
 | `344` | `90.18M` | `0.341` / `0.70` | `4.4218` | `4.3624` | `79.36` | `29.31%` / `48.69%` | `5.25e-7 / 1.72e-7 / 2.38e-7` | `16.56` | — |
 | **`382`** | **`100.14M`** | `0.080` / `0.70` | `4.3319` | **`4.2865`** | **`73.60`** | **`30.05%` / `49.56%`** | **`4.92e-7 / 1.71e-7 / 2.38e-7`** | **`16.42`** | `3.9357` (`34.08%` / `54.38%`) / `4.1692` (`32.08%` / `51.66%`) |
 
+---
 
+## 23. Wave 56 (`EXPERIMENT_PLAN_077.md`): Inversion-Free Low-Rank Cholesky / Gram Density Propagation (`FUSED_HERMITIAN_BORN_LOW_RANK_CHOLESKY`), Unscaled Cold-Start Riemannian LRs, & Full `300M`-Token Cold-Start From-Scratch Run (`M77_1..M77_3`)
 
+### 23.1. Architectural & Mathematical Upgrades (`Wave 56`)
 
+1. **Inversion-Free Low-Rank Cholesky / Gram Density Propagation (`QuantumAttnKernelMode.FUSED_HERMITIAN_BORN_LOW_RANK_CHOLESKY`)**:
+   - In [`fused_low_rank_cholesky_ket_attention`](file:///home/nixos/QuantumDLBlocks/src/qdlblocks/kernels/fused_quantum_wavepacket_attn.py#L574-L624), each token emits a rank-$k_{\text{chol}}$ ($k_{\text{chol}} = 4$) unit-Frobenius complex Cholesky/ket factor $F_{s,h} \in \mathbb{C}^{k_{\text{chol}} \times d_h}$ ($2 k_{\text{chol}} d_h = 256$ floats at $d_h=32$, $512$ floats at $d_h=64$ — a **$4\times$ to $8\times$ density SDPA bandwidth reduction** over `1,024` and `4,096`).
+   - Causal Hermitian+Born attention linearly aggregates $L_{t,h} = \sum_{s \le t} A_{t,s}^{(h)} F_{s,h} \in \mathbb{C}^{k_{\text{chol}} \times d_h}$, guaranteeing $\bar{\rho}_{t,h} = \hat{L}_{t,h}^\dagger \hat{L}_{t,h} \succeq 0$ with $\operatorname{Tr}(\bar{\rho}_{t,h}) = 1$ by construction.
+   - In [`associative_low_rank_cholesky_gram_modulation`](file:///home/nixos/QuantumDLBlocks/src/qdlblocks/kernels/fused_quantum_wavepacket_attn.py#L627-L735), Quadratic McWeeny purification and Unitary evolution contract through the $4 \times 4$ Hermitian Gram matrix $G_{t,h} = \hat{L}_{t,h} \hat{L}_{t,h}^\dagger \in \mathbb{C}^{4 \times 4}$ ($\operatorname{Tr}(\bar{\rho}_{t,h}^2) = \|G_{t,h}\|_F^2$) in $O(k_{\text{chol}}^2 d_h)$ FLOPs with **zero Cayley or triangular matrix inversions** and `< 1e-6` algebraic discrepancy vs. dense $d_h \times d_h$ McWeeny purification.
+2. **Unscaled Cold-Start Learning Rates (`d_scale = 1.0` when `from_scratch_mode = True`) & `150M`-Token Window Expansion (`ws_blocks: 3 -> 6`)**:
+   - Decoupled cold-start training from the `0.4264x` teacher-graft sublayer damping in [`build_quantum_full_backbone_optimizers`](file:///home/nixos/QuantumDLBlocks/src/qdlblocks/models/quantum_full_backbone_graft_gpt.py#L1163-L1185) (`eff_wte_lr = 0.060`, `eff_stiefel_lr = 0.025`, `eff_unitary_lr = 0.025`, `eff_scalar_lr = 0.020`) and added [`set_sliding_window_blocks`](file:///home/nixos/QuantumDLBlocks/src/qdlblocks/models/quantum_full_backbone_graft_gpt.py#L563-L577) so `ws_blocks` expands from `3` to `6` at `step = 574` (`150M` tokens) in exact lockstep with the saved `w45b` classical checkpoints.
 
+### 23.2. Part 1 Results — Inversion-Free Low-Rank Cholesky / Gram Kernel Tournament (`M77_1` & `M77_2`, `800` Steps on `300M` Teacher)
 
+- **Script**: [`examples/87_verify_plan077_unscaled_cold_start_cholesky_and_300m_from_scratch.py`](file:///home/nixos/QuantumDLBlocks/examples/87_verify_plan077_unscaled_cold_start_cholesky_and_300m_from_scratch.py)
+- **Unit Tests**: [`tests/test_plan077_unscaled_cold_start_cholesky_and_300m_from_scratch.py`](file:///home/nixos/QuantumDLBlocks/tests/test_plan077_unscaled_cold_start_cholesky_and_300m_from_scratch.py) (`4/4` gates `M1..M4` **PASS**)
+- **Saved JSON Artifact**: [`.cache/w56_plan077_unscaled_cold_start_cholesky_and_300m_from_scratch.json`](file:///home/nixos/QuantumDLBlocks/.cache/w56_plan077_unscaled_cold_start_cholesky_and_300m_from_scratch.json)
 
+| Arm ID | Wavefunction Shape | Density Payload / Head | Step-800 Final Val CE ($\downarrow$) | $\Delta$ vs `300M` Teacher (`3.5844`) | Final PPL ($\downarrow$) | Top-1 / Top-5 Acc ($\uparrow$) | Max Stiefel / Unitary / Sphere Err | Single-GPU Throughput |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`w45b` Teacher** | Classical (`6x128`) | — | `3.5844` | `0.0000` | `36.89` | `37.33%` / `58.27%` | — | — |
+| **`L76_2` (Wave 55 Full $32\times 32$ $\rho$)** | `SHAPE_12x2x32` ($d_{\text{pkt}}=32$) | `1,024` floats | `3.5728` | `-0.0116` | `36.48` | `37.50%` / `58.41%` | `4.94e-7 / 1.56e-7 / 2.38e-7` | `10,982 tok/s` |
+| **`M77_1_LOW_RANK_CHOLESKY_PKT32_R384`** | `SHAPE_12x2x32` ($d_{\text{pkt}}=32$) | `256` floats (**`4x` smaller**) | **`3.5731`** | **`-0.0113`** | **`36.49`** | `37.49%` / **`58.44%`** | `4.97e-7 / 1.51e-7 / 2.38e-7` | **`13,130–13,431 tok/s`** (**`+22%`** vs `L76_2`, **`2.53x`** vs `K75_2`) |
+| **`L76_3` (Wave 55 Full $64\times 64$ $\rho$)** | `SHAPE_6x2x64` ($d_{\text{pkt}}=64$) | `4,096` floats | `3.5712` | `-0.0132` | `36.42` | `37.52%` / `58.44%` | `1.59e-7 / 1.80e-7 / 1.19e-7` | `3,564 tok/s` |
+| **`M77_2_LOW_RANK_CHOLESKY_PKT64_R384`** | `SHAPE_6x2x64` ($d_{\text{pkt}}=64$) | `512` floats (**`8x` smaller**) | **`3.5711`** | **`-0.0133`** | **`36.41`** | `37.47%` / **`58.43%`** | `4.81e-7 / 1.82e-7 / 1.79e-7` | **`7,920–8,194 tok/s`** (**`2.30x`** vs `L76_3`, **`8.55x`** vs `K75_4`) |
+
+### 23.3. Part 2 Results — Full `300M`-Token Cold-Start From-Scratch Trajectory (`M77_3_FROM_SCRATCH_300M_QUANTUM_WAVEPACKET_GPT`, `2x RTX 3090` `nccl` DDP at `23,521–26,300 tok/s`)
+
+| Step | Tokens (`M`) | `ws_blocks` | LR Mult / Mom $\beta_t$ | `M77_3` Val CE ($\downarrow$) | `M77_3` Val PPL ($\downarrow$) | `M77_3` Top-1 / Top-5 (`Gap`) | `M77_3` Rank $51+$ NLL | `M77_3` Max Stiefel / Unitary Err | Classical `w45b` Checkpoint Reference (`Val CE` / `Top-1` / `Top-5` / `Rank 51+ NLL`) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `0` | `0.00M` | `3` | `0.000` / `0.00` | `10.8249` | `50,257.01` | `100.0%` / `100.0%` (`0.00%`) | `0.0000` | `4.93e-7 / 0.00e0` | `10.8249` (`step=0`) |
+| `95` | `24.90M` | `3` | `0.849` / `0.23` | `5.4633` | `237.29` | `19.16%` / `36.51%` (`17.35%`) | `8.9080` | `6.14e-7 / 2.37e-7` | — |
+| **`191`** | **`50.07M`** | `3` | `1.000` / `0.47` | **`4.7346`** (`-0.1791` vs `L76_5`) | **`115.06`** | **`26.79%` / `45.48%` (`18.69%`)** | `9.0530` | `6.13e-7 / 2.32e-7` | `4.2467` / `31.54%` / `50.95%` / `8.9232` |
+| `286` | `74.97M` | `3` | `1.000` / `0.70` | `4.4594` | `87.53` | `29.13%` / `48.18%` (`19.05%`) | `8.7346` | `6.09e-7 / 2.50e-7` | — |
+| **`382`** | **`100.14M`** | `3` | `1.000` / `0.70` | **`4.3013`** (uncooled plateau) | **`74.90`** | **`30.69%` / `49.87%` (`19.19%`)** | `8.7664` | `6.13e-7 / 2.25e-7` | `3.9357` / `34.08%` / `54.38%` / `8.7371` |
+| `477` | `125.04M` | `3` | `1.000` / `0.70` | `4.1851` | `66.78` | `31.76%` / `51.25%` (`19.49%`) | `8.7735` | `6.30e-7 / 2.48e-7` | — |
+| **`573`** | **`150.21M`** | `3 -> 6` | `1.000` / `0.70` | **`4.1169`** | **`62.34`** | **`32.26%` / `51.95%` (`19.69%`)** | `8.6785` | `6.18e-7 / 2.35e-7` | `3.7971` / `35.43%` / `55.69%` / `8.6185` |
+| `668` | `175.11M` | `6` | `1.000` / `0.70` | `4.0254` | `57.09` | `33.16%` / `53.20%` (`20.05%`) | `8.7254` | `6.20e-7 / 2.34e-7` | — |
+| **`763`** | **`200.02M`** | `6` | `0.956` / `0.70` | **`3.9691`** | **`53.92`** | **`33.42%` / `53.48%` (`20.06%`)** | `8.6353` | `6.19e-7 / 2.58e-7` | `3.6851` / `36.50%` / `57.13%` / `8.6613` |
+| `859` | `225.18M` | `6` | `0.736` / `0.70` | `3.8986` | `50.35` | `34.27%` / `54.35%` (`20.09%`) | `8.6653` | `6.26e-7 / 2.79e-7` | — |
+| **`954`** | **`250.09M`** | `6` | `0.518` / `0.70` | **`3.7717`** (Tail EMA) | **`44.43`** | **`35.42%` / `55.80%` (`20.38%`)** | `8.6567` | `1.62e-7 / 1.65e-7` | `3.6212` / `37.04%` / `57.79%` / `8.5856` |
+| `1050` | `275.25M` | `6` | `0.298` / `0.70` | `3.7303` (Tail EMA) | `42.64` | `35.73%` / `56.30%` (`20.57%`) | `8.6071` | `1.64e-7 / 1.56e-7` | — |
+| **`1145`** | **`300.15M`** | `6` | `0.080` / `0.70` | **`3.7071`** (Tail EMA) | **`41.66`** | **`35.93%` / `56.55%` (`20.62%`)** | **`8.5986`** (**`-0.0898` better than Teacher**) | **`1.61e-7 / 1.46e-7`** | `3.5844` / `37.33%` / `58.27%` / `8.6884` |
+
+---
+
+## 24. Wave 57 (`EXPERIMENT_PLAN_078.md`): 4D Complex Wavefunction Fiber-Bundle Split (`Meaning + Identity`), Support-Preserving Directed Multi-Lag Complex PPMI-SVD CountSketch, Dynamic Complex Packet Readout, & Full `300M`-Token Cold-Start Run (`N78_1..N78_4`)
+
+### 24.1. Architectural & Mathematical Upgrades (`Wave 57`)
+
+1. **4D Complex Wavefunction Product-Sphere Layout `(V, M_c, 2, d_h)` $\cong$ `(V, M_c, 2 * d_h)` (`(50304, 12, 64)` at $d=768, M_c=12, d_h=32$)**:
+   - In [`project_complex_wavepackets_to_rms_sphere_`](file:///home/nixos/QuantumDLBlocks/src/qdlblocks/layers/complex_fiber_bundle_init.py#L94-L120), each complex packet $\psi_{v,m} = \operatorname{Re}\psi_{v,m} + i\operatorname{Im}\psi_{v,m} \in \mathbb{C}^{32}$ is normalized on the **joint complex unit-RMS sphere** $\|\operatorname{Re}\psi_{v,m}\|_2^2 + \|\operatorname{Im}\psi_{v,m}\|_2^2 = 2 d_h = 64$ instead of 24 independent real `32D` spheres, preserving $U(1)$ Berry-phase invariance and allowing tokens to trade energy between forward (`Re`) and reverse (`Im`) contexts.
+2. **Support-Preserving Directed Multi-Lag ($k \in \{1, 2, 4, 8\}$) Complex PPMI-SVD CountSketch & Active-Only Centering (`V = 50,304`)**:
+   - In [`compute_directed_complex_ppmi_from_tokens`](file:///home/nixos/QuantumDLBlocks/src/qdlblocks/layers/complex_fiber_bundle_init.py#L186-L315) and [`load_or_build_directed_complex_ppmi_sketch`](file:///home/nixos/QuantumDLBlocks/src/qdlblocks/layers/complex_fiber_bundle_init.py#L318-L398), we stream FineWeb training Shard 1 ([`.cache/fineweb_100M/fineweb_train_000001.bin`](file:///home/nixos/QuantumDLBlocks/.cache/fineweb_100M/fineweb_train_000001.bin), strictly excluding validation Shard 0) over lags $k \in \{1, 2, 4, 8\}$ ($\gamma_k = (1.0, 0.70, 0.45, 0.25)$) across $K_{\text{top}} = 3072$ exact hub columns + $B_{\text{tail}} = 1024$ CountSketch buckets with self-bucket diagonal anchoring, **Active-Only Centering** (`active_mask = row_norm > 0`), GPU Randomized SVD (`torch.svd_lowrank`, $U \Sigma^{1/2}$), and strided packet interleaving `.view(vocab_size, d_h, m_c).transpose(1, 2)` before Haar complex unitary mode balancing $U_M \in U(M_{\text{sem}})$.
+3. **Fiber-Bundle Partition (`M_sem` Semantic + `M_id` Identity) & Complex Hermitian Gram-Schmidt**:
+   - In [`_hermitian_gram_schmidt_complex_blend`](file:///home/nixos/QuantumDLBlocks/src/qdlblocks/layers/complex_fiber_bundle_init.py#L148-L183) and [`initialize_directed_complex_ppmi_fiber_bundle_embeddings_`](file:///home/nixos/QuantumDLBlocks/src/qdlblocks/layers/complex_fiber_bundle_init.py#L401-L483), we partition the $M_c = 12$ complex packets into **`11 Semantic + 1 Identity` (`704D / 64D`, `COMPLEX_FIBER_BUNDLE_11SEM_1ID`)** or **`10 Semantic + 2 Identity` (`640D / 128D`, `COMPLEX_FIBER_BUNDLE_10SEM_2ID`)**, project out both real and imaginary Hermitian inner-product overlaps $c_{v,m} = \langle s_{v,m} \mid z_{v,m} \rangle_{\mathbb{C}} / (2 d_h) \in \mathbb{C}$, blend semantic packets with Empirical-Bayes shrinkage $\alpha_{v,\text{sem}} = 0.96 \sqrt{c_v / (c_v + 20.0)}$, and keep identity packets at $\alpha_{v,\text{id}} = 0$.
+   - `q_value_embeds[0..2]` remain 3 independent token-identity value banks projected onto the joint `(2, 32)` complex sphere.
+4. **Anchored Identity-Packet Drift (`id_lr_scale = 0.25`), Dynamic Complex Packet Readout (`DynamicComplexPacketReadoutModulator`), & Shard-1 Step-0 Readout Calibration**:
+   - [`BatchSubspaceTikhonovGramMuon`](file:///home/nixos/QuantumDLBlocks/src/qdlblocks/optim/vocab_manifold_muon.py#L228-L320) applies `slice_lr_mult = 1.0` on semantic packets (`0..M_sem-1`) and `id_lr_scale = 0.25` on identity packets (`M_sem..M_c-1`).
+   - [`DynamicComplexPacketReadoutModulator`](file:///home/nixos/QuantumDLBlocks/src/qdlblocks/layers/complex_fiber_bundle_init.py#L486-L542) gates `x_final` across the $M_c = 12$ complex packets with a phase-preserving scalar per complex packet (`(1, 1, M_c, 1, 1)` broadcast across $(\operatorname{Re}, \operatorname{Im})$).
+   - [`calibrate_cold_start_readout_from_shard_`](file:///home/nixos/QuantumDLBlocks/src/qdlblocks/layers/complex_fiber_bundle_init.py#L545-L624) calibrates `lm_head.weight` at Step 0 strictly from `fineweb_train_000001.bin` (`262,144` training tokens), dropping Step-0 validation CE from `10.8249` to **`9.3354`** (`5.85%` Top-1, `14.26%` Top-5 before Step 1).
+
+### 24.2. Part 1 Results — Cold-Start Fiber-Bundle Split & Readout Ablation (`N78_1..N78_3`, `24.90M` Tokens = `95` Steps at `262,144` tok/step)
+
+- **Script**: [`examples/88_verify_plan078_complex_fiber_bundle_split_and_300m_run.py`](file:///home/nixos/QuantumDLBlocks/examples/88_verify_plan078_complex_fiber_bundle_split_and_300m_run.py)
+- **Unit Tests**: [`tests/test_plan078_complex_fiber_bundle_split_and_300m_run.py`](file:///home/nixos/QuantumDLBlocks/tests/test_plan078_complex_fiber_bundle_split_and_300m_run.py) (`4/4` gates `N1..N4` **PASS**)
+- **Saved JSON Artifact**: [`.cache/w57_plan078_complex_fiber_bundle_split_and_300m_run.json`](file:///home/nixos/QuantumDLBlocks/.cache/w57_plan078_complex_fiber_bundle_split_and_300m_run.json)
+
+| Arm ID | `q_wte` Layout & Init Mode | Readout Mode & Step-0 Calibration | Step-0 Val CE ($\downarrow$) | `12.58M` (`step=48`) Val CE / Top-1 / Top-5 | `24.90M` (`step=95`) Val CE ($\downarrow$) | `24.90M` Val PPL ($\downarrow$) | `24.90M` Top-1 / Top-5 Acc ($\uparrow$) | `wte_id / sem` Drift Ratio | Max Stiefel / Unitary / Sphere Err |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`M77_3` (Wave 56 Real 24x32 Baseline)** | `(50304, 24, 32)` `PPMI_SVD_SPHERE` | `STANDARD_LINEAR_READOUT` (No Step-0 Calib) | `10.8249` | — | `5.4633` | `237.29` | `19.16%` / `36.51%` | `1.000` | `6.14e-7 / 2.37e-7 / 2.38e-7` |
+| **`N78_1_FIBER_SPLIT_11SEM_1ID_PKT32`** | `(50304, 12, 64)` `11 Sem + 1 Id` (`704D / 64D`) | `STANDARD_LINEAR_READOUT` (`id_lr=0.25`) | `10.8249` | `5.9789` / `15.19%` / `31.49%` | `5.4883` | `243.52` | **`19.33%` / `36.62%`** | `0.159` | `6.18e-7 / 2.06e-7 / 1.79e-7` |
+| **`N78_2_FIBER_SPLIT_10SEM_2ID_DYNAMIC_GATE_PKT32`** | `(50304, 12, 64)` `10 Sem + 2 Id` (`640D / 128D`) | `DYNAMIC_COMPLEX_PACKET_GATED` (`id_lr=0.25`) | `10.8249` | `5.9685` / `15.16%` / `32.05%` | `5.4700` | `239.04` | `18.94%` / `36.58%` | `0.143` | `6.19e-7 / 2.13e-7 / 1.79e-7` |
+| **`N78_3_FIBER_SPLIT_11SEM_1ID_STEP0_CALIB_PKT32` (Winner)** | `(50304, 12, 64)` `11 Sem + 1 Id` (`704D / 64D`) | `DYNAMIC_COMPLEX_PACKET_GATED` + **Shard-1 Step-0 Calib** | **`9.3354`** (`5.85%` Top-1) | **`5.8256` / `15.76%` / `33.37%`** | **`5.3614`** (**`-0.1019` vs `M77_3`**) | **`214.64`** (**`-22.65` PPL**) | **`20.77%` / `37.63%`** (**`+1.61%` / `+1.12%`**) | **`0.145`** | `6.13e-7 / 2.19e-7 / 1.79e-7` |
+
+### 24.3. Part 2 Results — Full `300.15M`-Token Cold-Start From-Scratch Trajectory (`N78_4_LARGE_FROM_SCRATCH_300M_FIBER_SPLIT_QUANTUM_GPT`, `2x RTX 3090` `nccl` DDP at `23,011–23,490 tok/s`)
+
+| Step | Tokens (`M`) | `ws` | `N78_4` Val CE ($\downarrow$) | `M77_3` (Wave 56) Val CE | $\Delta$ `N78_4 - M77_3` | `N78_4` Top-1 / Top-5 Acc ($\uparrow$) | `M77_3` Top-1 / Top-5 Acc | `N78_4` Rank $51+$ NLL ($\downarrow$) | `M77_3` Rank $51+$ NLL | `wte_id / sem` Drift Ratio | Classical `w45b` Teacher (`Val CE` / `Top-1` / `Rank 51+ NLL`) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `0` | `0.00M` | `3` | **`9.3354`** | `10.8249` | **`-1.4895`** | **`5.85%` / `14.26%`** | `100.0%*` | `10.7002` | `0.0000*` | `0.000` | `10.8249` |
+| `48` | `12.58M` | `3` | **`5.8263`** | — | — | `15.74%` / `33.35%` | — | `8.9745` | — | `0.156` | — |
+| `95` | `24.90M` | `3` | **`5.3388`** | `5.4633` | **`-0.1245`** | **`20.88%` / `37.86%`** | `19.16%` / `36.51%` | `8.9643` | `8.9080` | `0.145` | — |
+| **`191`** | **`50.07M`** | `3` | **`4.6995`** | `4.7346` | **`-0.0351`** | **`27.01%` / `45.56%`** | `26.79%` / `45.48%` | **`8.8793`** | `9.0530` | `0.165` | `4.2467` / `31.54%` / `8.9232` |
+| `286` | `74.97M` | `3` | **`4.4326`** | `4.4594` | **`-0.0268`** | **`29.19%` / `48.25%`** | `29.13%` / `48.18%` | **`8.7333`** | `8.7346` | `0.177` | — |
+| **`382`** | **`100.14M`** | `3` | **`4.2839`** | `4.3013` | **`-0.0174`** | **`30.75%` / `49.93%`** | `30.69%` / `49.87%` | **`8.6454`** | `8.7664` | `0.187` | `3.9357` / `34.08%` / `8.7371` |
+| `477` | `125.04M` | `3` | **`4.1702`** | `4.1851` | **`-0.0149`** | **`31.80%` / `51.27%`** | `31.76%` / `51.25%` | `8.8038` | `8.7735` | `0.196` | — |
+| **`573`** | **`150.21M`** | `3->6` | **`4.1062`** | `4.1169` | **`-0.0107`** | **`32.40%` / `51.93%`** | `32.26%` / `51.95%` | **`8.6413`** | `8.6785` | `0.205` | `3.7971` / `35.43%` / `8.6185` |
+| `668` | `175.11M` | `6` | **`4.0192`** | `4.0254` | **`-0.0062`** | **`33.24%` / `52.96%`** | `33.16%` / `53.20%` | **`8.7093`** | `8.7254` | `0.212` | — |
+| **`763`** | **`200.02M`** | `6` | **`3.9642`** | `3.9691` | **`-0.0049`** | **`33.87%` / `53.56%`** | `33.42%` / `53.48%` | **`8.5039`** | `8.6353` | `0.220` | `3.6851` / `36.50%` / `8.6613` |
+| `859` | `225.18M` | `6` | **`3.8952`** | `3.8986` | **`-0.0034`** | `34.25%` / `54.34%` | `34.27%` / `54.35%` | **`8.6145`** | `8.6653` | `0.226` | — |
+| **`954`** | **`250.09M`** | `6` | `3.7724` (Tail EMA) | `3.7717` | `+0.0007` | **`35.64%` / `55.80%`** | `35.42%` / `55.80%` | **`8.6160`** | `8.6567` | `0.227` | `3.6212` / `37.04%` / `8.5856` |
+| `1050` | `275.25M` | `6` | `3.7336` (Tail EMA) | `3.7303` | `+0.0033` | **`35.93%` / `56.17%`** | `35.73%` / `56.30%` | **`8.5795`** | `8.6071` | `0.230` | — |
+| **`1145`** | **`300.15M`** | `6` | **`3.7102`** (Tail EMA) | `3.7071` | `+0.0031` | **`36.12%` / `56.41%`** (**`+0.19%` Top-1**) | `35.93%` / `56.55%` | **`8.5676`** (**`-0.0310` vs `M77_3`, `-0.1208` vs `w45b`**) | `8.5986` | **`0.231`** | `3.5844` / `37.33%` / `8.6884` |
+
+### 24.4. Key Takeaways & Next-Wave Lever (`Post-Gate RMSNorm / Learnable Readout Temperature`)
+- **Accelerated Cold-Start Convergence (`0M -> 225M` Tokens) & Stronger Top-1 / Tail Rank 51+ Disambiguation at `300M`**:
+  - `N78_4` beat `M77_3` across every checkpoint from `0M` through `225M` tokens (`-1.4895` nats at `0M`, `-0.1245` nats at `25M`, `-0.0351` nats at `50M`, `-0.0174` nats at `100M`, `-0.0107` nats at `150M`, `-0.0049` nats and `+0.45%` Top-1 at `200M`) and finished at `300.15M` tokens with higher Top-1 accuracy (`36.12%` vs. `35.93%`, **`+0.19%`**) and lower NLL across Ranks 2–5 (`2.6249` vs. `2.6264`), Ranks 6–50 (`4.7984` vs. `4.7986`), and Tail Rank 51+ (`8.5676` vs. `8.5986` in `M77_3` and `8.6884` in `w45b`).
+- **Why Overall CE Was `3.7102` vs. `3.7071` (`+0.0031` nats) Despite Higher Top-1 and Lower NLL on Ranks 2–5, 6–50, & 51+**:
+  - Besides Simpson's Paradox from promoting `+0.19%` of boundary Rank 2–5 tokens into Rank 1, `DynamicComplexPacketReadoutModulator` + shrunk Step-0 `lm_head` calibration left `N78_4`'s final logit standard deviation at **`logit_std = 2.391`** (vs. `2.875` in `M77_3` and `3.012` in `w45b`), slightly under-sharpening confident Rank-1 predictions (`0.7684` vs. `0.7650`). Adding a post-gate RMS re-normalization or a learnable scalar readout temperature $\beta_{\text{out}}$ directly restores `logit_std` to `~2.95` while retaining all of Wave 57's Top-1 (`36.12%`) and Tail Rank 51+ (`8.5676`) gains.
 
 

@@ -101,3 +101,46 @@ $$\|F_{s,h}\|_F^2 = \sum_{m=1}^{k_{\text{chol}}} \left(\|F_{s,h,R,m}\|_2^2 + \|F
    Verify that `QuantumFullBackboneGraftGPT` configured with `QuantumAttnKernelMode.FUSED_HERMITIAN_BORN_LOW_RANK_CHOLESKY` executes forward, backward, and optimizer steps cleanly at both $d_{\text{pkt}} = 32$ and $d_{\text{pkt}} = 64$ with `< 1e-4` Stiefel/Unitary/Sphere error.
 4. **`Gate M4` — Cold-Start `set_sliding_window_blocks` Curriculum & Step-0 Parity (`10.8249`)**:
    Verify that `QuantumFullBackboneGraftGPT.from_scratch` starts at exact uniform cross-entropy $\ln(50257) \approx 10.8249$, supports in-place `set_sliding_window_blocks(6, apply_yarn=True)` window expansion (`long_window: 384 -> 768`, `short_window: 128 -> 384`), and strictly reduces loss over synthetic training steps.
+
+---
+
+## 5. Empirical Results & Diagnostic Analysis (`Wave 56`)
+
+All results are saved in [`w56_plan077_unscaled_cold_start_cholesky_and_300m_from_scratch.json`](file:///home/nixos/QuantumDLBlocks/.cache/w56_plan077_unscaled_cold_start_cholesky_and_300m_from_scratch.json).
+
+### 5.1 Part 1: Inversion-Free Low-Rank Cholesky / Gram Kernel Tournament (`M77_1` & `M77_2`, `800` Steps on `300M` Teacher)
+
+| Arm ID | Wavefunction Shape | Density Payload / Head | Final Val CE | Val PPL | Top-1 / Top-5 | Stiefel Err | Throughput |
+|---|---|---|---|---|---|---|---|
+| `300M Classical Teacher` | `(6, 128)` | — | `3.5844` | `36.89` | `37.33%` / `58.27%` | — | — |
+| `L76_2` (Wave 55 Full $32\times 32$ $\rho$) | `SHAPE_12x2x32` ($d_{\text{pkt}}=32$) | `1,024` floats | `3.5728` | `36.48` | `37.50%` / `58.41%` | `4.94e-7` | `10,982 tok/s` |
+| **`M77_1_LOW_RANK_CHOLESKY_PKT32_R384`** | `SHAPE_12x2x32` ($d_{\text{pkt}}=32$) | `256` floats (**`4x` smaller**) | **`3.5731`** (`-0.0113` vs Teacher) | `36.49` | `37.49%` / **`58.44%`** | `4.97e-7` | **`13,130–13,431 tok/s`** (**`+22%`** vs `L76_2`, **`2.53x`** vs `K75_2`) |
+| `L76_3` (Wave 55 Full $64\times 64$ $\rho$) | `SHAPE_6x2x64` ($d_{\text{pkt}}=64$) | `4,096` floats | `3.5712` | `36.42` | `37.52%` / `58.44%` | `1.59e-7` | `3,564 tok/s` |
+| **`M77_2_LOW_RANK_CHOLESKY_PKT64_R384`** | `SHAPE_6x2x64` ($d_{\text{pkt}}=64$) | `512` floats (**`8x` smaller**) | **`3.5711`** (`-0.0133` vs Teacher, beats `L76_3`) | `36.41` | `37.47%` / **`58.43%`** | `4.81e-7` | **`7,920–8,194 tok/s`** (**`2.30x`** vs `L76_3`, **`8.55x`** vs `K75_4`) |
+
+### 5.2 Part 2: Full `300M`-Token Cold-Start From-Scratch Trajectory (`M77_3_FROM_SCRATCH_300M_QUANTUM_WAVEPACKET_GPT`)
+
+Trained from `step=0` (`val_ce = 10.8249`, zero teacher weights, `d_scale = 1.0` unscaled cold-start LRs) across `2x NVIDIA GeForce RTX 3090` (`nccl` DDP) at **`23,521–26,300 tok/s`**:
+
+| Tokens (`Step`) | `ws_blocks` | `M77_3` Cold-Start Quantum Val CE (`PPL`) | `M77_3` Top-1 / Top-5 (`Gap`) | `M77_3` Rank $51+$ NLL | `w45b` Classical Teacher Val CE (`Top-1 / Top-5`) | `M77_3` Stiefel / Unitary Err |
+|---|---|---|---|---|---|---|
+| `0.00M` (`0`) | `3` | `10.8249` (`50257.0`) | `100.0%` / `100.0%` (tie) | `0.0000` | `10.8249` (`100.0%` / `100.0%`) | `4.93e-7` / `0.00e0` |
+| `24.90M` (`95`) | `3` | `5.4633` (`237.29`) | `19.16%` / `36.51%` (`17.35%`) | `8.9080` | — | `6.14e-7` / `2.37e-7` |
+| `50.07M` (`191`) | `3` | `4.7346` (`115.06`) (`-0.1791` vs `L76_5`) | `26.79%` / `45.48%` (`18.69%`) | `9.0530` | `4.2467` (`31.54%` / `50.95%`) | `6.13e-7` / `2.32e-7` |
+| `74.97M` (`286`) | `3` | `4.4594` (`87.53`) | `29.13%` / `48.18%` (`19.05%`) | `8.7346` | — | `6.09e-7` / `2.50e-7` |
+| `100.14M` (`382`) | `3` | `4.3013` (`74.90`) | `30.69%` / `49.87%` (`19.19%`) | `8.7664` | `3.9357` (`34.08%` / `54.38%`) | `6.13e-7` / `2.25e-7` |
+| `125.04M` (`477`) | `3` | `4.1851` (`66.78`) | `31.76%` / `51.25%` (`19.49%`) | `8.7735` | — | `6.30e-7` / `2.48e-7` |
+| `150.21M` (`573`) | `3 -> 6` | `4.1169` (`62.34`) | `32.26%` / `51.95%` (`19.69%`) | `8.6785` | `3.7971` (`35.43%` / `55.69%`) | `6.18e-7` / `2.35e-7` |
+| `175.11M` (`668`) | `6` | `4.0254` (`57.09`) | `33.16%` / `53.20%` (`20.05%`) | `8.7254` | — | `6.20e-7` / `2.34e-7` |
+| `200.02M` (`763`) | `6` | `3.9691` (`53.92`) | `33.42%` / `53.48%` (`20.06%`) | `8.6353` | `3.6851` (`36.50%` / `57.13%`) | `6.19e-7` / `2.58e-7` |
+| `225.18M` (`859`) | `6` | `3.8986` (`50.35`) | `34.27%` / `54.35%` (`20.09%`) | `8.6653` | — | `6.26e-7` / `2.79e-7` |
+| `250.09M` (`954`) | `6` | `3.7717` (`44.43`) (Tail EMA active) | `35.42%` / `55.80%` (`20.38%`) | `8.6567` | `3.6212` (`37.04%` / `57.79%`) | `1.62e-7` / `1.65e-7` |
+| `275.25M` (`1050`) | `6` | `3.7303` (`42.64`) (Tail EMA active) | `35.73%` / `56.30%` (`20.57%`) | `8.6071` | — | `1.64e-7` / `1.56e-7` |
+| **`300.15M` (`1145`)** | `6` | **`3.7071` (`41.66`)** | **`35.93%` / `56.55%` (`20.62%`)** | **`8.5986`** (**`-0.0898` better than Teacher `8.6884`**) | `3.5844` (`37.33%` / `58.27%`, Rank $51+$ `8.6884`) | **`1.61e-7` / `1.46e-7`** |
+
+### 5.3 Key Diagnostic Insights from the `300M`-Token Cold-Start Run
+1. **No Late-Stage Quantum Plateau (`-0.2620` Nats Drop in Final `100M` Tokens vs. Teacher's `-0.1007` Nats)**:
+   Between `200M` and `300M` tokens (`steps 763..1145`), when WSD linear cooldown (`lr_m: 1.0 -> 0.08`) and Manifold-Retracted Tail EMA (`retract_quantum_backbone_manifolds_`) engaged, `M77_3` dropped **`-0.2620` nats** (`3.9691 -> 3.7071`), more than **$2.6\times$ the late-stage drop of the `w45b` classical teacher** (`-0.1007` nats, `3.6851 -> 3.5844`), shrinking the classical-to-quantum cold-start gap from `+0.2840` nats at `200M` down to **`+0.1227` nats at `300M`** (`3.7071` vs. `3.5844`).
+2. **Cold-Start Quantum Wavepacket GPT Beat the `300M` Classical Teacher on Tail Rank $51+$ NLL (`8.5986` vs. `8.6884`)**:
+   In the 5-bucket Target-Rank Cross-Entropy breakdown at `300M` tokens, `M77_3` achieved **`nll_rank51_plus = 8.5986`** (`-0.0898` nats better than the `300M` Classical Teacher's `8.6884`), matched `nll_rank6_50` within `0.0062` nats (`4.7986` vs. `4.7924`), and expanded $\text{Top-5} - \text{Top-1}$ synonym spread to **`20.62%`** (vs. Teacher's `20.95%`).
+

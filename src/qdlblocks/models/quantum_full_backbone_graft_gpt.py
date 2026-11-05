@@ -35,6 +35,16 @@ from ..kernels.fused_quantum_wavepacket_attn import (
     QuantumAttnKernelMode,
     run_coherent_ket_wavepacket_attention,
 )
+from ..layers.complex_fiber_bundle_init import (
+    DEFAULT_FIBER_BUNDLE_SEED,
+    DEFAULT_FIBER_SEMANTIC_PACKETS_10,
+    DEFAULT_FIBER_SEMANTIC_PACKETS_11,
+    DEFAULT_IDENTITY_PACKET_LR_SCALE,
+    DynamicComplexPacketReadoutModulator,
+    QuantumPacketReadoutMode,
+    initialize_directed_complex_ppmi_fiber_bundle_embeddings_,
+    project_complex_wavepackets_to_rms_sphere_,
+)
 from ..layers.impure_density_mirror_block import (
     DEFAULT_TIKHONOV_GRAM_LAMBDA,
     TRACE_NORM_EPS,
@@ -176,6 +186,8 @@ class QuantumFullBackboneGraftConfig:
     attn_kernel_mode: QuantumAttnKernelMode = QuantumAttnKernelMode.EXPANDED_SDPA_CHUNKS
     stiefel_momentum_mode: StiefelMomentumMode = StiefelMomentumMode.RIEMANNIAN_TANGENT_TRANSPORTED
     momentum_schedule_mode: QuantumMomentumScheduleMode = QuantumMomentumScheduleMode.FIXED_HIGH_MOMENTUM_090
+    packet_readout_mode: QuantumPacketReadoutMode = QuantumPacketReadoutMode.STANDARD_LINEAR_READOUT
+    id_packet_lr_scale: float = DEFAULT_IDENTITY_PACKET_LR_SCALE
     interface_warmup_steps: int = DEFAULT_FULL_BACKBONE_WARMUP_STEPS
     interface_align_weight: float = DEFAULT_FULL_BACKBONE_ALIGN_WEIGHT
     wte_lr: float = DEFAULT_FULL_BACKBONE_WTE_LR
@@ -357,6 +369,18 @@ class QuantumFullBackboneGraftGPT(nn.Module):
 
         spec = resolve_wavefunction_shape_spec(self.graft_cfg.wf_shape)
         self.wte_slices, self.wte_sphere_dim, self.d_emb, self.pkt_count, self.pkt_dim, self.q_heads = spec
+        self.is_complex_fiber_bundle: bool = self.graft_cfg.wte_init_mode in (
+            QuantumWteInitMode.COMPLEX_FIBER_BUNDLE_11SEM_1ID,
+            QuantumWteInitMode.COMPLEX_FIBER_BUNDLE_10SEM_2ID,
+        )
+        self.fiber_m_sem: int = (
+            DEFAULT_FIBER_SEMANTIC_PACKETS_10
+            if self.graft_cfg.wte_init_mode == QuantumWteInitMode.COMPLEX_FIBER_BUNDLE_10SEM_2ID
+            else DEFAULT_FIBER_SEMANTIC_PACKETS_11
+        )
+        if self.is_complex_fiber_bundle and self.pkt_count % 2 == 0:
+            self.wte_slices = self.pkt_count // 2
+            self.wte_sphere_dim = 2 * self.pkt_dim
 
         self.w_in_bridge: nn.Parameter | None = None
         if self.d_emb != self.embed_dim:
@@ -368,9 +392,21 @@ class QuantumFullBackboneGraftGPT(nn.Module):
         q_wte = torch.randn(self.vocab_size, self.wte_slices, self.wte_sphere_dim, dtype=torch.float32)
         if self.graft_cfg.wte_init_mode == QuantumWteInitMode.TEACHER_PROCRUSTES_SPHERE:
             initialize_teacher_procrustes_sphere_embeddings_(q_wte, self.classical.wte.weight, self.w_in_bridge, None)
+        elif self.is_complex_fiber_bundle:
+            initialize_directed_complex_ppmi_fiber_bundle_embeddings_(
+                q_wte,
+                m_sem=self.fiber_m_sem,
+                seed=DEFAULT_FIBER_BUNDLE_SEED,
+                id_lr_scale=self.graft_cfg.id_packet_lr_scale,
+            )
         else:
             initialize_arbitrary_shape_ppmi_sphere_embeddings_(q_wte, ppmi_embeddings=ppmi_embeddings)
         self.q_wte = nn.Parameter(q_wte)
+        if self.is_complex_fiber_bundle:
+            slice_mult = torch.ones(self.wte_slices, dtype=torch.float32)
+            if self.fiber_m_sem < self.wte_slices:
+                slice_mult[self.fiber_m_sem :] = float(self.graft_cfg.id_packet_lr_scale)
+            setattr(self.q_wte, "_slice_lr_mult", slice_mult)
         self.in_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
         wp_complex_modes = max(1, self.pkt_count // 2)
@@ -452,6 +488,17 @@ class QuantumFullBackboneGraftGPT(nn.Module):
         self.q_skip_weights: nn.Parameter | None = None
         self.q_skip_attn_lambdas = nn.ParameterDict()
         self.q_rope = copy.deepcopy(self.classical.rope)
+        self.packet_readout_modulator: DynamicComplexPacketReadoutModulator | None = None
+        if (
+            self.graft_cfg.packet_readout_mode == QuantumPacketReadoutMode.DYNAMIC_COMPLEX_PACKET_GATED_READOUT
+            and self.embed_dim % (2 * max(1, self.pkt_count // 2)) == 0
+        ):
+            self.packet_readout_modulator = DynamicComplexPacketReadoutModulator(
+                embed_dim=self.embed_dim,
+                m_c=max(1, self.pkt_count // 2),
+                m_sem=self.fiber_m_sem,
+                init_biased=False,
+            )
         if self.full_blocks_replaced:
             self._init_standalone_full_backbone_modules()
 
@@ -482,7 +529,10 @@ class QuantumFullBackboneGraftGPT(nn.Module):
                     ve_proj = ve_t
                 ve_3d = ve_proj.reshape(self.vocab_size, self.wte_slices, self.wte_sphere_dim).clone()
                 slice_rms = ve_3d.pow(2).mean(dim=-1, keepdim=True).clamp_min(1e-12).sqrt().contiguous()
-                project_rows_to_rms_sphere_(ve_3d)
+                if self.is_complex_fiber_bundle:
+                    project_complex_wavepackets_to_rms_sphere_(ve_3d)
+                else:
+                    project_rows_to_rms_sphere_(ve_3d)
                 q_ve_list.append(nn.Parameter(ve_3d))
                 self.register_buffer(f"ve_slice_rms_{b_idx}", slice_rms, persistent=True)
             self.q_value_embeds = nn.ParameterList(q_ve_list)
@@ -529,7 +579,8 @@ class QuantumFullBackboneGraftGPT(nn.Module):
     ) -> QuantumFullBackboneGraftGPT:
         """Construct a cold-start 12-layer Quantum Wavepacket GPT with zero pretrained teacher weights (`step=0`)."""
         cfg_eff = copy.deepcopy(graft_cfg) if graft_cfg is not None else QuantumFullBackboneGraftConfig()
-        cfg_eff.wte_init_mode = QuantumWteInitMode.PPMI_SVD_SPHERE
+        if cfg_eff.wte_init_mode == QuantumWteInitMode.TEACHER_PROCRUSTES_SPHERE:
+            cfg_eff.wte_init_mode = QuantumWteInitMode.PPMI_SVD_SPHERE
         cfg_eff.recovery_schedule_mode = QuantumRecoveryScheduleMode.PURE_CE
         cfg_eff.interface_warmup_steps = 0
 
@@ -834,6 +885,8 @@ class QuantumFullBackboneGraftGPT(nn.Module):
                 encoder_states.append(x)
 
         x_final = F.rms_norm(x, (self.embed_dim,), eps=self.cfg.eps)
+        if self.packet_readout_modulator is not None:
+            x_final = self.packet_readout_modulator(x_final)
         return x_final, x_0, layer_outputs
 
     def forward_features(self, idx: torch.Tensor) -> torch.Tensor:
@@ -988,6 +1041,8 @@ class QuantumFullBackboneGraftGPT(nn.Module):
             params.extend(svd_blk.scalar_parameters())  # type: ignore[operator]
         for mz_blk in self.quantum_mlp_blocks.values():
             params.extend(mz_blk.scalar_parameters())  # type: ignore[operator]
+        if self.packet_readout_modulator is not None:
+            params.extend(self.packet_readout_modulator.scalar_parameters())
         return [p for p in params if p.requires_grad]
 
     def active_quantum_parameters(self) -> list[nn.Parameter]:
@@ -1021,6 +1076,8 @@ class QuantumFullBackboneGraftGPT(nn.Module):
             svd_blk.restrict_scalars_()  # type: ignore[operator]
         for mz_blk in self.quantum_mlp_blocks.values():
             mz_blk.restrict_scalars_()  # type: ignore[operator]
+        if self.packet_readout_modulator is not None:
+            self.packet_readout_modulator.restrict_scalars_()
 
     @torch.no_grad()
     def compute_quantum_graft_telemetry(self) -> dict[str, float]:
@@ -1293,6 +1350,7 @@ __all__ = [
     "QuantumKetAmplitudeMode",
     "QuantumMLPChannelMode",
     "QuantumMomentumScheduleMode",
+    "QuantumPacketReadoutMode",
     "SVDStiefelMachZehnderInterferometer",
     "build_doc_swc_sdpa_masks",
     "build_quantum_full_backbone_optimizers",

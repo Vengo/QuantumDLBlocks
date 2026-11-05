@@ -124,10 +124,12 @@ class QuantumReplacementScope(str, Enum):
 
 
 class QuantumWteInitMode(str, Enum):
-    """Axis E enum selecting PPMI-SVD sphere initialization vs. Teacher-Procrustes sphere alignment (Rule 3)."""
+    """Axis E & Wave 57 enum selecting PPMI-SVD, Teacher-Procrustes, or 4D Complex Fiber-Bundle sphere initialization (Rule 3)."""
 
     PPMI_SVD_SPHERE = "ppmi_svd_sphere"
     TEACHER_PROCRUSTES_SPHERE = "teacher_procrustes_sphere"
+    COMPLEX_FIBER_BUNDLE_11SEM_1ID = "complex_fiber_bundle_11sem_1id"
+    COMPLEX_FIBER_BUNDLE_10SEM_2ID = "complex_fiber_bundle_10sem_2id"
 
 
 class QuantumValueEmbedCouplingMode(str, Enum):
