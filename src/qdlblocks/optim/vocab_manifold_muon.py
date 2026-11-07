@@ -33,6 +33,11 @@ DEFAULT_COUPLED_NS_STEPS: int = 5
 DEFAULT_VOCAB_RADIAL_LR_RATIO: float = 0.25
 DEFAULT_VOCAB_RADIAL_MIN: float = 0.75
 DEFAULT_VOCAB_RADIAL_MAX: float = 1.50
+DEFAULT_BALL_TRUST_TAU: float = 0.18
+DEFAULT_BALL_MAX_RMS: float = 1.50
+DEFAULT_COMPLEX_SPHERE_MAX_ANGLE: float = 0.20
+DEFAULT_POSITIVE_GEODESIC_MAX_STEP: float = 0.22
+DEFAULT_BOUNDED_TANGENT_MAX_STEP: float = 0.12
 VOCAB_MANIFOLD_EPS: float = 1e-7
 
 
@@ -174,15 +179,20 @@ def _step_full_single_param(
     u_tan = _project_to_sphere_tangent(u_all, w_unit)
 
     u_norm = u_tan.norm(dim=-1, keepdim=True)
-    snr = m_tan.norm(dim=-1, keepdim=True) / (exp_avg_sq.sqrt() + VOCAB_MANIFOLD_EPS)
+    m_row_norm = m_tan.norm(dim=-1, keepdim=True)
+    snr = m_row_norm / (exp_avg_sq.sqrt() + VOCAB_MANIFOLD_EPS)
     rms_u = u_norm.square().mean().sqrt().clamp_min(VOCAB_MANIFOLD_EPS)
     rel_mag = (u_norm / rms_u).clamp_max(2.5)
+    g_tau = float(state.get("grad_norm_gate_tau", 0.0))
+    mag_gate: torch.Tensor | float = (
+        (m_row_norm.square() / (m_row_norm.square() + g_tau * g_tau)).sqrt() if g_tau > 0.0 else 1.0
+    )
     if idx_act is not None:
         row_lr = torch.full((w_f.size(0), 1), lr * 0.25, device=w_f.device, dtype=w_f.dtype)
         row_lr.index_fill_(0, idx_act.to(w_f.device), lr)
-        theta = row_lr * rel_mag * (snr / (snr + DEFAULT_SPHERE_SNR_TRUST_TAU))
+        theta = row_lr * rel_mag * (snr / (snr + DEFAULT_SPHERE_SNR_TRUST_TAU)) * mag_gate
     else:
-        theta = lr * rel_mag * (snr / (snr + DEFAULT_SPHERE_SNR_TRUST_TAU))
+        theta = lr * rel_mag * (snr / (snr + DEFAULT_SPHERE_SNR_TRUST_TAU)) * mag_gate
 
     u_dir = (target_radius / u_norm.clamp_min(VOCAB_MANIFOLD_EPS)) * u_tan
     w_raw = torch.cos(theta) * w_unit - torch.sin(theta) * u_dir
@@ -235,20 +245,25 @@ def _step_active_wavepacket_3d(
     tik_lam: float,
     ns_steps: int,
 ) -> None:
-    """Update active 3D `(V, M, d_h)` wavepacket rows on $(\\sqrt{d_h}\\,\\mathbb{S}^{d_h-1})^M$ (`8` args)."""
+    """Update active 3D `(V, M, d_h)` or 4D complex `(V, M_c, 2, d_h)` wavepacket rows on the sphere (`8` args)."""
     if p.grad is None:
         return
-    g_act = p.grad.index_select(0, idx_dev).float()
+    is_complex_pair = bool(getattr(p, "_complex_wavepacket_pair", False)) or (p.ndim == 4)
+    v_sz = p.size(0)
+    m_eff = (p.size(1) // 2) if (p.ndim == 3 and is_complex_pair) else p.size(1)
+    d_eff = (2 * p.size(-1)) if is_complex_pair else p.size(-1)
+
+    g_act = p.grad.index_select(0, idx_dev).float().reshape(-1, m_eff, d_eff)
     if not torch.isfinite(g_act).all():
         return
     if "momentum_buffer" not in state:
-        state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
-        state["exp_avg_sq"] = torch.zeros(p.size(0), p.size(1), 1, device=p.device, dtype=torch.float32)
+        state["momentum_buffer"] = torch.zeros((v_sz, m_eff, d_eff), device=p.device, dtype=torch.float32)
+        state["exp_avg_sq"] = torch.zeros((v_sz, m_eff, 1), device=p.device, dtype=torch.float32)
     mom_buf = state["momentum_buffer"]
     exp_avg_sq = state["exp_avg_sq"]
 
-    w_act = p.index_select(0, idx_dev).float()
-    target_radius = math.sqrt(float(w_act.size(-1)))
+    w_act = p.index_select(0, idx_dev).float().reshape(-1, m_eff, d_eff)
+    target_radius = math.sqrt(float(d_eff))
     g_tan = _project_to_sphere_tangent(g_act, w_act)
     g_norm_sq = g_tan.square().sum(dim=-1, keepdim=True)
     m_prev = mom_buf.index_select(0, idx_dev)
@@ -281,11 +296,69 @@ def _step_active_wavepacket_3d(
 
     mom_buf.index_copy_(0, idx_dev, _project_to_sphere_tangent(m_tan, w_next))
     exp_avg_sq.index_copy_(0, idx_dev, v_new)
-    p.index_copy_(0, idx_dev, w_next.to(p.dtype))
+    p.index_copy_(0, idx_dev, w_next.reshape(idx_dev.numel(), *p.shape[1:]).to(p.dtype))
+
+
+def _step_active_zero_init_ball(
+    p: torch.Tensor,
+    state: dict[str, Any],
+    lr: float,
+    beta1: float,
+    beta2: float,
+    tik_lam: float,
+    ns_steps: int,
+) -> None:
+    """Update active rows of zero-init N-gram/register tables via `d x d` Tikhonov Gram whitening inside the unit-RMS ball (`<= 8` args)."""
+    if p.grad is None or p.ndim != 2:
+        return
+    g_row_sq = p.grad.float().square().sum(dim=-1)
+    idx_nz = torch.nonzero(g_row_sq > 1e-18, as_tuple=False).reshape(-1)
+    if idx_nz.numel() == 0:
+        return
+    g_act = p.grad.index_select(0, idx_nz).float()
+    if not torch.isfinite(g_act).all():
+        return
+
+    if "momentum_buffer" not in state:
+        state["momentum_buffer"] = torch.zeros_like(p, dtype=torch.float32)
+        state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+        state["step_count"] = torch.zeros(p.size(0), 1, device=p.device, dtype=torch.float32)
+    mom_buf = state["momentum_buffer"]
+    exp_avg_sq = state["exp_avg_sq"]
+    step_buf = state["step_count"]
+
+    m_prev = mom_buf.index_select(0, idx_nz)
+    v_prev = exp_avg_sq.index_select(0, idx_nz)
+    s_new = step_buf.index_select(0, idx_nz) + 1.0
+
+    m_new = beta1 * m_prev + (1.0 - beta1) * g_act
+    v_new = beta2 * v_prev + (1.0 - beta2) * g_act.square()
+    if float(torch.linalg.matrix_norm(m_new, ord="fro").item()) < VOCAB_MANIFOLD_EPS:
+        return
+
+    bc1 = (1.0 - (beta1 ** s_new)).clamp_min(1e-3) if beta1 > 0.0 else torch.ones_like(s_new)
+    bc2 = (1.0 - (beta2 ** s_new)).clamp_min(1e-3)
+    u_coord = (m_new / bc1) / ((v_new / bc2).sqrt().add_(1e-8))
+
+    inv_sqrt_a = _compute_tikhonov_gram_inv_sqrt(m_new, tik_lam=tik_lam, ns_steps=ns_steps)
+    u_gram = torch.matmul(m_new, inv_sqrt_a)
+    u_gram_unit = u_gram / u_gram.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(VOCAB_MANIFOLD_EPS)
+    u_comb = 0.85 * u_coord + 0.15 * u_gram_unit
+
+    delta = -DEFAULT_BALL_TRUST_TAU * torch.tanh((lr * u_comb) / DEFAULT_BALL_TRUST_TAU)
+    w_act = p.index_select(0, idx_nz).float()
+    w_raw = w_act + delta
+    w_rms = w_raw.square().mean(dim=-1, keepdim=True).sqrt()
+    w_next = w_raw * (DEFAULT_BALL_MAX_RMS / w_rms.clamp_min(DEFAULT_BALL_MAX_RMS))
+
+    mom_buf.index_copy_(0, idx_nz, m_new)
+    exp_avg_sq.index_copy_(0, idx_nz, v_new)
+    step_buf.index_copy_(0, idx_nz, s_new)
+    p.index_copy_(0, idx_nz, w_next.to(p.dtype))
 
 
 class BatchSubspaceTikhonovGramMuon(torch.optim.Optimizer):
-    """Active-token `(Q, N_act, A)` Tikhonov-damped Gram Muon on the unit-RMS sphere $\\sqrt{d}\\,\\mathbb{S}^{d-1}$."""
+    """Active-token `(Q, N_act, A)` Tikhonov-damped Gram Muon on the unit-RMS sphere $\\sqrt{d}\\,\\mathbb{S}^{d-1}$ or soft RMS ball."""
 
     def __init__(
         self,
@@ -295,13 +368,18 @@ class BatchSubspaceTikhonovGramMuon(torch.optim.Optimizer):
         tikhonov_lambda: float = DEFAULT_TIKHONOV_GRAM_LAMBDA,
         ns_steps: int = DEFAULT_COUPLED_NS_STEPS,
         radial_lr_ratio: float = 0.0,
+        zero_init_ball: bool = False,
+        grad_norm_gate_tau: float = 0.0,
     ) -> None:
         self.radial_lr_ratio = float(radial_lr_ratio)
+        self.grad_norm_gate_tau = float(grad_norm_gate_tau)
         defaults = {
             "lr": float(lr),
             "beta": float(beta),
             "tikhonov_lambda": float(tikhonov_lambda),
             "ns_steps": int(ns_steps),
+            "zero_init_ball": bool(zero_init_ball),
+            "grad_norm_gate_tau": float(grad_norm_gate_tau),
         }
         super().__init__(params, defaults)
 
@@ -331,7 +409,7 @@ class BatchSubspaceTikhonovGramMuon(torch.optim.Optimizer):
         active_idx: torch.Tensor,
         lr_scale: float = 1.0,
     ) -> None:
-        """Update strictly the active vocabulary rows indexed by `active_idx`."""
+        """Update strictly the active vocabulary or N-gram bucket rows."""
         valid_mask = active_idx >= 0
         idx_act = torch.unique(active_idx[valid_mask].reshape(-1)).long()
         if idx_act.numel() == 0:
@@ -343,22 +421,17 @@ class BatchSubspaceTikhonovGramMuon(torch.optim.Optimizer):
             beta2 = DEFAULT_VOCAB_MOMENTUM_BETA2
             tik_lam = float(group["tikhonov_lambda"])
             ns_steps = int(group["ns_steps"])
+            is_ball = bool(group.get("zero_init_ball", False))
+            g_tau = float(group.get("grad_norm_gate_tau", self.grad_norm_gate_tau))
 
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                idx_dev = idx_act.to(p.device)
-                if p.ndim == 4:
-                    p_3d = p.view(p.size(0), p.size(1), p.size(2) * p.size(3))
-                    p_3d.grad = p.grad.view(p.size(0), p.size(1), p.size(2) * p.size(3))
-                    slice_mult = getattr(p, "_slice_lr_mult", None)
-                    if slice_mult is not None:
-                        self.state[p]["slice_lr_mult"] = slice_mult
-                    _step_active_wavepacket_3d(
-                        p_3d, self.state[p], idx_dev, lr, beta1, beta2, tik_lam, ns_steps
-                    )
+                if is_ball:
+                    _step_active_zero_init_ball(p, self.state[p], lr, beta1, beta2, tik_lam, ns_steps)
                     continue
-                if p.ndim == 3:
+                idx_dev = idx_act.to(p.device)
+                if p.ndim in (3, 4):
                     _step_active_wavepacket_3d(
                         p, self.state[p], idx_dev, lr, beta1, beta2, tik_lam, ns_steps
                     )
@@ -398,10 +471,14 @@ class BatchSubspaceTikhonovGramMuon(torch.optim.Optimizer):
                 u_tan = _project_to_sphere_tangent(u_act, w_act)
 
                 u_norm = u_tan.norm(dim=-1, keepdim=True)
-                snr = m_tan.norm(dim=-1, keepdim=True) / (v_new.sqrt() + VOCAB_MANIFOLD_EPS)
+                m_row_norm = m_tan.norm(dim=-1, keepdim=True)
+                snr = m_row_norm / (v_new.sqrt() + VOCAB_MANIFOLD_EPS)
                 rms_u = u_norm.square().mean().sqrt().clamp_min(VOCAB_MANIFOLD_EPS)
                 rel_mag = (u_norm / rms_u).clamp_max(2.5)
-                theta = lr * rel_mag * (snr / (snr + DEFAULT_SPHERE_SNR_TRUST_TAU))
+                mag_gate: torch.Tensor | float = (
+                    (m_row_norm.square() / (m_row_norm.square() + g_tau * g_tau)).sqrt() if g_tau > 0.0 else 1.0
+                )
+                theta = lr * rel_mag * (snr / (snr + DEFAULT_SPHERE_SNR_TRUST_TAU)) * mag_gate
 
                 u_dir = (target_radius / u_norm.clamp_min(VOCAB_MANIFOLD_EPS)) * u_tan
                 w_raw = torch.cos(theta) * w_act - torch.sin(theta) * u_dir
@@ -431,11 +508,19 @@ class BatchSubspaceTikhonovGramMuon(torch.optim.Optimizer):
             beta1 = float(group["beta"])
             tik_lam = float(group["tikhonov_lambda"])
             ns_steps = int(group["ns_steps"])
+            is_ball = bool(group.get("zero_init_ball", False))
+            g_tau = float(group.get("grad_norm_gate_tau", self.grad_norm_gate_tau))
 
             for p in group["params"]:
-                _step_full_single_param(
-                    p, self.state[p], lr, beta1, tik_lam, ns_steps, idx_act, self.radial_lr_ratio
-                )
+                if is_ball:
+                    _step_active_zero_init_ball(
+                        p, self.state[p], lr, beta1, DEFAULT_VOCAB_MOMENTUM_BETA2, tik_lam, ns_steps
+                    )
+                else:
+                    self.state[p]["grad_norm_gate_tau"] = g_tau
+                    _step_full_single_param(
+                        p, self.state[p], lr, beta1, tik_lam, ns_steps, idx_act, self.radial_lr_ratio
+                    )
 
     @torch.no_grad()
     def step(self, closure: Any = None) -> torch.Tensor | None:
@@ -603,3 +688,298 @@ class RiemannianSphereTangentSNROptimizer(torch.optim.Optimizer):
                 loss = closure()
         self.step_full(lr_scale=1.0)
         return loss
+
+
+def _step_complex_sphere_pair(
+    p_re: torch.Tensor,
+    p_im: torch.Tensor,
+    state: dict[str, Any],
+    lr: float,
+    beta1: float,
+    beta2: float,
+    max_angle: float,
+) -> None:
+    """Update paired complex kets `(p_re, p_im)` on $\\mathbb{S}^{2 d_h - 1}$ via tangent-projected great-circle rotation (`<= 8` args)."""
+    if p_re.grad is None or p_im.grad is None:
+        return
+    d_h = p_re.size(-1)
+    w = torch.cat([p_re.float(), p_im.float()], dim=-1)
+    g = torch.cat([p_re.grad.float(), p_im.grad.float()], dim=-1)
+    if not torch.isfinite(g).all():
+        return
+
+    target_r = w.norm(dim=-1, keepdim=True).clamp_min(VOCAB_MANIFOLD_EPS)
+    g_tan = _project_to_sphere_tangent(g, w)
+    g_sq = g_tan.square().sum(dim=-1, keepdim=True)
+
+    if "exp_avg" not in state:
+        state["exp_avg"] = torch.zeros_like(w, dtype=torch.float32)
+        state["exp_avg_sq"] = torch.zeros(*w.shape[:-1], 1, device=w.device, dtype=torch.float32)
+        state["step"] = 0
+    state["step"] += 1
+    t = int(state["step"])
+    exp_avg = state["exp_avg"]
+    exp_avg_sq = state["exp_avg_sq"]
+
+    exp_avg.mul_(beta1).add_(g_tan, alpha=1.0 - beta1)
+    exp_avg_sq.mul_(beta2).add_(g_sq, alpha=1.0 - beta2)
+    m_tan = _project_to_sphere_tangent(exp_avg, w)
+
+    bc1 = max(1e-3, 1.0 - (beta1 ** t)) if beta1 > 0.0 else 1.0
+    bc2 = max(1e-3, 1.0 - (beta2 ** t))
+    m_norm = m_tan.norm(dim=-1, keepdim=True)
+    snr = ((m_norm / bc1) / ((exp_avg_sq / bc2).sqrt() + VOCAB_MANIFOLD_EPS)).clamp_max(2.0)
+    theta = max_angle * torch.tanh((lr * snr) / max_angle)
+
+    u_dir = (target_r / m_norm.clamp_min(VOCAB_MANIFOLD_EPS)) * m_tan
+    w_raw = torch.cos(theta) * w - torch.sin(theta) * u_dir
+    w_next = (target_r / w_raw.norm(dim=-1, keepdim=True).clamp_min(VOCAB_MANIFOLD_EPS)) * w_raw
+
+    exp_avg.copy_(_project_to_sphere_tangent(m_tan, w_next))
+    p_re.copy_(w_next[..., :d_h].to(p_re.dtype))
+    p_im.copy_(w_next[..., d_h:].to(p_im.dtype))
+
+
+def _step_real_sphere_ket(
+    p: torch.Tensor,
+    state: dict[str, Any],
+    lr: float,
+    beta1: float,
+    beta2: float,
+    max_angle: float,
+) -> None:
+    """Update real-packed sphere ket `p` `(..., d)` on $\\sqrt{d}\\,\\mathbb{S}^{d-1}$ via great-circle geodesic rotation (`<= 8` args)."""
+    if p.grad is None:
+        return
+    g = p.grad.float()
+    if not torch.isfinite(g).all():
+        return
+    w = p.float()
+    target_r = math.sqrt(float(w.size(-1)))
+    g_tan = _project_to_sphere_tangent(g, w)
+    g_sq = g_tan.square().sum(dim=-1, keepdim=True)
+
+    if "exp_avg" not in state:
+        state["exp_avg"] = torch.zeros_like(w, dtype=torch.float32)
+        state["exp_avg_sq"] = torch.zeros(*w.shape[:-1], 1, device=w.device, dtype=torch.float32)
+        state["step"] = 0
+    state["step"] += 1
+    t = int(state["step"])
+    exp_avg = state["exp_avg"]
+    exp_avg_sq = state["exp_avg_sq"]
+
+    exp_avg.mul_(beta1).add_(g_tan, alpha=1.0 - beta1)
+    exp_avg_sq.mul_(beta2).add_(g_sq, alpha=1.0 - beta2)
+    m_tan = _project_to_sphere_tangent(exp_avg, w)
+
+    bc1 = max(1e-3, 1.0 - (beta1 ** t)) if beta1 > 0.0 else 1.0
+    bc2 = max(1e-3, 1.0 - (beta2 ** t))
+    m_norm = m_tan.norm(dim=-1, keepdim=True)
+    snr = ((m_norm / bc1) / ((exp_avg_sq / bc2).sqrt() + VOCAB_MANIFOLD_EPS)).clamp_max(2.0)
+    theta = max_angle * torch.tanh((lr * snr) / max_angle)
+
+    u_dir = (target_r / m_norm.clamp_min(VOCAB_MANIFOLD_EPS)) * m_tan
+    w_raw = torch.cos(theta) * w - torch.sin(theta) * u_dir
+    w_next = (target_r / w_raw.norm(dim=-1, keepdim=True).clamp_min(VOCAB_MANIFOLD_EPS)) * w_raw
+
+    exp_avg.copy_(_project_to_sphere_tangent(m_tan, w_next))
+    p.copy_(w_next.to(p.dtype))
+
+
+def _step_positive_geodesic_param(
+    p: torch.Tensor,
+    state: dict[str, Any],
+    lr: float,
+    beta1: float,
+    beta2: float,
+    ref_scale: float,
+    max_log_step: float,
+) -> None:
+    """Update positive scale `p > 0` on $(\\mathbb{R}_{>0}, ds = (1/p + 1/\\beta_{\\text{ref}})dp)$ with zero quenching (`<= 8` args)."""
+    if p.grad is None:
+        return
+    g_f = p.grad.float()
+    if not torch.isfinite(g_f).all():
+        return
+    if "exp_avg" not in state:
+        state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+        state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+        state["step"] = 0
+    state["step"] += 1
+    t = int(state["step"])
+    exp_avg = state["exp_avg"]
+    exp_avg_sq = state["exp_avg_sq"]
+
+    exp_avg.mul_(beta1).add_(g_f, alpha=1.0 - beta1)
+    exp_avg_sq.mul_(beta2).addcmul_(g_f, g_f, value=1.0 - beta2)
+
+    bc1 = max(1e-3, 1.0 - (beta1 ** t)) if beta1 > 0.0 else 1.0
+    bc2 = max(1e-3, 1.0 - (beta2 ** t))
+    u_hat = (exp_avg / bc1) / ((exp_avg_sq / bc2).sqrt().add_(1e-8))
+
+    cold_ramp = 0.50 if t == 1 else 1.0
+    delta_xi = -max_log_step * torch.tanh((cold_ramp * lr * u_hat) / max_log_step)
+    p_f = p.float().clamp_min(1e-4)
+    eff_log_step = delta_xi / (1.0 + p_f / float(max(1e-3, ref_scale)))
+    p.copy_((p_f * torch.exp(eff_log_step)).to(p.dtype))
+
+
+def _step_sparse_vocab_param(
+    p: torch.Tensor,
+    state: dict[str, Any],
+    idx_act: torch.Tensor | None,
+    lr: float,
+    beta1: float,
+    beta2: float,
+    max_step: float,
+    is_positive: bool,
+) -> None:
+    """Update active vocabulary coordinates `p[idx_act]` `(V,)` via sparse geodesic/tangent steps (`<= 8` args)."""
+    if p.grad is None or p.ndim != 1:
+        return
+    if idx_act is None or idx_act.numel() == 0:
+        return
+    idx_dev = idx_act.to(p.device)
+    g_act = p.grad.index_select(0, idx_dev).float()
+    if not torch.isfinite(g_act).all():
+        return
+
+    if "exp_avg" not in state:
+        state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+        state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+        state["step_count"] = torch.zeros_like(p, dtype=torch.float32)
+    exp_avg = state["exp_avg"]
+    exp_avg_sq = state["exp_avg_sq"]
+    step_buf = state["step_count"]
+
+    m_new = beta1 * exp_avg.index_select(0, idx_dev) + (1.0 - beta1) * g_act
+    v_new = beta2 * exp_avg_sq.index_select(0, idx_dev) + (1.0 - beta2) * g_act.square()
+    s_new = step_buf.index_select(0, idx_dev) + 1.0
+
+    bc1 = (1.0 - (beta1 ** s_new)).clamp_min(1e-3) if beta1 > 0.0 else torch.ones_like(s_new)
+    bc2 = (1.0 - (beta2 ** s_new)).clamp_min(1e-3)
+    u_hat = (m_new / bc1) / ((v_new / bc2).sqrt().add_(1e-8))
+    delta = -max_step * torch.tanh((lr * u_hat) / max_step)
+
+    p_act = p.index_select(0, idx_dev).float()
+    p_next = p_act.clamp_min(1e-4) * torch.exp(delta / (1.0 + p_act.clamp_min(1e-4))) if is_positive else (p_act + delta)
+    exp_avg.index_copy_(0, idx_dev, m_new)
+    exp_avg_sq.index_copy_(0, idx_dev, v_new)
+    step_buf.index_copy_(0, idx_dev, s_new)
+    p.index_copy_(0, idx_dev, p_next.to(p.dtype))
+
+
+def _step_bounded_tangent_param(
+    p: torch.Tensor,
+    state: dict[str, Any],
+    lr: float,
+    beta1: float,
+    beta2: float,
+    max_step: float,
+) -> None:
+    """Update signed coupling scalar, phase $\\in \\mathbb{S}^1$, or small 2D gate matrix with bounded tangent step (`<= 8` args)."""
+    if p.grad is None:
+        return
+    g_f = p.grad.float()
+    if not torch.isfinite(g_f).all():
+        return
+    if "exp_avg" not in state:
+        state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+        state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+        state["step"] = 0
+    state["step"] += 1
+    t = int(state["step"])
+    exp_avg = state["exp_avg"]
+    exp_avg_sq = state["exp_avg_sq"]
+
+    exp_avg.mul_(beta1).add_(g_f, alpha=1.0 - beta1)
+    exp_avg_sq.mul_(beta2).addcmul_(g_f, g_f, value=1.0 - beta2)
+
+    bc1 = max(1e-3, 1.0 - (beta1 ** t)) if beta1 > 0.0 else 1.0
+    bc2 = max(1e-3, 1.0 - (beta2 ** t))
+    u_hat = (exp_avg / bc1) / ((exp_avg_sq / bc2).sqrt().add_(1e-8))
+    delta = -max_step * torch.tanh((lr * u_hat) / max_step)
+    w_raw = p.float() + delta
+    if p.ndim == 2:
+        w_rms = w_raw.square().mean(dim=-1, keepdim=True).sqrt()
+        w_raw = w_raw * (DEFAULT_BALL_MAX_RMS / w_rms.clamp_min(DEFAULT_BALL_MAX_RMS))
+    p.copy_(w_raw.to(p.dtype))
+
+
+class RiemannianGeodesicScalarAndProbeOptimizer(torch.optim.Optimizer):
+    """100% `AdamW`-free Riemannian optimizer for complex $\\mathbb{S}^{31}$ probe/vacuum kets, $\\mathbb{R}_{>0}$ geodesic scales, sparse priors, and bounded gates."""
+
+    def __init__(
+        self,
+        params: Any,
+        lr: float = 0.008,
+        beta1: float = 0.80,
+        beta2: float = 0.95,
+    ) -> None:
+        defaults = {
+            "lr": float(lr),
+            "beta1": float(beta1),
+            "beta2": float(beta2),
+            "kind": "bounded_tangent",
+            "ref_scale": 1.0,
+            "max_step": DEFAULT_BOUNDED_TANGENT_MAX_STEP,
+        }
+        super().__init__(params, defaults)
+
+    def set_momentum(self, beta1: float) -> None:
+        """Update first-moment tangent decay `beta1` across all parameter groups."""
+        b1 = 0.0 if beta1 <= 0.0 else float(beta1)
+        for group in self.param_groups:
+            group["beta1"] = b1
+
+    @torch.no_grad()
+    def step_active(
+        self,
+        active_idx: torch.Tensor | None = None,
+        lr_scale: float = 1.0,
+    ) -> None:
+        """Execute one coordinated geodesic/tangent step across all parameter groups."""
+        idx_act: torch.Tensor | None = None
+        if active_idx is not None:
+            valid_mask = active_idx >= 0
+            u_idx = torch.unique(active_idx[valid_mask].reshape(-1)).long()
+            if u_idx.numel() > 0:
+                idx_act = u_idx
+
+        for group in self.param_groups:
+            lr = float(group["lr"]) * float(lr_scale)
+            beta1 = float(group["beta1"])
+            beta2 = float(group["beta2"])
+            kind = str(group.get("kind", "bounded_tangent"))
+            ref_scale = float(group.get("ref_scale", 1.0))
+            max_step = float(group.get("max_step", DEFAULT_BOUNDED_TANGENT_MAX_STEP))
+            params = group["params"]
+
+            if kind == "complex_sphere_pair":
+                for i in range(0, len(params) - 1, 2):
+                    _step_complex_sphere_pair(
+                        params[i], params[i + 1], self.state[params[i]], lr, beta1, beta2, max_step
+                    )
+            elif kind == "real_sphere_ket":
+                for p in params:
+                    _step_real_sphere_ket(p, self.state[p], lr, beta1, beta2, max_step)
+            elif kind == "positive_geodesic":
+                for p in params:
+                    _step_positive_geodesic_param(p, self.state[p], lr, beta1, beta2, ref_scale, max_step)
+            elif kind in ("sparse_vocab_positive", "sparse_vocab_bias"):
+                is_pos = kind == "sparse_vocab_positive"
+                for p in params:
+                    _step_sparse_vocab_param(p, self.state[p], idx_act, lr, beta1, beta2, max_step, is_pos)
+            else:
+                for p in params:
+                    _step_bounded_tangent_param(p, self.state[p], lr, beta1, beta2, max_step)
+
+    @torch.no_grad()
+    def step(self, closure: Any = None) -> torch.Tensor | None:
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        self.step_active(active_idx=None, lr_scale=1.0)
+        return loss
+

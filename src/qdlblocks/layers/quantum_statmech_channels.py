@@ -59,6 +59,7 @@ DEFAULT_COLUMN_SCALE_LR_RATIO: float = 1.00
 DEFAULT_COLUMN_SCALE_MIN: float = 0.50
 DEFAULT_COLUMN_SCALE_MAX: float = 2.00
 DEFAULT_STIEFEL_SNR_TRUST_TAU: float = 0.35
+DEFAULT_MUON_GRAD_NORM_GATE_TAU: float = 1e-4
 DEFAULT_MOM_FIXED_HIGH_BETA: float = 0.90
 DEFAULT_MOM_WARMUP_ZERO_FRAC: float = 0.10
 DEFAULT_MOM_WARMUP_END_FRAC: float = 0.375
@@ -97,6 +98,7 @@ class StiefelMomentumMode(str, Enum):
     EUCLIDEAN_AMBIENT = "euclidean_ambient"
     RIEMANNIAN_TANGENT_TRANSPORTED = "riemannian_tangent_transported"
     RIEMANNIAN_TANGENT_SNR_GATED = "riemannian_tangent_snr_gated"
+    RIEMANNIAN_TANGENT_SNR_AND_MAG_GATED = "riemannian_tangent_snr_and_mag_gated"
     RIEMANNIAN_COLUMN_SCALED_STIEFEL = "riemannian_column_scaled_stiefel"
     UNNORMALIZED_FINAL_READOUT_HEAD = "unnormalized_final_readout_head"
     UNNORMALIZED_FINAL_BLOCK_AND_HEAD = "unnormalized_final_block_and_head"
@@ -510,11 +512,15 @@ def riemannian_stiefel_tangent_transport_muon_step(
     elif momentum_mode in (
         StiefelMomentumMode.RIEMANNIAN_TANGENT_TRANSPORTED,
         StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_GATED,
+        StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_AND_MAG_GATED,
     ):
         w_unit = w_f32
         g_tan = project_real_stiefel_tangent(g_clean, w_unit)
         m_prev_tan = project_real_stiefel_tangent(m_f32, w_unit)
-        if momentum_mode == StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_GATED:
+        if momentum_mode in (
+            StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_GATED,
+            StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_AND_MAG_GATED,
+        ):
             g_sq = g_tan.square().sum(dim=(-2, -1), keepdim=True).clamp_min(TRACE_NORM_EPS)
             m_sq = m_prev_tan.square().sum(dim=(-2, -1), keepdim=True)
             dot_mg = (m_prev_tan * g_tan).sum(dim=(-2, -1), keepdim=True)
@@ -526,6 +532,10 @@ def riemannian_stiefel_tangent_transport_muon_step(
             coh = m_updated.norm(dim=(-2, -1), keepdim=True) / (float(beta) * m_n + g_n + TRACE_NORM_EPS)
             snr_tan = (coh * (1.0 + 0.5 * cos_mg)).clamp(0.05, 1.50)
             step_lr: torch.Tensor | float = float(lr) * (snr_tan / (snr_tan + DEFAULT_STIEFEL_SNR_TRUST_TAU))
+            if momentum_mode == StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_AND_MAG_GATED:
+                m_tan_sq = m_tan.square().sum(dim=(-2, -1), keepdim=True)
+                tau_sq = float(DEFAULT_MUON_GRAD_NORM_GATE_TAU * DEFAULT_MUON_GRAD_NORM_GATE_TAU)
+                step_lr = step_lr * (m_tan_sq / (m_tan_sq + tau_sq)).sqrt()
         else:
             m_updated = float(beta) * m_prev_tan + g_tan
             m_tan = g_tan + float(beta) * m_updated
@@ -568,6 +578,7 @@ def riemannian_stiefel_tangent_transport_muon_step(
     elif momentum_mode in (
         StiefelMomentumMode.RIEMANNIAN_TANGENT_TRANSPORTED,
         StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_GATED,
+        StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_AND_MAG_GATED,
     ):
         w_next = w_unit_next
         m_stored = project_real_stiefel_tangent(m_updated, w_next)
@@ -665,7 +676,10 @@ def riemannian_complex_tangent_transport_muon_step(
     if momentum_mode != StiefelMomentumMode.EUCLIDEAN_AMBIENT:
         g_tan_re, g_tan_im = project_complex_stiefel_tangent(g_in_re, g_in_im, ar, ai)
         m_pre_tan_re, m_pre_tan_im = project_complex_stiefel_tangent(mom_re.float(), mom_im.float(), ar, ai)
-        if momentum_mode == StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_GATED:
+        if momentum_mode in (
+            StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_GATED,
+            StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_AND_MAG_GATED,
+        ):
             g_sq = (g_tan_re.square() + g_tan_im.square()).sum(dim=(-2, -1), keepdim=True).clamp_min(TRACE_NORM_EPS)
             m_sq = (m_pre_tan_re.square() + m_pre_tan_im.square()).sum(dim=(-2, -1), keepdim=True)
             dot_mg = (m_pre_tan_re * g_tan_re + m_pre_tan_im * g_tan_im).sum(dim=(-2, -1), keepdim=True)
@@ -685,6 +699,10 @@ def riemannian_complex_tangent_transport_muon_step(
             mom_im.copy_(float(beta) * m_pre_tan_im + g_tan_im)
         g_re = g_tan_re + float(beta) * mom_re.float()
         g_im = g_tan_im + float(beta) * mom_im.float()
+        if momentum_mode == StiefelMomentumMode.RIEMANNIAN_TANGENT_SNR_AND_MAG_GATED:
+            m_tan_sq = (g_re.square() + g_im.square()).sum(dim=(-2, -1), keepdim=True)
+            tau_sq = float(DEFAULT_MUON_GRAD_NORM_GATE_TAU * DEFAULT_MUON_GRAD_NORM_GATE_TAU)
+            step_lr = step_lr * (m_tan_sq / (m_tan_sq + tau_sq)).sqrt()
     else:
         mom_re.mul_(beta).add_(g_in_re)
         mom_im.mul_(beta).add_(g_in_im)

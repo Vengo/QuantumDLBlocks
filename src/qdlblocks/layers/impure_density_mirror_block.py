@@ -87,6 +87,32 @@ def complex_l2_normalize(
     return z_re * inv_norm, z_im * inv_norm
 
 
+_HERMITIAN_ISOMETRIC_MASKS_CACHE: dict[
+    tuple[int, torch.device, torch.dtype], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+] = {}
+
+
+def _get_hermitian_isometric_masks(
+    d_h: int, device: torch.device, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return cached `(pack_re_mask, pack_im_t_mask, unpack_re_half_mask, unpack_im_low_mask)` of shape `(d_h, d_h)`."""
+    key = (int(d_h), device, dtype)
+    cached = _HERMITIAN_ISOMETRIC_MASKS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ones = torch.ones((d_h, d_h), device=device, dtype=torch.float32)
+    eye = torch.eye(d_h, device=device, dtype=torch.float32)
+    upper = torch.triu(ones, diagonal=1)
+    lower = torch.tril(ones, diagonal=-1)
+    pack_re = (eye + upper * SQRT2_ISOMETRIC_OFFDIAG_SCALE).to(dtype)
+    pack_im_t = (lower * SQRT2_ISOMETRIC_OFFDIAG_SCALE).to(dtype)
+    unpack_re_half = (0.5 * eye + upper * INV_SQRT2_ISOMETRIC_SCALE).to(dtype)
+    unpack_im_low = (lower * INV_SQRT2_ISOMETRIC_SCALE).to(dtype)
+    res = (pack_re, pack_im_t, unpack_re_half, unpack_im_low)
+    _HERMITIAN_ISOMETRIC_MASKS_CACHE[key] = res
+    return res
+
+
 def pack_hermitian_isometric(
     rho_re: torch.Tensor,
     rho_im: torch.Tensor,
@@ -101,10 +127,9 @@ def pack_hermitian_isometric(
     Guarantees $\\langle \\tilde{P}(A), \\tilde{P}(B)\\rangle_{\\mathbb{R}^{d_h^2}} = \\text{Tr}(AB)$ and
     $\\|\\tilde{P}(\\rho)\\|_2^2 = \\text{Tr}(\\rho^2)$.
     """
-    diag_part = torch.diag_embed(torch.diagonal(rho_re, dim1=-2, dim2=-1))
-    upper_re = torch.triu(rho_re, diagonal=1) * SQRT2_ISOMETRIC_OFFDIAG_SCALE
-    lower_im = torch.tril(rho_im.transpose(-2, -1), diagonal=-1) * SQRT2_ISOMETRIC_OFFDIAG_SCALE
-    packed_mat = diag_part + upper_re + lower_im
+    d_h = rho_re.size(-1)
+    pack_re, pack_im_t, _, _ = _get_hermitian_isometric_masks(d_h, rho_re.device, rho_re.dtype)
+    packed_mat = rho_re * pack_re + rho_im.transpose(-2, -1) * pack_im_t
     return packed_mat.flatten(start_dim=-2, end_dim=-1)
 
 
@@ -114,12 +139,24 @@ def unpack_hermitian_isometric(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Invert `pack_hermitian_isometric`, mapping `(..., d_h * d_h)` back to Hermitian `(rho_re, rho_im)` `(..., d_h, d_h)`."""
     mat = packed.unflatten(dim=-1, sizes=(d_h, d_h))
-    diag_re = torch.diag_embed(torch.diagonal(mat, dim1=-2, dim2=-1))
-    upper_re = torch.triu(mat, diagonal=1) * INV_SQRT2_ISOMETRIC_SCALE
-    lower_im_t = torch.tril(mat, diagonal=-1) * INV_SQRT2_ISOMETRIC_SCALE
-    rho_re = diag_re + upper_re + upper_re.transpose(-2, -1)
-    rho_im = lower_im_t.transpose(-2, -1) - lower_im_t
+    _, _, unpack_re_half, unpack_im_low = _get_hermitian_isometric_masks(d_h, packed.device, packed.dtype)
+    half_re = mat * unpack_re_half
+    low_im = mat * unpack_im_low
+    rho_re = half_re + half_re.transpose(-2, -1)
+    rho_im = low_im.transpose(-2, -1) - low_im
     return rho_re, rho_im
+
+
+_COMPILED_PACK_RANK1_OUTER_FN: Any = None
+
+
+def _pack_rank1_ket_outer_masked(
+    v_re: torch.Tensor, v_im: torch.Tensor, pack_re: torch.Tensor, pack_im_t: torch.Tensor
+) -> torch.Tensor:
+    """Pure tensor rank-1 ket outer-product isometric packer for Inductor fusion (`<= 8` args)."""
+    outer_re = v_re.unsqueeze(-1) * v_re.unsqueeze(-2) + v_im.unsqueeze(-1) * v_im.unsqueeze(-2)
+    outer_im_t = v_re.unsqueeze(-1) * v_im.unsqueeze(-2) - v_im.unsqueeze(-1) * v_re.unsqueeze(-2)
+    return (outer_re * pack_re + outer_im_t * pack_im_t).flatten(start_dim=-2, end_dim=-1)
 
 
 def pack_rank1_ket_outer_isometric(
@@ -127,9 +164,14 @@ def pack_rank1_ket_outer_isometric(
     v_im: torch.Tensor,
 ) -> torch.Tensor:
     """Pack pure rank-1 outer product $|v\\rangle\\langle v|$ for complex kets `(v_re, v_im)` `(..., d_h)` into `(..., d_h^2)`."""
-    outer_re = v_re.unsqueeze(-1) * v_re.unsqueeze(-2) + v_im.unsqueeze(-1) * v_im.unsqueeze(-2)
-    outer_im = v_im.unsqueeze(-1) * v_re.unsqueeze(-2) - v_re.unsqueeze(-1) * v_im.unsqueeze(-2)
-    return pack_hermitian_isometric(outer_re, outer_im)
+    global _COMPILED_PACK_RANK1_OUTER_FN
+    d_h = v_re.size(-1)
+    pack_re, pack_im_t, _, _ = _get_hermitian_isometric_masks(d_h, v_re.device, v_re.dtype)
+    if v_re.is_cuda and not torch.compiler.is_compiling():
+        if _COMPILED_PACK_RANK1_OUTER_FN is None:
+            _COMPILED_PACK_RANK1_OUTER_FN = torch.compile(_pack_rank1_ket_outer_masked, dynamic=False)
+        return _COMPILED_PACK_RANK1_OUTER_FN(v_re, v_im, pack_re, pack_im_t)
+    return _pack_rank1_ket_outer_masked(v_re, v_im, pack_re, pack_im_t)
 
 
 def fast_rank_r_hermitian_and_ket_pack(

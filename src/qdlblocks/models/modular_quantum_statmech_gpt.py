@@ -485,8 +485,12 @@ class ModularRiemannianStiefelKrausMuon(torch.optim.Optimizer):
         if self.collect_diagnostics and diag_weight_sum > 0:
             self._last_step_diagnostics = {k: float(v / diag_weight_sum) for k, v in diag_accum.items()}
 
-        active_pairs = [(u_re, u_im) for u_re, u_im in self.complex_operator_pairs if u_re.grad is not None and u_im.grad is not None]
-        if active_pairs:
+        complex_buckets: dict[tuple[int, int], list[tuple[nn.Parameter, nn.Parameter]]] = {}
+        for u_re, u_im in self.complex_operator_pairs:
+            if u_re.grad is not None and u_im.grad is not None:
+                complex_buckets.setdefault((int(u_re.size(-2)), int(u_re.size(-1))), []).append((u_re, u_im))
+
+        for _, active_pairs in complex_buckets.items():
             u_re_list = [u_re.data for u_re, _ in active_pairs]
             u_im_list = [u_im.data for _, u_im in active_pairs]
             g_re_list = [u_re.grad for u_re, _ in active_pairs if u_re.grad is not None]

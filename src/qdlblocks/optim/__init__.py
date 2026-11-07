@@ -30,6 +30,7 @@ from .vocab_manifold_muon import (
     DEFAULT_SPHERE_GEODESIC_LR,
     DEFAULT_SPHERE_SNR_TRUST_TAU,
     BatchSubspaceTikhonovGramMuon,
+    RiemannianGeodesicScalarAndProbeOptimizer,
     RiemannianSphereTangentSNROptimizer,
     project_rows_to_rms_sphere_,
 )
@@ -39,6 +40,7 @@ __all__ = [
     "DEFAULT_SPHERE_GEODESIC_LR",
     "DEFAULT_SPHERE_SNR_TRUST_TAU",
     "BatchSubspaceTikhonovGramMuon",
+    "RiemannianGeodesicScalarAndProbeOptimizer",
     "RiemannianSphereTangentSNROptimizer",
     "project_rows_to_rms_sphere_",
     "DEFAULT_MUON_REFERENCE_BATCH_TOKENS",
