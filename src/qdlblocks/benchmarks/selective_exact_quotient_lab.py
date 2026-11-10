@@ -273,18 +273,105 @@ def filter_tied_bridge_post_ns_common_spin(
     z_in_ns: torch.Tensor, z_out_ns: torch.Tensor, xi_in_ref: torch.Tensor, xi_out_ref: torch.Tensor,
     u_in: torch.Tensor, u_out: torch.Tensor, excess_damping: float = DEFAULT_COMMON_BRIDGE_EXCESS_DAMPING,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    r"""Project post-NS bridge updates onto $\mathcal{H}_U\operatorname{Gr}(d_{\text{sub}}, 512)$ to decouple subspace selection from $W_{\text{vocab}}$ coordinate rotation (`<= 8` args).
+    r"""Preserve 100% of relative bridge rotation $\Omega_{\text{in}} - \Omega_{\text{out}}$ while damping excess post-NS common spin $\Delta\Omega_{\text{com}}^{\text{NS}}$ (`<= 8` args)."""
+    tin = project_real_stiefel_tangent(z_in_ns, u_in)
+    tout = project_real_stiefel_tangent(z_out_ns, u_out)
+    ut_in = torch.matmul(u_in.transpose(-2, -1), tin)
+    ut_out = torch.matmul(u_out.transpose(-2, -1), tout)
+    om_com_ns = 0.25 * ((ut_in - ut_in.transpose(-2, -1)) + (ut_out - ut_out.transpose(-2, -1)))
 
-    Because $W_{\text{vocab}} \in \mathbb{R}^{V \times d_{\text{sub}}}$ already updates coordinates inside the $d_{\text{sub}}$-dimensional
-    subspace at $5.6\times$ higher learning rate (`0.045` vs `0.008`), restricting the post-NS bridge step to
-    $H_{\text{in}} = (I - U_{\text{in}} U_{\text{in}}^\top) Z_{\text{in,ns}}$ and $H_{\text{out}} = (I - U_{\text{out}} U_{\text{out}}^\top) Z_{\text{out,ns}}$
-    eliminates both $\Omega^\top\Omega$ Gram contamination and two-player $(U, W_{\text{vocab}})$ basis-rotation collisions.
-    """
-    _ = (xi_in_ref, xi_out_ref, excess_damping)
-    h_in = z_in_ns - torch.matmul(u_in, torch.matmul(u_in.transpose(-2, -1), z_in_ns))
-    h_out = z_out_ns - torch.matmul(u_out, torch.matmul(u_out.transpose(-2, -1), z_out_ns))
-    return h_in, h_out
+    norm_ns = (tin.square().sum(dim=(-2, -1), keepdim=True) + tout.square().sum(dim=(-2, -1), keepdim=True)).sqrt()
+    norm_ref = (xi_in_ref.square().sum(dim=(-2, -1), keepdim=True) + xi_out_ref.square().sum(dim=(-2, -1), keepdim=True)).sqrt().clamp_min(1e-8)
+    ur_in = torch.matmul(u_in.transpose(-2, -1), xi_in_ref)
+    ur_out = torch.matmul(u_out.transpose(-2, -1), xi_out_ref)
+    om_com_ref = 0.25 * ((ur_in - ur_in.transpose(-2, -1)) + (ur_out - ur_out.transpose(-2, -1))) * (norm_ns / norm_ref)
+    delta_com = float(excess_damping) * (om_com_ns - om_com_ref)
+    return tin - torch.matmul(u_in, delta_com), tout - torch.matmul(u_out, delta_com)
 
+
+def _clean_and_snr_gate_real_tangent(
+    g_tan: torch.Tensor, m_prev_tan: torch.Tensor, lr: float, beta: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Clean opposing momentum ($\langle M, G\rangle < 0$) and compute tangent SNR + magnitude trust-region `step_lr` (`<= 8` args)."""
+    g_sq = g_tan.square().sum(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+    m_sq = m_prev_tan.square().sum(dim=(-2, -1), keepdim=True)
+    dot_mg = (m_prev_tan * g_tan).sum(dim=(-2, -1), keepdim=True)
+    m_clean = m_prev_tan - torch.clamp_max(dot_mg / g_sq, 0.0) * g_tan
+    m_upd = float(beta) * m_clean + g_tan
+    xi = g_tan + float(beta) * m_upd
+    g_n, m_n = g_sq.sqrt(), m_sq.sqrt()
+    cos_mg = dot_mg / (m_n * g_n + 1e-8)
+    coh = m_upd.norm(dim=(-2, -1), keepdim=True) / (float(beta) * m_n + g_n + 1e-8)
+    snr_tan = (coh * (1.0 + 0.5 * cos_mg)).clamp(0.05, 1.50)
+    xi_sq = xi.square().sum(dim=(-2, -1), keepdim=True)
+    tau_sq = float(DEFAULT_MUON_GRAD_NORM_GATE_TAU * DEFAULT_MUON_GRAD_NORM_GATE_TAU)
+    step_lr = float(lr) * (snr_tan / (snr_tan + 0.35)) * (xi_sq / (xi_sq + tau_sq)).sqrt()
+    return m_upd, xi, step_lr
+
+
+def _clean_and_snr_gate_complex_tangent(
+    gr_tan: torch.Tensor, gi_tan: torch.Tensor, mr_prev: torch.Tensor, mi_prev: torch.Tensor, lr: float, beta: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Clean opposing complex momentum and compute complex tangent SNR + magnitude trust-region `step_lr` (`<= 8` args)."""
+    g_sq = (gr_tan.square() + gi_tan.square()).sum(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+    m_sq = (mr_prev.square() + mi_prev.square()).sum(dim=(-2, -1), keepdim=True)
+    dot_mg = (mr_prev * gr_tan + mi_prev * gi_tan).sum(dim=(-2, -1), keepdim=True)
+    neg_proj = torch.clamp_max(dot_mg / g_sq, 0.0)
+    mr_clean = mr_prev - neg_proj * gr_tan
+    mi_clean = mi_prev - neg_proj * gi_tan
+    mr_upd = float(beta) * mr_clean + gr_tan
+    mi_upd = float(beta) * mi_clean + gi_tan
+    xi_re = gr_tan + float(beta) * mr_upd
+    xi_im = gi_tan + float(beta) * mi_upd
+    g_n, m_n = g_sq.sqrt(), m_sq.sqrt()
+    m_upd_n = (mr_upd.square() + mi_upd.square()).sum(dim=(-2, -1), keepdim=True).sqrt()
+    cos_mg = dot_mg / (m_n * g_n + 1e-8)
+    coh = m_upd_n / (float(beta) * m_n + g_n + 1e-8)
+    snr_tan = (coh * (1.0 + 0.5 * cos_mg)).clamp(0.05, 1.50)
+    xi_sq = (xi_re.square() + xi_im.square()).sum(dim=(-2, -1), keepdim=True)
+    tau_sq = float(DEFAULT_MUON_GRAD_NORM_GATE_TAU * DEFAULT_MUON_GRAD_NORM_GATE_TAU)
+    step_lr = float(lr) * (snr_tan / (snr_tan + 0.35)) * (xi_sq / (xi_sq + tau_sq)).sqrt()
+    return mr_upd, mi_upd, xi_re, xi_im, step_lr
+
+
+def _whiten_tall_real_stiefel(xi: torch.Tensor, ns_steps: int, tik_lam: float) -> torch.Tensor:
+    """Run `_newton_schulz5_tall_real` plus 1 quadratic polar step when `rows != cols` (`<= 8` args)."""
+    u_raw = _newton_schulz5_tall_real(xi, steps=ns_steps, tikhonov_lambda=tik_lam)
+    cols = xi.size(-1)
+    if xi.size(-2) != cols:
+        eye_c = torch.eye(cols, device=xi.device, dtype=xi.dtype)
+        u_raw = 0.5 * torch.matmul(u_raw, 3.0 * eye_c - torch.matmul(u_raw.transpose(-2, -1), u_raw))
+    return u_raw
+
+
+def _retract_real_tall_stiefel_tensor_lr(w_tall: torch.Tensor, u_tan: torch.Tensor, step_lr: torch.Tensor | float) -> torch.Tensor:
+    """Retract `w_tall` `(B, D, k)` along `u_tan` with tensor or scalar `step_lr` (`<= 8` args)."""
+    cols = w_tall.size(-1)
+    scale = torch.rsqrt(1.0 + step_lr * step_lr) if isinstance(step_lr, torch.Tensor) else (1.0 / math.sqrt(1.0 + float(step_lr) * float(step_lr)))
+    w_next = (w_tall - step_lr * u_tan) * scale
+    eye = torch.eye(cols, device=w_next.device, dtype=w_next.dtype)
+    for _ in range(2):
+        w_next = 0.5 * torch.matmul(w_next, 3.0 * eye - torch.matmul(w_next.transpose(-2, -1), w_next))
+    return w_next
+
+
+def _retract_complex_tall_stiefel_tensor_lr(
+    a_re: torch.Tensor, a_im: torch.Tensor, tan_re: torch.Tensor, tan_im: torch.Tensor, step_lr: torch.Tensor | float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Retract complex `(a_re, a_im)` `(B, D, d)` along `(tan_re, tan_im)` with tensor or scalar `step_lr` (`<= 8` args)."""
+    scale = torch.rsqrt(1.0 + step_lr * step_lr) if isinstance(step_lr, torch.Tensor) else (1.0 / math.sqrt(1.0 + float(step_lr) * float(step_lr)))
+    nx_re = (a_re - step_lr * tan_re) * scale
+    nx_im = (a_im - step_lr * tan_im) * scale
+    eye = torch.eye(a_re.size(-1), device=a_re.device, dtype=a_re.dtype)
+    for _ in range(2):
+        g_re = torch.matmul(nx_re.transpose(-2, -1), nx_re) + torch.matmul(nx_im.transpose(-2, -1), nx_im)
+        g_im = torch.matmul(nx_re.transpose(-2, -1), nx_im) - torch.matmul(nx_im.transpose(-2, -1), nx_re)
+        tm_re, tm_im = 3.0 * eye - g_re, -g_im
+        nx_re, nx_im = (
+            0.5 * (torch.matmul(nx_re, tm_re) - torch.matmul(nx_im, tm_im)),
+            0.5 * (torch.matmul(nx_re, tm_im) + torch.matmul(nx_im, tm_re)),
+        )
+    return nx_re, nx_im
 
 
 # ==============================================================================
@@ -326,7 +413,7 @@ class SelectiveExactQuotientMuon(torch.optim.Optimizer):
 
     @torch.no_grad()
     def _step_bridge_pairs(self, stiefel_lr: float, beta: float, ns_steps: int, tik_lam: float) -> None:
-        """Update tied vocabulary subspace bridges `(U_in, U_out)` with orthogonal Horizontal Grassmann whitening + fiber restoration (`<= 8` args)."""
+        """Update tied vocabulary subspace bridges `(U_in, U_out)` with SNR-gated Stiefel whitening + excess common-spin damping (`<= 8` args)."""
         active = [(u_in, u_out) for u_in, u_out in self.bridge_pairs if u_in.grad is not None and u_out.grad is not None]
         if not active:
             return
@@ -338,36 +425,23 @@ class SelectiveExactQuotientMuon(torch.optim.Optimizer):
         mout_l = [self.state[p].setdefault("momentum_buffer", torch.zeros_like(p, dtype=torch.float32)) for _, p in active]
         min_s, mout_s = torch.stack(min_l, dim=0), torch.stack(mout_l, dim=0)
 
+        tin_g = project_real_stiefel_tangent(gin_s, uin_s)
+        tout_g = project_real_stiefel_tangent(gout_s, uout_s)
+        min_pre = project_real_stiefel_tangent(min_s, uin_s)
+        mout_pre = project_real_stiefel_tangent(mout_s, uout_s)
+        min_upd, xi_in, lr_in = _clean_and_snr_gate_real_tangent(tin_g, min_pre, stiefel_lr, beta)
+        mout_upd, xi_out, lr_out = _clean_and_snr_gate_real_tangent(tout_g, mout_pre, stiefel_lr, beta)
+        zin_ns = _whiten_tall_real_stiefel(xi_in, ns_steps=ns_steps, tik_lam=tik_lam)
+        zout_ns = _whiten_tall_real_stiefel(xi_out, ns_steps=ns_steps, tik_lam=tik_lam)
         if self.enable_selective_quotient:
-            tin_g = project_real_stiefel_tangent(gin_s, uin_s)
-            tout_g = project_real_stiefel_tangent(gout_s, uout_s)
-            min_pre = project_real_stiefel_tangent(min_s, uin_s)
-            mout_pre = project_real_stiefel_tangent(mout_s, uout_s)
-            min_upd = float(beta) * min_pre + tin_g
-            mout_upd = float(beta) * mout_pre + tout_g
-            xi_in = tin_g + float(beta) * min_upd
-            xi_out = tout_g + float(beta) * mout_upd
-            hin_in = xi_in - torch.matmul(uin_s, torch.matmul(uin_s.transpose(-2, -1), xi_in))
-            hout_in = xi_out - torch.matmul(uout_s, torch.matmul(uout_s.transpose(-2, -1), xi_out))
-            zin_ns = _newton_schulz5_tall_real(hin_in, steps=ns_steps, tikhonov_lambda=tik_lam)
-            zout_ns = _newton_schulz5_tall_real(hout_in, steps=ns_steps, tikhonov_lambda=tik_lam)
             tan_in, tan_out = filter_tied_bridge_post_ns_common_spin(zin_ns, zout_ns, xi_in, xi_out, uin_s, uout_s)
-            uin_next = _retract_real_tall_stiefel_step(uin_s, tan_in, stiefel_lr)
-            uout_next = _retract_real_tall_stiefel_step(uout_s, tan_out, stiefel_lr)
-            min_stored = project_real_stiefel_tangent(min_upd, uin_next)
-            mout_stored = project_real_stiefel_tangent(mout_upd, uout_next)
         else:
-            min_upd = float(beta) * min_s + gin_s
-            mout_upd = float(beta) * mout_s + gout_s
-            xi_in = project_real_stiefel_tangent(gin_s + float(beta) * min_upd, uin_s)
-            xi_out = project_real_stiefel_tangent(gout_s + float(beta) * mout_upd, uout_s)
-            zin_ns = _newton_schulz5_tall_real(xi_in, steps=ns_steps, tikhonov_lambda=tik_lam)
-            zout_ns = _newton_schulz5_tall_real(xi_out, steps=ns_steps, tikhonov_lambda=tik_lam)
             tan_in = project_real_stiefel_tangent(zin_ns, uin_s)
             tan_out = project_real_stiefel_tangent(zout_ns, uout_s)
-            uin_next = _retract_real_tall_stiefel_step(uin_s, tan_in, stiefel_lr)
-            uout_next = _retract_real_tall_stiefel_step(uout_s, tan_out, stiefel_lr)
-            min_stored, mout_stored = min_upd, mout_upd
+        uin_next = _retract_real_tall_stiefel_tensor_lr(uin_s, tan_in, lr_in)
+        uout_next = _retract_real_tall_stiefel_tensor_lr(uout_s, tan_out, lr_out)
+        min_stored = project_real_stiefel_tangent(min_upd, uin_next)
+        mout_stored = project_real_stiefel_tangent(mout_upd, uout_next)
 
         self.last_gauge_diagnostics["bridge_common_spin_frac"] = compute_coupled_svd_joint_spin_fraction(tan_in, tan_out, uin_s, uout_s)
         torch._foreach_copy_([p.data for p, _ in active], list(uin_next.unbind(0)))
@@ -377,7 +451,7 @@ class SelectiveExactQuotientMuon(torch.optim.Optimizer):
 
     @torch.no_grad()
     def _step_coupled_svd_triples(self, stiefel_lr: float, beta: float, ns_steps: int, tik_lam: float) -> None:
-        """Update coupled `(U, V, sigma)` triples with Horizontal SVD whitening + Lorentzian split-spectrum co-rotation (`<= 8` args)."""
+        """Update coupled `(U, V, sigma)` triples with SNR-gated Stiefel whitening + Lorentzian split-spectrum co-rotation (`<= 8` args)."""
         buckets: dict[tuple[tuple[int, int], tuple[int, int]], list[tuple[nn.Parameter, nn.Parameter, nn.Parameter]]] = {}
         for u_p, v_p, s_p in self.coupled_svd_triples:
             if u_p.grad is not None and v_p.grad is not None:
@@ -398,32 +472,27 @@ class SelectiveExactQuotientMuon(torch.optim.Optimizer):
             if self.enable_selective_quotient:
                 gu_h, gv_h = project_coupled_svd_raw_exact_degenerate(gu_stack, gv_stack, u_stack, v_stack, s_stack)
                 mu_pre, mv_pre = project_coupled_svd_raw_exact_degenerate(mu_stack, mv_stack, u_stack, v_stack, s_stack)
-                mu_upd = float(beta) * mu_pre + gu_h
-                mv_upd = float(beta) * mv_pre + gv_h
-                xi_u = gu_h + float(beta) * mu_upd
-                xi_v = gv_h + float(beta) * mv_upd
-                ut_x = torch.matmul(u_stack.transpose(-2, -1), xi_u)
-                vt_x = torch.matmul(v_stack.transpose(-2, -1), xi_v)
-                om_x = 0.25 * ((ut_x - ut_x.transpose(-2, -1)) + (vt_x - vt_x.transpose(-2, -1)))
-                zu_ns = _newton_schulz5_tall_real(xi_u - torch.matmul(u_stack, om_x), steps=ns_steps, tikhonov_lambda=tik_lam)
-                zv_ns = _newton_schulz5_tall_real(xi_v - torch.matmul(v_stack, om_x), steps=ns_steps, tikhonov_lambda=tik_lam)
+                mu_upd, xi_u, lr_u = _clean_and_snr_gate_real_tangent(gu_h, mu_pre, stiefel_lr, beta)
+                mv_upd, xi_v, lr_v = _clean_and_snr_gate_real_tangent(gv_h, mv_pre, stiefel_lr, beta)
+                zu_ns = _whiten_tall_real_stiefel(xi_u, ns_steps=ns_steps, tik_lam=tik_lam)
+                zv_ns = _whiten_tall_real_stiefel(xi_v, ns_steps=ns_steps, tik_lam=tik_lam)
                 tu_tan, tv_tan = filter_coupled_svd_post_ns_corotation(zu_ns, zv_ns, xi_u, xi_v, u_stack, v_stack, s_stack)
-                u_next = _retract_real_tall_stiefel_step(u_stack, tu_tan, stiefel_lr)
-                v_next = _retract_real_tall_stiefel_step(v_stack, tv_tan, stiefel_lr)
-                mu_stored = project_real_stiefel_tangent(mu_upd, u_next)
-                mv_stored = project_real_stiefel_tangent(mv_upd, v_next)
             else:
-                mu_upd = float(beta) * mu_stack + gu_stack
-                mv_upd = float(beta) * mv_stack + gv_stack
-                tu_in = project_real_stiefel_tangent(gu_stack + float(beta) * mu_upd, u_stack)
-                tv_in = project_real_stiefel_tangent(gv_stack + float(beta) * mv_upd, v_stack)
-                zu_ns = _newton_schulz5_tall_real(tu_in, steps=ns_steps, tikhonov_lambda=tik_lam)
-                zv_ns = _newton_schulz5_tall_real(tv_in, steps=ns_steps, tikhonov_lambda=tik_lam)
+                gu_t = project_real_stiefel_tangent(gu_stack, u_stack)
+                gv_t = project_real_stiefel_tangent(gv_stack, v_stack)
+                mu_pre = project_real_stiefel_tangent(mu_stack, u_stack)
+                mv_pre = project_real_stiefel_tangent(mv_stack, v_stack)
+                mu_upd, xi_u, lr_u = _clean_and_snr_gate_real_tangent(gu_t, mu_pre, stiefel_lr, beta)
+                mv_upd, xi_v, lr_v = _clean_and_snr_gate_real_tangent(gv_t, mv_pre, stiefel_lr, beta)
+                zu_ns = _whiten_tall_real_stiefel(xi_u, ns_steps=ns_steps, tik_lam=tik_lam)
+                zv_ns = _whiten_tall_real_stiefel(xi_v, ns_steps=ns_steps, tik_lam=tik_lam)
                 tu_tan = project_real_stiefel_tangent(zu_ns, u_stack)
                 tv_tan = project_real_stiefel_tangent(zv_ns, v_stack)
-                u_next = _retract_real_tall_stiefel_step(u_stack, tu_tan, stiefel_lr)
-                v_next = _retract_real_tall_stiefel_step(v_stack, tv_tan, stiefel_lr)
-                mu_stored, mv_stored = mu_upd, mv_upd
+
+            u_next = _retract_real_tall_stiefel_tensor_lr(u_stack, tu_tan, lr_u)
+            v_next = _retract_real_tall_stiefel_tensor_lr(v_stack, tv_tan, lr_v)
+            mu_stored = project_real_stiefel_tangent(mu_upd, u_next)
+            mv_stored = project_real_stiefel_tangent(mv_upd, v_next)
 
             deg_spins.append(compute_degenerate_svd_spin_fraction(tu_tan, tv_tan, u_stack, v_stack, s_stack))
             unwt_spins.append(compute_coupled_svd_joint_spin_fraction(tu_tan, tv_tan, u_stack, v_stack))
@@ -451,26 +520,16 @@ class SelectiveExactQuotientMuon(torch.optim.Optimizer):
             mi_list = [self.state[ui].setdefault("momentum_buffer", torch.zeros_like(ui, dtype=torch.float32)) for _, ui in active]
             mr_cat, mi_cat = torch.cat(mr_list, dim=0), torch.cat(mi_list, dim=0)
 
-            proj_fn = project_su_dh_mub_horizontal if is_mub else project_kraus_branch_gauge_horizontal
-            if self.enable_selective_quotient:
-                gr_h, gi_h = proj_fn(gr_cat, gi_cat, ur_cat, ui_cat)
-                mr_pre, mi_pre = proj_fn(mr_cat, mi_cat, ur_cat, ui_cat)
-                mr_upd = float(beta) * mr_pre + gr_h
-                mi_upd = float(beta) * mi_pre + gi_h
-                zr, zi = _complex_newton_schulz5(
-                    gr_h + float(beta) * mr_upd, gi_h + float(beta) * mi_upd, steps=ns_steps, tikhonov_lambda=tik_lam
-                )
-                tan_re, tan_im = proj_fn(zr, zi, ur_cat, ui_cat)
-                ur_next, ui_next = _retract_complex_tall_stiefel_step(ur_cat, ui_cat, tan_re, tan_im, unitary_lr)
-                mr_stored, mi_stored = proj_fn(mr_upd, mi_upd, ur_next, ui_next)
-            else:
-                mr_upd = float(beta) * mr_cat + gr_cat
-                mi_upd = float(beta) * mi_cat + gi_cat
-                tr, ti = project_complex_stiefel_tangent(gr_cat + float(beta) * mr_upd, gi_cat + float(beta) * mi_upd, ur_cat, ui_cat)
-                zr, zi = _complex_newton_schulz5(tr, ti, steps=ns_steps, tikhonov_lambda=tik_lam)
-                tan_re, tan_im = project_complex_stiefel_tangent(zr, zi, ur_cat, ui_cat)
-                ur_next, ui_next = _retract_complex_tall_stiefel_step(ur_cat, ui_cat, tan_re, tan_im, unitary_lr)
-                mr_stored, mi_stored = mr_upd, mi_upd
+            proj_fn = (project_su_dh_mub_horizontal if is_mub else project_kraus_branch_gauge_horizontal) if self.enable_selective_quotient else project_complex_stiefel_tangent
+            gr_h, gi_h = proj_fn(gr_cat, gi_cat, ur_cat, ui_cat)
+            mr_pre, mi_pre = proj_fn(mr_cat, mi_cat, ur_cat, ui_cat)
+            mr_upd, mi_upd, xi_re, xi_im, step_lr = _clean_and_snr_gate_complex_tangent(
+                gr_h, gi_h, mr_pre, mi_pre, unitary_lr, beta
+            )
+            zr, zi = _complex_newton_schulz5(xi_re, xi_im, steps=ns_steps, tikhonov_lambda=tik_lam)
+            tan_re, tan_im = proj_fn(zr, zi, ur_cat, ui_cat)
+            ur_next, ui_next = _retract_complex_tall_stiefel_tensor_lr(ur_cat, ui_cat, tan_re, tan_im, step_lr)
+            mr_stored, mi_stored = proj_fn(mr_upd, mi_upd, ur_next, ui_next)
 
             if is_mub:
                 self.last_gauge_diagnostics["su16_step_phase_frac"] = compute_su_dh_global_phase_fraction(tan_re, tan_im, ur_cat, ui_cat)
@@ -849,10 +908,10 @@ def build_wave67_selective_optimizers(
     q_trunk_opt.enable_selective_quotient = bool(model.spec.enable_selective_quotient)
 
     sub_mup = math.sqrt(float(model.subspace_dim) / float(DEFAULT_NARROW_SUBSPACE_DIM))
-    voc_lr = DEFAULT_SHALLOW_WTE_LR * 1.35 * sub_mup
+    voc_lr = DEFAULT_SHALLOW_WTE_LR * 1.35
     gate_tau = DEFAULT_MUON_GRAD_NORM_GATE_TAU / sub_mup
     sub_groups = model.boundary.sphere_and_ball_groups(
-        base_wte_lr=voc_lr, base_readout_lr=DEFAULT_SHALLOW_READOUT_LR * 1.35 * sub_mup
+        base_wte_lr=voc_lr, base_readout_lr=DEFAULT_SHALLOW_READOUT_LR * 1.35
     )
     sub_groups.append({"params": [model.tok_ngram_in.weight, model.tok_ngram_out.weight], "lr": DEFAULT_SHALLOW_NGRAM_LR * 1.5, "zero_init_ball": True})
     vocab_opt = BatchSubspaceTikhonovGramMuon(
@@ -975,10 +1034,12 @@ def run_wave67_selective_quotient_comparison_suite(
         exp_logger = StandardizedExperimentLogger(intent)
         optimizers = build_wave67_selective_optimizers(model)
         q_trunk_opt = optimizers[0]
+        ema_d = DEFAULT_THERMOSTAT_EMA_DECAY
+        retr_cad = 8 if steps >= 1000 else DEFAULT_THERMOSTAT_RETRACT_CADENCE
         thermostat: RiemannianShadowEMAThermostat = (
-            ReadOnlyQuenchRiemannianShadowEMA(model, eval_fn=evaluate_wave67_model)
+            ReadOnlyQuenchRiemannianShadowEMA(model, ema_decay=ema_d, eval_fn=evaluate_wave67_model, retract_cadence=retr_cad)
             if spec.enable_read_only_shadow_ema
-            else RiemannianShadowEMAThermostat(model, eval_fn=evaluate_wave67_model)
+            else RiemannianShadowEMAThermostat(model, ema_decay=ema_d, eval_fn=evaluate_wave67_model, retract_cadence=retr_cad)
         )
 
         step0_ev = evaluate_wave67_model(model, stream)
@@ -992,6 +1053,7 @@ def run_wave67_selective_quotient_comparison_suite(
 
         curve: list[dict[str, Any]] = [step0_ev]
         thermostat_lr_scale: float = 1.0
+        warmup_steps = 5
         if device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -1009,15 +1071,18 @@ def run_wave67_selective_quotient_comparison_suite(
                 (loss * inv_k).backward()
                 del loss
 
-            if step <= 5:
-                warm = float(step) / 5.0
+            anneal = (1.0 / math.sqrt(1.0 + max(0.0, float(step - 200)) / 300.0)) if steps >= 1000 else 1.0
+            if step <= warmup_steps:
+                warm = float(step) / float(warmup_steps)
                 lr_mult, mom_beta = (0.25 + 0.75 * warm) * thermostat_lr_scale, 0.50 * warm
             elif step <= plateau_steps:
-                lr_mult, mom_beta = 1.0 * thermostat_lr_scale, DEFAULT_SELECTIVE_MOMENTUM_BETA
+                lr_mult, mom_beta = anneal * thermostat_lr_scale, DEFAULT_SELECTIVE_MOMENTUM_BETA
             else:
+                anneal_end = (1.0 / math.sqrt(1.0 + max(0.0, float(plateau_steps - 200)) / 300.0)) if steps >= 1000 else 1.0
                 q_p = float(step - plateau_steps) / float(max(1, quench_steps))
                 cos_q = 0.5 * (1.0 + math.cos(math.pi * min(1.0, q_p)))
-                lr_mult, mom_beta = (0.08 + 0.92 * cos_q) * thermostat_lr_scale, 0.85 + 0.10 * (1.0 - cos_q)
+                lr_mult = anneal_end * (0.15 + 0.85 * cos_q) * thermostat_lr_scale
+                mom_beta = 0.85 + 0.10 * (1.0 - cos_q)
 
             step_wave67_optimizers(model, optimizers, tokens_in_step=tokens_per_step, lr_mult=lr_mult, mom_beta=mom_beta)
             thermostat.update_after_step(model)
@@ -1043,13 +1108,13 @@ def run_wave67_selective_quotient_comparison_suite(
                 ev["ema_val_ce"] = th_out["ema_val_ce"]
                 ev["thermal_gap_ce"] = th_out["thermal_gap_ce"]
                 ev["thermostat_triggered"] = th_out["triggered"]
-                ev["thermostat_lr_scale"] = round(thermostat_lr_scale, 4)
+                ev["thermostat_lr_scale"] = round(lr_mult, 4)
                 ev["retract_ms"] = th_out["retract_ms"]
                 ev.update(gd)
                 curve.append(ev)
                 exp_logger.log_eval(step, {**ev, "top1_acc": round(100.0 * ev["top1_acc"], 2), "top5_acc": round(100.0 * ev["top5_acc"], 2)})
                 print(
-                    f"[{mode.value}] Step {step:4d} ({ev['tokens_M']:5.2f}M tok, lr={thermostat_lr_scale:.2f}x) | "
+                    f"[{mode.value}] Step {step:4d} ({ev['tokens_M']:5.2f}M tok, lr={lr_mult:.3f}x) | "
                     f"Hot CE: {th_out['hot_val_ce']:.4f} | EMA CE: {th_out['ema_val_ce']:.4f} "
                     f"(gap={th_out['thermal_gap_ce']:+.4f}, trig={th_out['triggered']}) | "
                     f"Top1: {100.0 * ev['top1_acc']:.2f}% | MUBErr: {ev['mub_unbiased_err']:.2e} | "

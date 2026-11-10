@@ -1,0 +1,22 @@
+/-
+Copyright (c) 2026 QuantumDLBlocks Authors. All rights reserved.
+Root umbrella module for `QuantumDLBlocksLean`:
+Machine-checked, zero-`sorry`, zero-custom-axiom Lean 4 formalization of the 13 core
+differential-geometric, quantum-measurement, pure density-matrix, factored cross-head
+Kraus superoperator, Riemannian momentum-buffer, sensory-anchored bipartite density,
+and grouped 4-qubit multi-branch Kronecker density theorems of the Wave 66–72
+QuantumDLBlocks architecture.
+-/
+import QuantumDLBlocksLean.Core
+import QuantumDLBlocksLean.QuotientHorizontalCompleteness
+import QuantumDLBlocksLean.SplitSpectrumBiorthogonalSVD
+import QuantumDLBlocksLean.KrausUnitaryGaugeSylvester
+import QuantumDLBlocksLean.NewtonSchulzHorizontalLeakage
+import QuantumDLBlocksLean.SequentialLudersInstrument
+import QuantumDLBlocksLean.HilbertSchmidtQuantumAttention
+import QuantumDLBlocksLean.QuantumOrAndSchurLogic
+import QuantumDLBlocksLean.OnlineEmaAndStatefulHistoryDensity
+import QuantumDLBlocksLean.FactoredCrossHeadKrausSuperoperator
+import QuantumDLBlocksLean.RiemannianMomentumBufferEffectiveness
+import QuantumDLBlocksLean.SensoryAnchoredBipartiteDensity
+import QuantumDLBlocksLean.GroupedFourQubitKroneckerDensity

@@ -92,12 +92,14 @@ def run_colab_exec(
 
 
 def build_code_bundle_b64(include_paths: list[str] | None = None) -> tuple[str, int]:
-    """Create an in-memory xz-compressed tarball of `src/` and `examples/11_*.py` and return (b64_str, byte_size)."""
+    """Create an in-memory xz-compressed tarball of `src/`, `examples/11_*.py`, and benchmark scripts."""
     if include_paths is None:
         include_paths = [
             "src/qdlblocks",
             "src/qdlblocks_jax",
             "examples/11_fineweb_100m_multiepoch_gpu_tpu.py",
+            "scripts/pure_density_matrix_bench.py",
+            "scripts/factored_kraus_density_bench.py",
         ]
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:xz", preset=9) as tar:
@@ -226,15 +228,21 @@ def cmd_status(runs: list[dict[str, Any]]) -> int:
     for run in runs:
         session = run["session"]
         key = run["key"]
+        script_rel = run.get("script", "examples/11_fineweb_100m_multiepoch_gpu_tpu.py")
+        script_base = Path(script_rel).name
+        pgrep_pat = f"[{script_base[0]}]{script_base[1:]}"
         log_path = run.get("remote_log", f"/content/{key}.log")
+        std_log_path = f"/content/.cache/live_logs/{key}.log"
         probe_code = f"""
 import json, os, subprocess
 gpu = subprocess.getoutput("nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader 2>/dev/null").splitlines()
 gpu_str = gpu[0].strip() if gpu else "No GPU / TPU"
-pids = subprocess.getoutput("pgrep -f '[1]1_fineweb_100m_multiepoch_gpu_tpu.py'").splitlines()
+pids = subprocess.getoutput("pgrep -f '{pgrep_pat}'").splitlines()
 last_line = ""
-if os.path.exists({log_path!r}):
-    with open({log_path!r}, "r", errors="replace") as f:
+cand_paths = [{std_log_path!r}, {log_path!r}]
+chosen = next((p for p in cand_paths if os.path.exists(p) and os.path.getsize(p) > 0), {log_path!r})
+if os.path.exists(chosen):
+    with open(chosen, "r", errors="replace") as f:
         lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
         last_line = lines[-1] if lines else "(empty log)"
 else:
@@ -340,22 +348,25 @@ def cmd_launch(
         session = run["session"]
         key = run["key"]
         cli_args = run["cli_args"]
+        script_rel = run.get("script", "examples/11_fineweb_100m_multiepoch_gpu_tpu.py")
+        script_base = Path(script_rel).name
+        pgrep_pat = f"[{script_base[0]}]{script_base[1:]}"
         remote_log = run.get("remote_log", f"/content/{key}.log")
         remote_json = run.get("remote_json", f"/content/{key}_results.json")
 
         full_train_cmd = (
-            f"PYTHONPATH=/content/src /usr/bin/python3 -u /content/examples/11_fineweb_100m_multiepoch_gpu_tpu.py "
+            f"PYTHONPATH=/content/src /usr/bin/python3 -u /content/{script_rel} "
             f"{cli_args} --out-json {remote_json} > {remote_log} 2>&1"
         )
 
         launch_script = f"""
 import os, subprocess, sys
-existing = subprocess.getoutput("pgrep -f '[1]1_fineweb_100m_multiepoch_gpu_tpu.py'").split()
+existing = subprocess.getoutput("pgrep -f '{pgrep_pat}'").split()
 if existing and not {force!r}:
     print("ALREADY_RUNNING:" + ",".join(existing))
     sys.exit(0)
 if existing and {force!r}:
-    subprocess.run(["pkill", "-9", "-f", "[1]1_fineweb_100m_multiepoch_gpu_tpu.py"], check=False)
+    subprocess.run(["pkill", "-9", "-f", "{pgrep_pat}"], check=False)
 
 pid = os.getpid()
 detached_cmd = f"sleep 1 && kill -9 {{pid}} && sleep 2 && {full_train_cmd}"
@@ -388,23 +399,30 @@ def cmd_harvest(runs: list[dict[str, Any]], out_dir: Path = DEFAULT_CACHE_DIR) -
     eval_re = re.compile(
         r"Val CE:\s*([0-9.]+)\s*\|\s*Val PPL:\s*([0-9.]+).*?\|\s*([0-9,]+)\s*tok/s"
     )
+    ema_eval_re = re.compile(
+        r"EMA CE:\s*([0-9.]+)\s*\(raw\s*([0-9.]+)\)"
+    )
     summary_rows: list[dict[str, Any]] = []
     for run in runs:
         session = run["session"]
         key = run["key"]
         remote_log = run.get("remote_log", f"/content/{key}.log")
         remote_json = run.get("remote_json", f"/content/{key}_results.json")
+        std_log = f"/content/.cache/live_logs/{key}.log"
+        std_json = f"/content/.cache/live_logs/{key}_results.json"
         local_log = out_dir / f"{key}.log"
         local_json = out_dir / f"{key}_results.json"
 
         harvest_script = f"""
 import base64, json, os
 res = {{"log_b64": None, "json_b64": None}}
-if os.path.exists({remote_log!r}):
-    with open({remote_log!r}, "rb") as f:
+chosen_log = {std_log!r} if (os.path.exists({std_log!r}) and os.path.getsize({std_log!r}) > 0) else {remote_log!r}
+chosen_json = {remote_json!r} if (os.path.exists({remote_json!r}) and os.path.getsize({remote_json!r}) > 0) else {std_json!r}
+if os.path.exists(chosen_log):
+    with open(chosen_log, "rb") as f:
         res["log_b64"] = base64.b64encode(f.read()).decode("ascii")
-if os.path.exists({remote_json!r}):
-    with open({remote_json!r}, "rb") as f:
+if os.path.exists(chosen_json):
+    with open(chosen_json, "rb") as f:
         res["json_b64"] = base64.b64encode(f.read()).decode("ascii")
 print("HARVEST_PAYLOAD:" + json.dumps(res))
 """
@@ -430,9 +448,9 @@ print("HARVEST_PAYLOAD:" + json.dumps(res))
                 res_obj = res_raw
             else:
                 res_obj = {}
-            best_ce = res_obj.get("val_ce") or res_obj.get("best_val_loss") or res_obj.get("final_val_loss")
+            best_ce = res_obj.get("val_ce") or res_obj.get("best_val_loss") or res_obj.get("final_val_loss") or res_obj.get("final_ema_val_ce")
             best_ppl = res_obj.get("val_ppl") or res_obj.get("best_val_ppl") or res_obj.get("final_val_ppl")
-            best_tps = res_obj.get("tok_per_s") or res_obj.get("mean_tokens_per_sec") or res_obj.get("tokens_per_sec")
+            best_tps = res_obj.get("tok_per_s") or res_obj.get("mean_tokens_per_sec") or res_obj.get("tokens_per_sec") or res_obj.get("mean_tok_per_s")
             status_str = "COMPLETED"
         elif local_log.exists():
             log_text = local_log.read_text(encoding="utf-8", errors="replace")
@@ -444,6 +462,12 @@ print("HARVEST_PAYLOAD:" + json.dumps(res))
                     tps_v = float(m.group(3).replace(",", ""))
                     if best_ce is None or ce_v <= best_ce:
                         best_ce, best_ppl, best_tps = ce_v, ppl_v, tps_v
+                else:
+                    m2 = ema_eval_re.search(ln)
+                    if m2:
+                        ce_v = float(m2.group(1))
+                        if best_ce is None or ce_v <= best_ce:
+                            best_ce = ce_v
             status_str = "COMPLETED" if "COMPLETED" in log_text else "IN_PROGRESS"
 
         summary_rows.append(
@@ -470,15 +494,18 @@ print("HARVEST_PAYLOAD:" + json.dumps(res))
 
 
 def cmd_kill(runs: list[dict[str, Any]]) -> int:
-    """Kill running `11_fineweb_100m_multiepoch_gpu_tpu.py` processes on the target sessions."""
-    sessions = list(dict.fromkeys(r["session"] for r in runs))
-    for session in sessions:
+    """Kill running training processes on the target sessions."""
+    for run in runs:
+        session = run["session"]
+        script_rel = run.get("script", "examples/11_fineweb_100m_multiepoch_gpu_tpu.py")
+        script_base = Path(script_rel).name
+        pgrep_pat = f"[{script_base[0]}]{script_base[1:]}"
         rc, out, _ = run_colab_exec(
             session,
-            'import subprocess; subprocess.run(["pkill", "-9", "-f", "11_fineweb_100m_multiepoch_gpu_tpu.py"], check=False); print("KILLED")',
+            f'import subprocess; subprocess.run(["pkill", "-9", "-f", "{pgrep_pat}"], check=False); print("KILLED")',
             timeout=30,
         )
-        print(f"[kill] {session}: rc={rc} {out.strip()}")
+        print(f"[kill] {session} ({script_base}): rc={rc} {out.strip()}")
     return 0
 
 

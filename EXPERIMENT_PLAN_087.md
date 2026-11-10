@@ -96,7 +96,7 @@ Wave 66 ([`EXPERIMENT_PLAN_086.md`](file:///home/festivity/agy/QuantumDLBlocks/E
 
 ### 6.1 AST Best-Practices Linter & Unit Test Verification
 - [`scripts/ast_signature_and_length_linter.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/ast_signature_and_length_linter.py):
-  - [`src/qdlblocks/benchmarks/selective_exact_quotient_lab.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/selective_exact_quotient_lab.py): `860` SLOC (`<= 1,000` soft limit), `36` functions, `max_args = 8`, `max_nested_sloc = 0` (**PASS**).
+  - [`src/qdlblocks/benchmarks/selective_exact_quotient_lab.py`](file:///home/festivity/agy/QuantumDLBlocks/src/qdlblocks/benchmarks/selective_exact_quotient_lab.py): `915` SLOC (`<= 1,000` soft limit), `38` functions, `max_args = 8`, `max_nested_sloc = 0` (**PASS**).
   - [`scripts/horizontal_gradient_completeness_auditor.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/horizontal_gradient_completeness_auditor.py): `226` SLOC, `5` functions, `max_args = 3`, `max_nested_sloc = 0` (**PASS**).
   - [`scripts/selective_exact_quotient_bench.py`](file:///home/festivity/agy/QuantumDLBlocks/scripts/selective_exact_quotient_bench.py): `39` SLOC, `1` function, `max_args = 0` (**PASS**).
   - [`tests/test_plan087_selective_exact_quotient.py`](file:///home/festivity/agy/QuantumDLBlocks/tests/test_plan087_selective_exact_quotient.py): `76` SLOC, `4 passed in 5.83s` (**PASS**).
@@ -133,10 +133,38 @@ Wave 66 ([`EXPERIMENT_PLAN_086.md`](file:///home/festivity/agy/QuantumDLBlocks/E
 | **Step 175 (`0.36M`)** | `7.2323` / `7.2131` (`0.67x`) | `7.2764` / `7.2530` (`0.74x`) | `7.2549` / `7.2339` (`1.00x`) | `7.2780` / `7.2503` (`1.00x`) |
 | **Step 200 (`0.41M`)** | `7.1695` / `7.1743` (`10.75%` Top-1, `MUBErr=0.697`) | `7.2102` / `7.1912` (`10.71%` Top-1, `MUBErr=0.00`) | **`7.1709` / `7.1720`** (`10.76%` Top-1, `MUBErr=0.00`) | **`7.1664` / `7.1709`** (**`10.81%` Top-1**, `MUBErr=0.00`) |
 
-### 6.5 Post-Mortem & Key Mathematical Takeaways
-1. **Why Selective Exact Quotienting (`W67_S1` & `W67_S3`) Reverses the Late-Horizon Slowdown of `W66_G3`**:
-   - In `W66_G3`, projecting $(U_{\text{in}}, U_{\text{out}})$, coupled SVD pairs $(U, V)$, and MUB bases $U_h^{(1)}$ onto over-restricted quotient spaces threw away `23.4%–36.8%` of physical horizontal gradients under split spectra and triggered a thermostat rollback at Step 75 (`7.2102` Hot CE / `7.1912` EMA CE at Step 200).
-   - Restoring 100% horizontal gradient completeness (`0.000000` raw vertical leak) and making the Riemannian Shadow EMA strictly read-only (`0` rollbacks, `lr = 1.00x`) allowed **`W67_S1` (`128D`) to beat `W66_G3` by `-0.0393` nats on Hot CE (`7.1709` vs. `7.2102`) and `-0.0192` nats on EMA CE (`7.1720` vs. `7.1912`)**, and allowed **`W67_S3` (`256D, R=4, MLP=1536`) to reach `7.1664` Hot CE / `7.1709` EMA CE / `10.81%` Top-1**—surpassing both `W66_G3` (`-0.0438` Hot CE) and `W66_G0` across `Hot CE`, `EMA CE`, `Top-1`, and `MUBErr` (`0.00e+00` vs. `0.697`).
-2. **Decoupling $\operatorname{Gr}(d_{\text{sub}}, 512)$ Subspace Selection from $W_{\text{vocab}}$ Coordinate Rotation**:
-   - Passing $\Xi_{\text{horiz}} + U\Omega$ into tall Stiefel Newton–Schulz contaminates the $d_{\text{sub}} \times d_{\text{sub}}$ Gram matrix $(\Xi_{\text{horiz}}^\top\Xi_{\text{horiz}} + \Omega^\top\Omega)$ with vertical fiber spin $\Omega^\top\Omega$ and collides with `BatchSubspaceTikhonovGramMuon` updating $W_{\text{vocab}}$ at `5.6x` higher LR. Orthogonalizing only $(I - U U^\top)\Xi$ via Newton–Schulz cleanly separates Grassmannian subspace selection on $(U_{\text{in}}, U_{\text{out}})$ from coordinate updates on $W_{\text{vocab}}$.
+### 6.5 `300.00M`-Token (`36,621`-Step, `B=16, T=512, L=4`) Scale-Up Trajectory (`W67_S3` vs. Wave 65 `W65_V3` Reference)
+
+- **Active Run Log**: [`.cache/live_logs/plan087_w67_s3_selective_quotient_256d_wide_trunk_36621steps.log`](file:///home/festivity/agy/QuantumDLBlocks/.cache/live_logs/plan087_w67_s3_selective_quotient_256d_wide_trunk_36621steps.log) vs. Wave 65 Reference [`.cache/live_logs/plan085_w65_v3_shared_stiefel_128d_frame_36621steps.log`](file:///home/festivity/agy/QuantumDLBlocks/.cache/live_logs/plan085_w65_v3_shared_stiefel_128d_frame_36621steps.log) (`W65_V3` all-time best across `231.18M` tokens / `28,220` steps: `4.8977` CE, `26.45%` Top-1 at Step 27,750 / `227.33M` tokens).
+
+| Step | Tokens (`M`) | `W65_V3` (`128D` Ref) Val CE / Top-1 | **`W67_S3` (`256D` Selective Quotient) EMA CE** | **`W67_S3` Hot CE** | **`W67_S3` Top-1** | `lr_mult` | `MUBErr` / `SU16Phase` / `KrausGauge` | Gain vs. `W65_V3` |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `0` | `0.00M` | `8.9075` (`0.20%`) | `8.9100` | `8.9100` | `0.20%` | `1.000x` | `0.00` / `0.00` / `0.00` | `+0.0025` |
+| `500` | `4.10M` | `6.1396` (`18.73%`) | **`6.1117`** | `6.1542` | **`18.84%`** | `0.707x` | `0.00` / `0.00` / `0.00` | **`-0.0279`** |
+| `1000` | `8.19M` | `5.8000` (`20.89%`) | **`5.7623`** | **`5.7883`** | **`20.97%`** | `0.522x` | `0.00` / `0.00` / `0.00` | **`-0.0377`** |
+| `2000` | `16.38M` | `5.5191` (`22.26%`) | **`5.4947`** | **`5.5122`** | **`22.31%`** | `0.378x` | `0.00` / `0.00` / `0.00` | **`-0.0244`** |
+| `4000` | `32.77M` | `5.2746` (`23.76%`) | **`5.2615`** | `5.2783` | **`24.06%`** | `0.271x` | `0.00` / `0.00` / `0.00` | **`-0.0131`** |
+| `6000` | `49.15M` | `5.1806` (`24.64%`) | **`5.1441`** | **`5.1611`** | **`24.66%`** | `0.222x` | `0.00` / `0.00` / `0.00` | **`-0.0365`** |
+| `8000` | `65.54M` | `5.1017` (`25.09%`) | **`5.0537`** | **`5.0644`** | **`25.41%`** | `0.192x` | `0.00` / `0.00` / `0.00` | **`-0.0480`** |
+| `10000` | `81.92M` | `5.0439` (`25.35%`) | **`4.9963`** | **`5.0080`** | **`25.67%`** | `0.172x` | `0.00` / `0.00` / `0.00` | **`-0.0476`** |
+| `12000` | `98.30M` | `5.0258` (`25.67%`) | **`4.9628`** | **`4.9718`** | **`26.15%`** | `0.157x` | `0.00` / `0.00` / `0.00` | **`-0.0630`** |
+| `13000` | `106.50M` | `5.0003` (`25.73%`) | **`4.9285`** | **`4.9394`** | **`26.47%`** | `0.151x` | `0.00` / `0.00` / `0.00` | **`-0.0718`** |
+| `14250` | `116.74M` | `4.9788` (`25.75%`) | **`4.9004`** | **`4.9094`** | **`26.63%`** | `0.145x` | `0.00` / `0.00` / `0.00` | **`-0.0784`** |
+| `14750` | `120.83M` | `4.9829` (`25.77%`) | **`4.9003`** | **`4.9083`** | **`26.55%`** | `0.142x` | `0.00` / `0.00` / `0.00` | **`-0.0826`** |
+| `15500` | `126.98M` | `4.9682` (`25.76%`) | **`4.8928`** | **`4.9025`** | **`26.51%`** | `0.139x` | `0.00` / `0.00` / `0.00` | **`-0.0754`** |
+| `16000` | `131.07M` | `4.9745` (`25.80%`) | **`4.8854`** | **`4.8974`** | **`26.48%`** | `0.137x` | `0.00` / `0.00` / `0.00` | **`-0.0891`** |
+| `16250` | `133.12M` | `4.9579` (`25.78%`) | **`4.8796`** | **`4.8874`** | **`26.79%`** | `0.135x` | `0.00` / `0.00` / `0.00` | **`-0.0783`** |
+| `16500` | `135.17M` | `4.9552` (`25.91%`) | **`4.8713`** | **`4.8798`** | **`26.64%`** | `0.134x` | `0.00` / `0.00` / `0.00` | **`-0.0839`** |
+| `16750` | `137.22M` | `4.9557` (`25.81%`) | **`4.8754`** | **`4.8818`** | **`26.74%`** | `0.133x` | `0.00` / `0.00` / `0.00` | **`-0.0803`** |
+| `17250` | `141.31M` | `4.9535` (`25.89%`) | **`4.8670`** | **`4.8763`** | **`26.85%`** | `0.131x` | `0.00` / `0.00` / `0.00` | **`-0.0865`** |
+| `17750` | `145.41M` | `4.9562` (`25.90%`) | **`4.8616`** | **`4.8699`** | **`26.92%`** | `0.130x` | `0.00` / `0.00` / `0.00` | **`-0.0946`** |
+| `18000` | `147.46M` | `4.9488` (`25.99%`) | **`4.8580`** | **`4.8659`** | **`26.72%`** | `0.129x` | `0.00` / `0.00` / `0.00` | **`-0.0908`** |
+
+### 6.6 Post-Mortem & Key Mathematical Takeaways
+1. **Surpassing Wave 65's `231M`-Token All-Time Best in `< 127M` Tokens and Reaching `4.8580` EMA CE at `147.46M` Tokens**:
+   - Wave 65's `W65_V3` reference (`128D` Shared Stiefel Frame) reached an all-time best of `4.8977` Val CE (`26.45%` Top-1) at Step 27,750 (`227.33M` tokens) across its `231.18M`-token run.
+   - `W67_S3` (`256D` Selective Exact Quotient + Read-Only Shadow EMA + $1/\sqrt{t}$ Riemannian Annealing) broke `4.8977` at **Step 15,500 (`126.98M` tokens, `4.8928` EMA CE)**—over **`100M` tokens (`12,250` steps) earlier**—and by **Step 18,000 (`147.46M` tokens)** reached **`4.8580` EMA CE** (`4.8659` Hot CE, `26.92%` peak Top-1 at Step 17,750), outperforming `W65_V3` at matched steps by **`-0.0908` to `-0.0946` nats** (`+1.02%` Top-1) and beating `W65_V3`'s all-time `231M`-token best by **`-0.0397` nats** (`+0.47%` Top-1) with zero mid-training rollbacks and exact gauge invariants (`MUBErr = 0.00e+00`, `SU16Phase = 0.00e+00`, `KrausGauge = 0.00e+00`).
+2. **Why Selective Exact Quotienting + Tall-Stiefel Post-NS Polar Refinement + $1/\sqrt{t}$ Riemannian Annealing Work Synergistically**:
+   - Restoring 100% horizontal gradient completeness (`0.000000` raw vertical leak) while stripping post-Newton–Schulz artificial gauge spin prevents the optimizer from injecting vertical $\mathfrak{u}(R)$ / $\mathfrak{su}(16)$ / degenerate-SVD momentum drift.
+   - Adding 1-step quadratic polar refinement (`0.5 * U @ (3I - U^T U)`) after 5-step Newton–Schulz whitening on rectangular Stiefel bridges `(512, 256)` and `(1536, 512)`, combined with negative-overlap momentum cleaning, tangent-SNR trust-region gating, and Robbins–Monro $1/\sqrt{1 + (t - 200)/300}$ Riemannian annealing, eliminates late-horizon geodesic overshooting while maintaining steady descent past `137M+` tokens.
 
