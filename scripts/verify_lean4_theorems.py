@@ -71,6 +71,13 @@ EXPECTED_THEOREMS: tuple[str, ...] = (
     "QuantumDLBlocksLean.four_qubit_segre_norm_and_intra_head_entanglement",
     "QuantumDLBlocksLean.mean_field_single_branch_ghz_collapse_vs_multibranch_exactness",
     "QuantumDLBlocksLean.factorized_65536d_hilbert_schmidt_born_coincidence_identity",
+    "QuantumDLBlocksLean.theorem14a_four_compartment_backoff_and_schur_subspace_intersection",
+    "QuantumDLBlocksLean.theorem14b_walsh_hadamard_token_id_zero_shot_reversal_and_online_bath",
+    "QuantumDLBlocksLean.theorem14c_distributive_factored_schur_and_two_layer_four_way_conjunction",
+    "QuantumDLBlocksLean.theorem15a_factorized_ket_schur_action_identity",
+    "QuantumDLBlocksLean.theorem15b_diagonal_conjugated_bath_schur_action_identity",
+    "QuantumDLBlocksLean.theorem15c_gram_purity_cyclicity_identity",
+    "QuantumDLBlocksLean.theorem16_exact_mixed_state_attention_schur_action_identity",
 )
 
 
