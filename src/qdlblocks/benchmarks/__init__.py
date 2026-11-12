@@ -352,6 +352,25 @@ __all__ = [
     "run_wave77_induction_and_mqar_probes",
     "run_wave77_multishard_confirmation_spin",
     "zero_matrix_complementary_schur_probe_action",
+    "HorizonPooledCausalMTPMPSSweep",
+    "PurityConditionedHybridWalshCopyGate",
+    "UnifiedMuPCarbonBlock",
+    "UnifiedMuPCarbonBatonLM",
+    "UnifiedMuPCarbonConfig",
+    "Wave78UnifiedAdapter",
+    "Wave78VariantKind",
+    "ZeroSyncComplementarySchurGate",
+    "build_symmetric_walsh_hadamard_codebook",
+    "build_wave78_mup_optimizers",
+    "build_wave78_variant_adapter",
+    "evaluate_wave78_official_shard0_validation",
+    "extract_wave78_post_sprint_telemetry",
+    "inspect_copy_gate_confidence_and_entity_calibration",
+    "load_wave77_checkpoint_or_sprint_adapter",
+    "profile_complementary_schur_pand_and_purity_layers",
+    "run_wave78_controlled_sprint",
+    "run_wave78_induction_and_mqar_probes",
+    "run_wave78_multishard_confirmation_spin",
 ]
 
 from .architecture_mechanistic_probes import (
@@ -421,3 +440,52 @@ from .wave77_quantum_routing_primitives import (
     explicit_complementary_schur_matrix_pair,
     zero_matrix_complementary_schur_probe_action,
 )
+from .wave78_routing_and_copy_diagnostics import (
+    inspect_copy_gate_confidence_and_entity_calibration,
+    load_wave77_checkpoint_or_sprint_adapter,
+    profile_complementary_schur_pand_and_purity_layers,
+)
+from .wave78_unification_runner import (
+    evaluate_wave78_official_shard0_validation,
+    extract_wave78_post_sprint_telemetry,
+    run_wave78_controlled_sprint,
+    run_wave78_induction_and_mqar_probes,
+    run_wave78_multishard_confirmation_spin,
+)
+from .wave78_unified_mup_carbon_baton import (
+    HorizonPooledCausalMTPMPSSweep,
+    PurityConditionedHybridWalshCopyGate,
+    UnifiedMuPCarbonBatonLM,
+    UnifiedMuPCarbonBlock,
+    UnifiedMuPCarbonConfig,
+    Wave78UnifiedAdapter,
+    Wave78VariantKind,
+    ZeroSyncComplementarySchurGate,
+    build_symmetric_walsh_hadamard_codebook,
+    build_wave78_mup_optimizers,
+    build_wave78_variant_adapter,
+)
+from .wave79_fused_schur_and_induction_baton import (
+    FusedUnifiedBatonConfig,
+    FusedUnifiedSchurBatonBlock,
+    FusedUnifiedSchurBatonLM,
+    InAttentionComplementarySchurRouter,
+    SurprisalConditionedWalshBiTriggerCopyGate,
+    Wave79FusedAdapter,
+    Wave79VariantKind,
+    build_balanced_128d_walsh_codebook,
+    build_bos_doc_flex_block_mask,
+    build_wave79_mup_optimizers,
+    build_wave79_variant_adapter,
+)
+from .wave79_speedrun_and_ablation_runner import (
+    FlexDocMaskBenchConfig,
+    audit_wave79_copy_and_schur_diagnostics,
+    benchmark_flex_attention_bos_docmask_parity_and_speed,
+    evaluate_wave79_official_shard0_validation,
+    inspect_mtp_horizon_weights_and_rollout_cosines,
+    run_wave79_300m_multishard_wsd_speedrun,
+    run_wave79_controlled_sprint,
+    run_wave79_induction_and_mqar_probes,
+)
+
